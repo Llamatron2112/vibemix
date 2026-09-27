@@ -33,3 +33,8 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rosc = "0.10"
 rtrb = "0.3"
 jack = "0.13"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = "debuginfo"

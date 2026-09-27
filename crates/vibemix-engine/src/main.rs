@@ -18,7 +18,7 @@ use crate::params::{SharedMeters, SharedParams};
 static GLOBAL_ALLOCATOR: rt_guard::GuardAllocator = rt_guard::GuardAllocator;
 
 #[derive(Debug, Parser)]
-#[command(name = "vibemix-engine", about = "vibemix audio mixer engine")]
+#[command(name = "vibemix-engine", version, about = "vibemix audio mixer engine")]
 struct Args {
     #[arg(long, default_value = "vibemix")]
     client_name: String,

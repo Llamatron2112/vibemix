@@ -1,0 +1,12 @@
+#!/usr/bin/env bash
+# Launch vibemix: start the engine for this session (or reuse a running one)
+# and open the GUI. The engine we started is stopped when the GUI exits.
+set -euo pipefail
+
+PORT="${VIBEMIX_OSC_PORT:-9000}"
+
+vibemix-engine --osc-port "${PORT}" &
+ENGINE_PID=$!
+trap 'kill "${ENGINE_PID}" 2>/dev/null || true' EXIT
+
+vibemix-gui

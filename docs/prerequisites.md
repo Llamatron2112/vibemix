@@ -55,6 +55,31 @@ Qt's link step needs a fast linker. Add `~/.cargo/config.toml`:
 rustflags = ["-C", "link-arg=-fuse-ld=lld"]
 ```
 
+## Build and install
+
+```bash
+just build                 # debug
+just release               # optimized (lto)
+just run-engine            # run the engine from source
+just run-gui               # run the GUI from source
+
+just install               # install to /usr/local
+just PREFIX=~/.local install   # or a custom prefix
+just PREFIX=~/.local uninstall
+```
+
+`just install` installs `vibemix-engine`, `vibemix-gui`, a `vibemix` launcher
+(starts the engine for the session, then opens the GUI), a `.desktop` entry and
+an icon.
+
+Environment variables:
+
+- `VIBEMIX_OSC_PORT` — control port for the engine and GUI (default `9000`).
+- `VIBEMIX_CONFIG_DIR` — config directory (default `$XDG_CONFIG_HOME/vibemix`,
+  i.e. `~/.config/vibemix`); holds `recent.json`, `catalog.json` and `sessions/`.
+- `VIBEMIX_LV2_BLACKLIST` — comma-separated plugin URIs to refuse to load.
+- `VIBEMIX_RT_GUARD=1` — abort (debug) on any heap operation on the audio thread.
+
 ## PipeWire instead of jackd
 
 JACK is provided by PipeWire; do not install `jack-audio-connection-kit` (it conflicts with `pipewire-jack`). Clients link against `libjack.so` and appear in the PipeWire graph. Inspect with `pw-link -l`, `pw-dump`, `pw-cli info 0`.
