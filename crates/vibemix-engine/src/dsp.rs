@@ -3,6 +3,23 @@ pub fn pan_gains(pan: f32) -> (f32, f32) {
     (angle.cos(), angle.sin())
 }
 
+/// Enables flush-to-zero / denormals-are-zero on the current thread (x86_64).
+/// Cheap and idempotent; intended to be called from the audio callback.
+pub fn flush_denormals() {
+    #[cfg(target_arch = "x86_64")]
+    {
+        use core::arch::asm;
+        const FTZ: u32 = 1 << 15;
+        const DAZ: u32 = 1 << 6;
+        let mut csr: u32 = 0;
+        unsafe {
+            asm!("stmxcsr [{}]", in(reg) &mut csr, options(nostack, preserves_flags));
+            csr |= FTZ | DAZ;
+            asm!("ldmxcsr [{}]", in(reg) &csr, options(nostack, preserves_flags));
+        }
+    }
+}
+
 pub fn scale_into(dst: &mut [f32], src: &[f32], gain: f32) {
     for (out, input) in dst.iter_mut().zip(src.iter()) {
         *out = *input * gain;

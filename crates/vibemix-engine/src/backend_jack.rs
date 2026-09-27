@@ -194,6 +194,7 @@ struct MixerGraph {
     garbage_chains: Producer<Vec<SlotPlugin>>,
     garbage_nested: Producer<Vec<StripChains>>,
     strip_gain_smooth: Vec<f32>,
+    strip_pan_smooth: Vec<f32>,
     strip_input_smooth: Vec<f32>,
     bus_gain_smooth: Vec<f32>,
     send_gain_smooth: Vec<Vec<f32>>,
@@ -499,7 +500,14 @@ impl MixerGraph {
             let smoothed = &mut self.strip_gain_smooth[index];
             *smoothed += (target - *smoothed) * SMOOTHING;
             let gain = *smoothed;
-            let (pan_l, pan_r) = dsp::pan_gains(self.params.strip_pan(index));
+
+            let pan_target = self.params.strip_pan(index);
+            let pan = {
+                let smoothed = &mut self.strip_pan_smooth[index];
+                *smoothed += (pan_target - *smoothed) * SMOOTHING;
+                *smoothed
+            };
+            let (pan_l, pan_r) = dsp::pan_gains(pan);
 
             dsp::apply_gain(&mut self.strip_scratch[0][..frames], gain * pan_l);
             dsp::apply_gain(&mut self.strip_scratch[1][..frames], gain * pan_r);
@@ -682,6 +690,7 @@ impl MixerGraph {
 
 impl ProcessHandler for MixerGraph {
     fn process(&mut self, _client: &Client, scope: &ProcessScope) -> Control {
+        dsp::flush_denormals();
         self.apply_commands();
 
         let paused = self.params.state_pause();
@@ -846,6 +855,7 @@ impl JackEngine {
             garbage_chains: garbage_chains_producer,
             garbage_nested: garbage_nested_producer,
             strip_gain_smooth: vec![0.0; strip_count],
+            strip_pan_smooth: vec![0.0; strip_count],
             strip_input_smooth: vec![1.0; strip_count],
             bus_gain_smooth: vec![0.0; bus_count],
             send_gain_smooth: (0..strip_count).map(|_| vec![0.0; bus_count]).collect(),
