@@ -740,6 +740,22 @@ impl Controller {
             for chain in 0..PLUGIN_CHAINS {
                 let plugins = strip_plugin_list_mut(strip, chain);
                 for (slot, plugin) in plugins.iter_mut().enumerate() {
+                    // Persist the live control values (written by either the
+                    // editor or the plugin's native UI) into the model.
+                    if let Some(controls) = self
+                        .plugins
+                        .iter()
+                        .find(|info| info.uri == plugin.uri)
+                        .map(|info| info.controls.len().min(MAX_PARAMS))
+                    {
+                        if plugin.params.len() < controls {
+                            plugin.params.resize(controls, 0.0);
+                        }
+                        for param in 0..controls {
+                            plugin.params[param] =
+                                self.params.plugin_param(strip_index, chain, slot, param);
+                        }
+                    }
                     if let Some(proxy) = self.engine.state_proxy(strip_index, chain, slot) {
                         if proxy.supports_save() {
                             plugin.state = encode_state(&self.host, &proxy.save());
@@ -752,6 +768,19 @@ impl Controller {
         for bus in &mut self.model.buses {
             let bus_index = bus.id.0 as usize;
             for (slot, plugin) in bus.plugins.iter_mut().enumerate() {
+                if let Some(controls) = self
+                    .plugins
+                    .iter()
+                    .find(|info| info.uri == plugin.uri)
+                    .map(|info| info.controls.len().min(MAX_PARAMS))
+                {
+                    if plugin.params.len() < controls {
+                        plugin.params.resize(controls, 0.0);
+                    }
+                    for param in 0..controls {
+                        plugin.params[param] = self.params.bus_plugin_param(bus_index, slot, param);
+                    }
+                }
                 if let Some(proxy) = self.engine.bus_state_proxy(bus_index, slot) {
                     if proxy.supports_save() {
                         plugin.state = encode_state(&self.host, &proxy.save());
