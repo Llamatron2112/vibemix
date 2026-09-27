@@ -16,8 +16,6 @@ use crate::params::{
 
 const SMOOTHING: f32 = 0.005;
 const COMMAND_CAPACITY: usize = 64;
-const GARBAGE_CAPACITY: usize = 256;
-const CHAIN_GARBAGE_CAPACITY: usize = 64;
 
 type StripChains = [Vec<SlotPlugin>; PLUGIN_CHAINS];
 type StripProxies = [Vec<Option<StateProxy>>; PLUGIN_CHAINS];
@@ -225,7 +223,7 @@ impl MixerGraph {
                     match target {
                         Some(chain) if chain.len() < MAX_PLUGINS => chain.push(plugin),
                         _ => {
-                            let _ = self.garbage.push(plugin);
+                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
                         }
                     }
                 }
@@ -237,7 +235,7 @@ impl MixerGraph {
                     {
                         if slot < target.len() {
                             let plugin = target.remove(slot);
-                            let _ = self.garbage.push(plugin);
+                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
                         }
                     }
                 }
@@ -262,7 +260,7 @@ impl MixerGraph {
                     if let Some(chains) = self.plugin_chains.get_mut(strip) {
                         for chain in chains.iter_mut() {
                             let taken = std::mem::take(chain);
-                            let _ = self.garbage_chains.push(taken);
+                            if let Err(chain) = self.garbage_chains.push(taken) { std::mem::forget(chain); }
                         }
                     }
                 }
@@ -270,7 +268,7 @@ impl MixerGraph {
                     match self.bus_chains.get_mut(bus) {
                         Some(chain) if chain.len() < MAX_PLUGINS => chain.push(plugin),
                         _ => {
-                            let _ = self.garbage.push(plugin);
+                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
                         }
                     }
                 }
@@ -278,7 +276,7 @@ impl MixerGraph {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
                         if slot < chain.len() {
                             let plugin = chain.remove(slot);
-                            let _ = self.garbage.push(plugin);
+                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
                         }
                     }
                 }
@@ -293,7 +291,7 @@ impl MixerGraph {
                 EngineCommand::ClearBus { bus } => {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
                         let taken = std::mem::take(chain);
-                        let _ = self.garbage_chains.push(taken);
+                        if let Err(chain) = self.garbage_chains.push(taken) { std::mem::forget(chain); }
                     }
                 }
                 EngineCommand::SetStripPorts { strip, in_l, in_r } => {
@@ -331,10 +329,10 @@ impl MixerGraph {
                     bus_chains,
                 } => {
                     let old = std::mem::replace(&mut self.plugin_chains, chains);
-                    let _ = self.garbage_nested.push(old);
+                    if let Err(chains) = self.garbage_nested.push(old) { std::mem::forget(chains); }
                     let old_bus = std::mem::replace(&mut self.bus_chains, bus_chains);
                     for chain in old_bus {
-                        let _ = self.garbage_chains.push(chain);
+                        if let Err(chain) = self.garbage_chains.push(chain) { std::mem::forget(chain); }
                     }
                 }
             }
@@ -821,12 +819,17 @@ impl JackEngine {
 
         let (commands, command_consumer) =
             rtrb::RingBuffer::<EngineCommand>::new(COMMAND_CAPACITY);
+        // Garbage queues are sized so a full command queue's worth of retired
+        // objects can never overflow them (the control thread drains each loop).
+        let garbage_plugins_capacity = COMMAND_CAPACITY * (strip_count + bus_count + 1);
+        let garbage_chains_capacity = COMMAND_CAPACITY * (bus_count.max(PLUGIN_CHAINS) + 1);
+        let garbage_nested_capacity = COMMAND_CAPACITY;
         let (garbage_producer, garbage) =
-            rtrb::RingBuffer::<SlotPlugin>::new(GARBAGE_CAPACITY);
+            rtrb::RingBuffer::<SlotPlugin>::new(garbage_plugins_capacity);
         let (garbage_chains_producer, garbage_chains) =
-            rtrb::RingBuffer::<Vec<SlotPlugin>>::new(CHAIN_GARBAGE_CAPACITY);
+            rtrb::RingBuffer::<Vec<SlotPlugin>>::new(garbage_chains_capacity);
         let (garbage_nested_producer, garbage_nested) =
-            rtrb::RingBuffer::<Vec<StripChains>>::new(CHAIN_GARBAGE_CAPACITY);
+            rtrb::RingBuffer::<Vec<StripChains>>::new(garbage_nested_capacity);
 
         let graph = MixerGraph {
             params: Arc::clone(&params),
