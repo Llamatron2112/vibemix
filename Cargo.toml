@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/vibemix-core",
+    "crates/vibemix-proto",
+    "crates/vibemix-lv2",
+    "crates/vibemix-engine",
+    "crates/vibemix-gui",
+]
+exclude = [
+    "spikes/0a-jack-passthrough",
+    "spikes/0b-lv2-host",
+    "spikes/0c-cxx-qt-qml",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+rust-version = "1.85"
+
+[workspace.dependencies]
+vibemix-core = { path = "crates/vibemix-core" }
+vibemix-proto = { path = "crates/vibemix-proto" }
+vibemix-lv2 = { path = "crates/vibemix-lv2" }
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+rosc = "0.10"
+rtrb = "0.3"
+jack = "0.13"

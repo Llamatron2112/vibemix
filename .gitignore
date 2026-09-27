@@ -1,0 +1,14 @@
+/target
+**/target
+*.swp
+
+# Host-specific build config (QMAKE path, linker flags); see docs/prerequisites.md
+.cargo/
+.qmlls.ini
+
+# Editor / OS
+.idea/
+.vscode/
+*.iml
+.DS_Store
+*~

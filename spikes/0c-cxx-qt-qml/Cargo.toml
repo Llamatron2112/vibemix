@@ -1,0 +1,15 @@
+[package]
+name = "spike-0c-cxx-qt-qml"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+cxx = "1.0"
+cxx-qt = "0.10"
+cxx-qt-lib = { version = "0.10", features = ["qt_full"] }
+
+[build-dependencies]
+cxx-qt-build = "0.10"
+
+[workspace]

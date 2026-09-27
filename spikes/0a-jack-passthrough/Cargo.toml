@@ -1,0 +1,11 @@
+[package]
+name = "spike-0a-jack-passthrough"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+anyhow = "1"
+jack = "0.13"
+
+[workspace]

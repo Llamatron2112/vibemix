@@ -1,0 +1,10 @@
+[package]
+name = "spike-0b-lv2-host"
+version = "0.0.0"
+edition = "2021"
+publish = false
+
+[dependencies]
+lilv = "0.2"
+
+[workspace]
