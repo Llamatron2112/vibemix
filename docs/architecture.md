@@ -224,13 +224,30 @@ them in its control loop. Open/close from the GUI "UI" button
 hostable (215 plugins incl. LSP/x42); Gtk UIs (Calf) are not, and the UIs are
 separate floating windows (no embedding into the QML window).
 
-The host provides `ui:resize` and `ui:showInterface` (with the retained
-`LV2UI_Resize` kept alive for the UI) and pumps every UI — including its
+The host provides `ui:resize`, `ui:showInterface` (with the retained
+`LV2UI_Resize` kept alive for the UI), and `options:options` carrying
+`ui:updateRate` and `ui:scaleFactor`. It pumps every UI — including its
 `ui:idleInterface` — each control-loop iteration, so animated UIs (including
-LSP's OpenGL UIs) update. Because UIs must run in-process, opening one is still
-gated by a short subprocess smoke test as a safety net: a UI that crashes or
-hangs is refused rather than taking the engine down. The smoke test runs
-headless (the window is never mapped), so it produces no visible flash.
+LSP's OpenGL UIs) update.
+
+The engine calls `XInitThreads()` before its first Xlib call. Plugin UIs such
+as LSP's X11/GL toolkit use Xlib from multiple threads and call `XInitThreads`
+themselves, but that is only effective if it happens first; otherwise their
+UIs can freeze.
+
+Plugin **output** ports are forwarded to each open UI as `ui:portEvent` from
+the control loop (control outputs every pump, atom outputs on change). The
+audio thread publishes output snapshots into a lock-free structure shared with
+the control thread (a `SharedOutputs` with atomics for control ports and a
+seqlock for atom payloads); publishing is gated on a per-instance "UI open"
+flag, so the audio thread does no extra work when no UI is open. Host-driven
+parameter edits are mirrored back into the native UI the same way.
+
+Because UIs must run in-process, opening one is still gated by a short
+subprocess smoke test as a safety net: a UI that crashes or hangs is refused
+rather than taking the engine down. The smoke test runs headless (the window is
+never mapped) and also exercises the output-forwarding path, so it produces no
+visible flash.
 
 Not supported: Gtk/Qt plugin UIs. meters.lv2 EBU R128 stays blacklisted (it
 aborts on its own internal buffer).

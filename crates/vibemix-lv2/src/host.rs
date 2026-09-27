@@ -10,6 +10,9 @@ use crate::urid::UridMap;
 use crate::worker::{Worker, WorkerInterface, WORKER_INTERFACE_URI, WORKER_SCHEDULE_URI};
 use crate::state::{StateEntry, StateInterface, StateProxy, STATE_INTERFACE_URI};
 use crate::ui::{self, UiCandidate, UiWindow};
+use crate::ui_outputs::SharedOutputs;
+
+use std::sync::Arc;
 
 const OPTIONS_URI: &[u8] = b"http://lv2plug.in/ns/ext/options#options\0";
 const BOUNDED_BLOCK_URI: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#boundedBlockLength\0";
@@ -484,6 +487,12 @@ impl Host {
 
         let active = unsafe { instance.activate() };
 
+        let outputs = Arc::new(SharedOutputs::new(
+            &control_outputs,
+            &atom_outputs,
+            ATOM_BUFFER_BYTES,
+        ));
+
         Some(PluginInstance {
             active,
             audio_inputs,
@@ -500,6 +509,7 @@ impl Host {
             _options: option_features,
             worker,
             state,
+            outputs,
         })
     }
 }
@@ -570,6 +580,7 @@ pub struct PluginInstance {
     _options: OptionFeatures,
     worker: Option<Box<Worker>>,
     state: Option<StateProxy>,
+    outputs: Arc<SharedOutputs>,
 }
 
 unsafe impl Send for PluginInstance {}
@@ -663,6 +674,28 @@ impl PluginInstance {
     pub fn run(&mut self, frames: usize) {
         let frames = frames.min(MAX_FRAMES);
         unsafe { self.active.run(frames) };
+        self.publish_outputs();
+    }
+
+    /// Sends the plugin's current output port values to the UI-facing snapshot.
+    /// Does nothing (and costs nothing) unless a UI is open for this instance.
+    fn publish_outputs(&self) {
+        if !self.outputs.is_active() {
+            return;
+        }
+        self.outputs.publish_control(&self.control_output_buffers);
+
+        let base = self.atom_inputs.len();
+        for (index, buffer) in self.atom_buffers.iter().enumerate().skip(base) {
+            let words = buffer.as_ptr() as *const u32;
+            // SAFETY: the buffer is a live `LV2_Atom_Sequence` written by the
+            // plugin on this thread during `run`.
+            let (size, format) = unsafe { (*words as usize, *words.add(1)) };
+            let total = (std::mem::size_of::<u32>() * 2 + size).min(ATOM_BUFFER_BYTES);
+            let bytes =
+                unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, total) };
+            self.outputs.publish_atom(index - base, bytes, format);
+        }
     }
 
     pub fn deliver_responses(&mut self) {
@@ -677,6 +710,10 @@ impl PluginInstance {
 
     pub fn handle(&self) -> *mut c_void {
         self.active.instance().handle()
+    }
+
+    pub fn outputs(&self) -> Arc<SharedOutputs> {
+        Arc::clone(&self.outputs)
     }
 
     pub fn restore_state(&mut self, entries: &[StateEntry]) {

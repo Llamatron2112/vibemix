@@ -20,6 +20,8 @@ struct Lv2UridUnmap {
 }
 
 extern "C" {
+    fn vibemix_ui_init();
+
     fn vibemix_ui_find(
         plugin_uri: *const c_char,
         want_type: *const c_char,
@@ -46,8 +48,21 @@ extern "C" {
     ) -> *mut c_void;
 
     fn vibemix_ui_pump(handle: *mut c_void);
+    fn vibemix_ui_port_event(
+        handle: *mut c_void,
+        port_index: u32,
+        size: u32,
+        format: u32,
+        buffer: *const c_void,
+    );
     fn vibemix_ui_wants_close(handle: *mut c_void) -> c_int;
     fn vibemix_ui_close(handle: *mut c_void);
+}
+
+/// Initialise Xlib threading support. Must run before any other Xlib call in
+/// the process; call once at engine startup.
+pub fn init() {
+    unsafe { vibemix_ui_init() };
 }
 
 #[derive(Debug, Clone)]
@@ -103,6 +118,18 @@ pub struct UiWindow {
 impl UiWindow {
     pub fn pump(&self) {
         unsafe { vibemix_ui_pump(self.handle) };
+    }
+
+    pub fn port_event(&self, port_index: u32, size: u32, format: u32, buffer: &[u8]) {
+        unsafe {
+            vibemix_ui_port_event(
+                self.handle,
+                port_index,
+                size,
+                format,
+                buffer.as_ptr() as *const c_void,
+            )
+        };
     }
 
     pub fn wants_close(&self) -> bool {

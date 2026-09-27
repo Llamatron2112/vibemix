@@ -11,7 +11,7 @@ use vibemix_core::model::{
     Bus, MixerModel, PluginSlot, Send, Strip, WindowGeometry, MAX_SEND_DELAY_MS,
 };
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
-use vibemix_lv2::{find_ui, Host, PluginInfo, PluginInstance, UiCandidate, UiWindow};
+use vibemix_lv2::{find_ui, Host, PluginInfo, PluginInstance, SharedOutputs, UiCandidate, UiWindow};
 use vibemix_proto::ControlMessage;
 
 use crate::backend_jack::{encode_state, make_slot_plugin, JackEngine};
@@ -57,6 +57,65 @@ struct UiWriteCtx {
     slot: usize,
     params: Arc<SharedParams>,
     ports: Vec<(u32, usize)>,
+    outputs: Option<Arc<SharedOutputs>>,
+    last_control: Vec<Option<u32>>,
+    last_atom_seq: Vec<usize>,
+}
+
+impl Drop for UiWriteCtx {
+    fn drop(&mut self) {
+        if let Some(outputs) = &self.outputs {
+            outputs.set_active(false);
+        }
+    }
+}
+
+impl UiWriteCtx {
+    /// Forwards the plugin's output port values to its native UI (host ->
+    /// `ui:portEvent`), so meters/analysers animate even for plugins that do
+    /// not read their DSP ports directly via `instance-access`.
+    fn forward_outputs(&mut self, window: &UiWindow) {
+        let Some(outputs) = &self.outputs else {
+            return;
+        };
+        if !outputs.is_active() {
+            return;
+        }
+
+        let controls = outputs.control_port_count();
+        if self.last_control.len() != controls {
+            self.last_control = vec![None; controls];
+        }
+        for index in 0..controls {
+            let bits = outputs.control_value(index).to_bits();
+            if self.last_control[index] == Some(bits) {
+                continue;
+            }
+            self.last_control[index] = Some(bits);
+            let value = f32::from_bits(bits);
+            window.port_event(
+                outputs.control_port(index),
+                std::mem::size_of::<f32>() as u32,
+                0,
+                &value.to_ne_bytes(),
+            );
+        }
+
+        let atoms = outputs.atom_port_count();
+        if self.last_atom_seq.len() != atoms {
+            self.last_atom_seq = vec![usize::MAX; atoms];
+        }
+        for index in 0..atoms {
+            let seq = outputs.atom_seq(index);
+            if seq == 0 || self.last_atom_seq[index] == seq {
+                continue;
+            }
+            if let Some((bytes, format)) = outputs.read_atom(index) {
+                self.last_atom_seq[index] = seq;
+                window.port_event(outputs.atom_port(index), bytes.len() as u32, format, &bytes);
+            }
+        }
+    }
 }
 
 extern "C" fn ui_port_write(
@@ -551,6 +610,7 @@ impl Controller {
                         }
                     }
                 }
+                self.reflect_param_to_ui(location, target, slot, param, value);
                 Actions::default()
             }
             ControlMessage::SetPluginBypass {
@@ -947,12 +1007,21 @@ impl Controller {
             })
             .unwrap_or_default();
 
+        let outputs = if let Some(chain) = strip_chain(location) {
+            self.engine.plugin_outputs(target as usize, chain, slot as usize)
+        } else {
+            self.engine.bus_plugin_outputs(target as usize, slot as usize)
+        };
+
         let mut context = Box::new(UiWriteCtx {
             location,
             target: target as usize,
             slot: slot as usize,
             params: Arc::clone(&self.params),
             ports,
+            outputs,
+            last_control: Vec::new(),
+            last_atom_seq: Vec::new(),
         });
 
         let Some(window) = (unsafe {
@@ -969,15 +1038,47 @@ impl Controller {
             return;
         };
 
+        if let Some(outputs) = &context.outputs {
+            outputs.set_active(true);
+        }
+
         tracing::info!(location, target, slot, %uri, "opened plugin UI");
         self.uis.insert(key, (window, context));
     }
 
+    /// Mirrors a host-driven parameter change into the plugin's native UI, so
+    /// the UI's own controls follow edits made in the vibemix editor.
+    fn reflect_param_to_ui(&self, location: u32, target: u32, slot: u32, param: u32, value: f32) {
+        let Some((window, context)) = self.uis.get(&(location, target, slot)) else {
+            return;
+        };
+        let Some((port, _)) = context
+            .ports
+            .iter()
+            .find(|(_, mapped)| *mapped == param as usize)
+        else {
+            return;
+        };
+        window.port_event(
+            *port,
+            std::mem::size_of::<f32>() as u32,
+            0,
+            &value.to_ne_bytes(),
+        );
+    }
+
     fn pump_uis(&mut self) {
-        self.uis.retain(|_, (window, _)| {
+        let mut closed = Vec::new();
+        for (key, (window, context)) in self.uis.iter_mut() {
             window.pump();
-            !window.wants_close()
-        });
+            context.forward_outputs(window);
+            if window.wants_close() {
+                closed.push(*key);
+            }
+        }
+        for key in closed {
+            self.uis.remove(&key);
+        }
     }
 
     fn clamp_plugin_param(

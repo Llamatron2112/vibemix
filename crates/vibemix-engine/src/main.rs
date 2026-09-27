@@ -48,6 +48,8 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
+    vibemix_lv2::ui::init();
+
     if std::env::var_os("VIBEMIX_RT_GUARD").is_some() {
         rt_guard::enable();
     }
@@ -138,7 +140,7 @@ fn run_smoke_ui(uri: &str) -> ! {
     extern "C" fn no_write(_: *mut c_void, _: u32, _: u32, _: u32, _: *const c_void) {}
 
     let host = Host::new();
-    let Some(instance) = host.instantiate(uri, 48000.0, 512, 8192) else {
+    let Some(mut instance) = host.instantiate(uri, 48000.0, 512, 8192) else {
         std::process::exit(2);
     };
     let Some(candidate) = find_ui(uri) else {
@@ -151,10 +153,30 @@ fn run_smoke_ui(uri: &str) -> ! {
         std::process::exit(2);
     };
 
+    // Exercise the same output-forwarding path the engine uses: run a block,
+    // publish the plugin's outputs, and deliver them to the UI.
+    let outputs = instance.outputs();
+    outputs.set_active(true);
     for _ in 0..75 {
+        instance.run(512);
+        for index in 0..outputs.control_port_count() {
+            let value = outputs.control_value(index);
+            window.port_event(
+                outputs.control_port(index),
+                std::mem::size_of::<f32>() as u32,
+                0,
+                &value.to_ne_bytes(),
+            );
+        }
+        for index in 0..outputs.atom_port_count() {
+            if let Some((bytes, format)) = outputs.read_atom(index) {
+                window.port_event(outputs.atom_port(index), bytes.len() as u32, format, &bytes);
+            }
+        }
         window.pump();
         std::thread::sleep(Duration::from_millis(20));
     }
+    outputs.set_active(false);
     drop(window);
     drop(instance);
     std::process::exit(0);
