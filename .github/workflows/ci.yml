@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+env:
+  CARGO_TERM_COLOR: always
+  # Qt's link step needs a fast linker; .cargo/config.toml is local-only.
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+
+jobs:
+  build:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config lld \
+            qt6-base-dev qt6-declarative-dev qt6-quickcontrols2-dev \
+            lv2-dev liblilv-dev libserd-dev libsord-dev libsratom-dev libsuil-dev \
+            libjack-jackd2-dev
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy, rustfmt
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build
+        run: cargo build --workspace --all-targets
+
+      - name: Clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test
+        run: cargo test --workspace
+
+      - name: qmllint
+        run: |
+          if command -v qmllint6 >/dev/null 2>&1; then
+            qmllint6 crates/vibemix-gui/qml/main.qml
+          elif command -v qmllint-qt6 >/dev/null 2>&1; then
+            qmllint-qt6 crates/vibemix-gui/qml/main.qml
+          else
+            echo "qmllint not found; skipping"
+          fi

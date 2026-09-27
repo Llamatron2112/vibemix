@@ -320,6 +320,10 @@ post-fader, `2` bus insert — and `target` (the strip or bus id).
 - **Phase 2** - full strip/bus model, sends, mute/solo, session save/load. Done.
 - **Phase 3** - LV2 hosting: discovery + instances (`vibemix-lv2`), per-strip
   insert chains, parameter control and UI, and session persistence. Done
-  (stereo plugins, control params; no worker/options/state/UI yet).
-- **Phase 4** - RT hardening, lock-free graph swap, packaging.
+  (mono/stereo plugins; control params; `worker:schedule`, `options`, state and
+  native UI windows all supported).
+- **Phase 4** - RT hardening (fixed buffers, no RT alloc/free, denormals,
+  smoothing, sample-rate-change handling, xrun counter, alloc guard), lock-free
+  graph swap, and source-install packaging (`just install`, desktop entry/icon).
+  Done (no AppImage/Flatpak).
 - **Phase 5** - non-mixer-style arbitrary module graph and port matrix.
