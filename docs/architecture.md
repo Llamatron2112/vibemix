@@ -71,7 +71,13 @@ and `out` (post-fader/pan) — and the GUI can select which one each strip's met
 shows. The numeric readout and the meter's dB scale use `-60..+6 dBFS`.
 
 Each strip has one post-fader send per bus (`strip.sends`), exposed as a slider
-per bus in the GUI. Bus 0 is the master and is auto-connected to system playback.
+per bus in the GUI; each send also carries an alignment delay (`delay_ms`,
+`0..500 ms`, smoothed and linearly interpolated) so a signal routed through
+several buses with different latencies (a dry path vs. a latency-inducing FX
+bus) can be phase-aligned per send. The GUI entry accepts `ms`, seconds (`s`) or
+samples (`smp`/`samples`); a bare number is milliseconds, and the value is shown
+with 3-decimal ms plus a samples tooltip. Bus 0 is the master and is
+auto-connected to system playback.
 Each bus sums its incoming sends, runs its own LV2 insert chain, applies
 gain/mute, and drives its JACK output ports (`{slug}_out_l/r`) — so a bus can be a
 hardware tap (sampling) or a monitor out. A bus can also **mix to master**
@@ -136,7 +142,7 @@ available again.
 Audio path per strip:
 
 ```
-input -> input trim -> pre-fader inserts (stereo) -> gain/pan -> post-fader inserts -> sends -> bus accumulators
+input -> input trim -> pre-fader inserts (stereo) -> gain/pan -> post-fader inserts -> sends (x gain, + delay) -> bus accumulators
 ```
 
 Bus path:
@@ -256,6 +262,7 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/bus/add` | none |
 | `/vibemix/bus/remove` | `int bus` |
 | `/vibemix/send/gain` | `int strip, int bus, float gain` |
+| `/vibemix/send/delay` | `int strip, int bus, float ms` (0..500, alignment delay) |
 | `/vibemix/plugin/add` | `int location, int target, string uri` |
 | `/vibemix/plugin/remove` | `int location, int target, int slot` |
 | `/vibemix/plugin/move` | `int location, int target, int from, int to` |

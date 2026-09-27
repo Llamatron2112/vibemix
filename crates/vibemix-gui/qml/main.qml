@@ -205,6 +205,12 @@ ApplicationWindow {
         var gain = entry.sends[busId]
         return gain === undefined ? 0 : gain
     }
+    function sendDelay(stripId, busId) {
+        var entry = values.strips[stripId]
+        if (!entry || !entry.send_delays) return 0
+        var delay = entry.send_delays[busId]
+        return delay === undefined ? 0 : delay
+    }
     function filteredCatalog(query) {
         if (!query) return catalog
         var needle = query.toLowerCase()
@@ -1081,11 +1087,13 @@ ApplicationWindow {
         property real resetValue: 0
         property bool dragging: false
         property real liveValue: 0
+        property real delay: 0
         property var formatValue: function(v) { return Number(v).toFixed(2) }
         readonly property string valueText: slider.formatValue ? slider.formatValue(slider.displayValue) : ""
         readonly property real displayValue: slider.dragging ? slider.liveValue : slider.value
         readonly property bool interacting: slider.dragging || valueTimer.running
         signal moved(real value)
+        signal delayMoved(real ms)
 
         implicitWidth: 56
         implicitHeight: 10
@@ -1102,6 +1110,35 @@ ApplicationWindow {
         function entryParse(t) {
             var db = Number(t)
             return isNaN(db) ? NaN : root.dbToGain(db)
+        }
+        function sampleRate() {
+            return backend.sample_rate > 0 ? backend.sample_rate : 48000
+        }
+        function delayFormat(v) {
+            return Number(v).toFixed(3) + " ms"
+        }
+        function delayParse(text) {
+            var t = String(text).trim().toLowerCase()
+            if (t.length === 0) return NaN
+            var value
+            if (t.indexOf("ms") >= 0) {
+                value = Number(t.replace("ms", "").trim())
+            } else if (t.indexOf("samples") >= 0) {
+                value = Number(t.replace("samples", "").trim())
+                return isNaN(value) ? NaN : value * 1000.0 / sampleRate()
+            } else if (t.indexOf("sample") >= 0) {
+                value = Number(t.replace("sample", "").trim())
+                return isNaN(value) ? NaN : value * 1000.0 / sampleRate()
+            } else if (t.indexOf("smp") >= 0) {
+                value = Number(t.replace("smp", "").trim())
+                return isNaN(value) ? NaN : value * 1000.0 / sampleRate()
+            } else if (t.charAt(t.length - 1) === "s") {
+                value = Number(t.slice(0, -1).trim())
+                return isNaN(value) ? NaN : value * 1000.0
+            } else {
+                value = Number(t)
+            }
+            return isNaN(value) ? NaN : value
         }
 
         Timer { id: valueTimer; interval: 700 }
@@ -1192,6 +1229,10 @@ ApplicationWindow {
                 text: "Set value…"
                 onTriggered: sendEntry.openFor(slider.value)
             }
+            MenuItem {
+                text: "Set delay…"
+                onTriggered: sendDelayEntry.openFor(slider.delay)
+            }
         }
 
         NumberEntry {
@@ -1203,6 +1244,19 @@ ApplicationWindow {
             parse: slider.entryParse
             onCommitted: (v) => {
                 slider.moved(v)
+                slider.bump()
+            }
+        }
+
+        NumberEntry {
+            id: sendDelayEntry
+            label: "send delay (ms · smp · s)"
+            from: 0
+            to: 500
+            format: slider.delayFormat
+            parse: slider.delayParse
+            onCommitted: (v) => {
+                slider.delayMoved(v)
                 slider.bump()
             }
         }
@@ -2081,22 +2135,59 @@ ApplicationWindow {
                                         width: root.stripBody
                                         spacing: 1
 
-                                        Label {
+                                        RowLayout {
                                             width: parent.width
-                                            text: sendRow.busData.name
-                                            elide: Text.ElideRight
-                                            color: root.mutedText
-                                            font.pixelSize: 8
+                                            spacing: 2
+
+                                            Label {
+                                                Layout.fillWidth: true
+                                                text: sendRow.busData.name
+                                                elide: Text.ElideRight
+                                                color: root.mutedText
+                                                font.pixelSize: 8
+                                            }
+
+                                            Rectangle {
+                                                id: delayBadge
+                                                readonly property real delayMs: root.sendDelay(
+                                                    stripCard.stripData.id, sendRow.busData.id)
+                                                visible: delayMs > 0
+                                                Layout.preferredWidth: 10
+                                                Layout.preferredHeight: 10
+                                                radius: 2
+                                                color: root.accentColor
+
+                                                Label {
+                                                    anchors.centerIn: parent
+                                                    text: "D"
+                                                    color: "#ffffff"
+                                                    font.pixelSize: 8
+                                                    font.bold: true
+                                                }
+
+                                                HoverHandler { id: delayBadgeHover }
+                                                ToolTip.visible: delayBadgeHover.hovered
+                                                ToolTip.text: delayBadge.delayMs.toFixed(3) + " ms ("
+                                                    + Math.round(delayBadge.delayMs
+                                                        * (backend.sample_rate > 0 ? backend.sample_rate : 48000)
+                                                        / 1000) + " samples)"
+                                                ToolTip.delay: 300
+                                            }
                                         }
 
                                         SendSlider {
                                             width: parent.width
                                             value: root.sendLevel(stripCard.stripData.id, sendRow.busData.id)
+                                            delay: root.sendDelay(stripCard.stripData.id, sendRow.busData.id)
                                             formatValue: root.gainText
                                             onMoved: (v) => backend.setSendGain(
                                                 stripCard.stripData.id,
                                                 sendRow.busData.id,
                                                 v)
+                                            onDelayMoved: (ms) => backend.setSendDelay(
+                                                stripCard.stripData.id,
+                                                sendRow.busData.id,
+                                                ms)
                                         }
                                     }
                                 }

@@ -198,7 +198,12 @@ struct MixerGraph {
     strip_gain_smooth: Vec<f32>,
     strip_input_smooth: Vec<f32>,
     bus_gain_smooth: Vec<f32>,
+    send_gain_smooth: Vec<Vec<f32>>,
+    send_delay_smooth: Vec<Vec<f32>>,
+    send_delays: Vec<Vec<dsp::DelayLine>>,
+    sample_rate: f32,
     strip_scratch: [Vec<f32>; 2],
+    send_scratch: [Vec<f32>; 2],
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
     buffer_size: usize,
@@ -510,19 +515,42 @@ impl MixerGraph {
             self.meters.store_strip_out(index, strip_peak_l, strip_peak_r);
 
             for bus in 0..bus_count {
-                let send_gain = self.params.send_gain(index, bus);
-                if send_gain > 0.0 {
-                    dsp::add_scaled(
-                        &mut self.bus_accum[bus][0][..frames],
-                        &self.strip_scratch[0][..frames],
-                        send_gain,
-                    );
-                    dsp::add_scaled(
-                        &mut self.bus_accum[bus][1][..frames],
-                        &self.strip_scratch[1][..frames],
-                        send_gain,
-                    );
+                let gain_target = self.params.send_gain(index, bus);
+                let gain = {
+                    let smoothed = &mut self.send_gain_smooth[index][bus];
+                    *smoothed += (gain_target - *smoothed) * SMOOTHING;
+                    *smoothed
+                };
+                if gain <= 1.0e-6 {
+                    continue;
                 }
+
+                let delay_target =
+                    self.params.send_delay(index, bus) * self.sample_rate / 1000.0;
+                let delay = {
+                    let smoothed = &mut self.send_delay_smooth[index][bus];
+                    *smoothed += (delay_target - *smoothed) * SMOOTHING;
+                    *smoothed
+                };
+
+                let [send_l, send_r] = &mut self.send_scratch;
+                self.send_delays[index][bus].process(
+                    &self.strip_scratch[0][..frames],
+                    &self.strip_scratch[1][..frames],
+                    &mut send_l[..frames],
+                    &mut send_r[..frames],
+                    delay,
+                );
+                dsp::add_scaled(
+                    &mut self.bus_accum[bus][0][..frames],
+                    &send_l[..frames],
+                    gain,
+                );
+                dsp::add_scaled(
+                    &mut self.bus_accum[bus][1][..frames],
+                    &send_r[..frames],
+                    gain,
+                );
             }
         }
     }
@@ -691,6 +719,8 @@ impl ProcessHandler for MixerGraph {
 
         self.strip_scratch[0].resize(size, 0.0);
         self.strip_scratch[1].resize(size, 0.0);
+        self.send_scratch[0].resize(size, 0.0);
+        self.send_scratch[1].resize(size, 0.0);
         self.bus_scratch[0].resize(size, 0.0);
         self.bus_scratch[1].resize(size, 0.0);
         for accumulator in &mut self.bus_accum {
@@ -736,6 +766,8 @@ impl JackEngine {
         let bus_count = params.bus_count();
         let sample_rate = client.sample_rate() as f64;
         let buffer_size = client.buffer_size() as usize;
+        let max_delay_samples =
+            (vibemix_core::model::MAX_SEND_DELAY_MS as f64 / 1000.0 * sample_rate).ceil() as usize + 1;
 
         let built = build_chains(host, model, strip_count, bus_count, sample_rate, buffer_size, &params);
         let Built {
@@ -809,7 +841,18 @@ impl JackEngine {
             strip_gain_smooth: vec![0.0; strip_count],
             strip_input_smooth: vec![1.0; strip_count],
             bus_gain_smooth: vec![0.0; bus_count],
+            send_gain_smooth: (0..strip_count).map(|_| vec![0.0; bus_count]).collect(),
+            send_delay_smooth: (0..strip_count).map(|_| vec![0.0; bus_count]).collect(),
+            send_delays: (0..strip_count)
+                .map(|_| {
+                    (0..bus_count)
+                        .map(|_| dsp::DelayLine::new(max_delay_samples))
+                        .collect()
+                })
+                .collect(),
+            sample_rate: sample_rate as f32,
             strip_scratch: [vec![0.0; buffer_size], vec![0.0; buffer_size]],
+            send_scratch: [vec![0.0; buffer_size], vec![0.0; buffer_size]],
             bus_scratch: [vec![0.0; buffer_size], vec![0.0; buffer_size]],
             bus_accum: (0..bus_count)
                 .map(|_| [vec![0.0f32; buffer_size], vec![0.0f32; buffer_size]])

@@ -1,7 +1,7 @@
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::pin::Pin;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 use std::fs;
@@ -28,6 +28,7 @@ static SESSION_NONCE: AtomicU64 = AtomicU64::new(0);
 static WINDOW_NONCE: AtomicU64 = AtomicU64::new(0);
 static LAST_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
 static PENDING_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
+static SAMPLE_RATE: AtomicU32 = AtomicU32::new(48000);
 
 struct View {
     structure_json: String,
@@ -206,6 +207,10 @@ fn receive_loop(socket: UdpSocket) {
                                 *pending = Some(window);
                             }
                         }
+                    }
+
+                    if let Some(rate) = sample_rate_from_state(&json) {
+                        SAMPLE_RATE.store(rate, Ordering::SeqCst);
                     }
                 }
                 Some(ControlMessage::SessionResult { ok, path, error }) => {
@@ -388,6 +393,15 @@ fn window_from_state(json: &str) -> Option<(i32, i32, bool)> {
     Some((width, height, maximized))
 }
 
+fn sample_rate_from_state(json: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let rate = value.get("sample_rate")?.as_u64()?;
+    if rate == 0 {
+        return None;
+    }
+    Some(rate as u32)
+}
+
 fn build_plugins(
     plugins: Option<&Vec<serde_json::Value>>,
     location: u64,
@@ -465,6 +479,7 @@ fn split_state(json: &str) -> (String, String) {
             // Send levels change continuously, so keep them in `values` (which
             // does not reset the strip/bus repeaters) rather than in the
             // structural snapshot.
+            let mut send_delays = serde_json::Map::new();
             let sends: serde_json::Value = strip
                 .get("sends")
                 .and_then(serde_json::Value::as_array)
@@ -474,6 +489,11 @@ fn split_state(json: &str) -> (String, String) {
                         if let Some(bus) = send.get("bus").and_then(serde_json::Value::as_u64) {
                             let gain = send.get("gain").cloned().unwrap_or(serde_json::json!(0.0));
                             map.insert(bus.to_string(), gain);
+                            let delay = send
+                                .get("delay_ms")
+                                .cloned()
+                                .unwrap_or(serde_json::json!(0.0));
+                            send_delays.insert(bus.to_string(), delay);
                         }
                     }
                     serde_json::Value::Object(map)
@@ -495,6 +515,7 @@ fn split_state(json: &str) -> (String, String) {
                     "mute": strip.get("mute").cloned().unwrap_or(serde_json::json!(false)),
                     "solo": strip.get("solo").cloned().unwrap_or(serde_json::json!(false)),
                     "sends": sends,
+                    "send_delays": serde_json::Value::Object(send_delays),
                 }),
             );
         }
@@ -567,6 +588,7 @@ pub mod qobject {
         #[qproperty(QString, session_dir)]
         #[qproperty(QString, recent_files)]
         #[qproperty(QString, window_geometry)]
+        #[qproperty(i32, sample_rate)]
         #[namespace = "vibemix"]
         type Backend = super::BackendRust;
 
@@ -647,6 +669,10 @@ pub mod qobject {
         fn update_send_gain(&self, strip: i32, bus: i32, gain: f32);
 
         #[qinvokable]
+        #[cxx_name = "setSendDelay"]
+        fn update_send_delay(&self, strip: i32, bus: i32, ms: f32);
+
+        #[qinvokable]
         #[cxx_name = "addStrip"]
         fn add_strip(&self);
 
@@ -719,6 +745,7 @@ pub struct BackendRust {
     session_dir: QString,
     recent_files: QString,
     window_geometry: QString,
+    sample_rate: i32,
 }
 
 impl Default for BackendRust {
@@ -743,6 +770,7 @@ impl Default for BackendRust {
             ),
             recent_files: QString::from("[]"),
             window_geometry: QString::from(""),
+            sample_rate: 48000,
         }
     }
 }
@@ -840,6 +868,9 @@ impl qobject::Backend {
             self.as_mut()
                 .set_window_geometry(QString::from(json.as_str()));
         }
+
+        self.as_mut()
+            .set_sample_rate(SAMPLE_RATE.load(Ordering::SeqCst) as i32);
     }
 
     pub fn refresh(&self) {
@@ -977,6 +1008,15 @@ impl qobject::Backend {
             strip: strip as u32,
             bus: bus as u32,
             gain,
+        });
+    }
+
+    pub fn update_send_delay(&self, strip: i32, bus: i32, ms: f32) {
+        note_action("send delay");
+        send(ControlMessage::SetSendDelay {
+            strip: strip as u32,
+            bus: bus as u32,
+            ms,
         });
     }
 

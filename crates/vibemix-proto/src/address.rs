@@ -18,6 +18,7 @@ pub const BUS_RETURN: &str = "/vibemix/bus/return";
 pub const BUS_RETURN_GAIN: &str = "/vibemix/bus/return_gain";
 pub const BUS_SEND_GAIN: &str = "/vibemix/bus/send_gain";
 pub const SEND_GAIN: &str = "/vibemix/send/gain";
+pub const SEND_DELAY: &str = "/vibemix/send/delay";
 pub const PLUGIN_ADD: &str = "/vibemix/plugin/add";
 pub const PLUGIN_REMOVE: &str = "/vibemix/plugin/remove";
 pub const PLUGIN_MOVE: &str = "/vibemix/plugin/move";

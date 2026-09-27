@@ -23,6 +23,7 @@ pub struct SharedParams {
     bus_send_gain: Vec<AtomicU32>,
     bus_return_gain: Vec<AtomicU32>,
     send_gain: Vec<Vec<AtomicU32>>,
+    send_delay: Vec<Vec<AtomicU32>>,
     plugin_params: Vec<Vec<Vec<Vec<AtomicU32>>>>,
     plugin_bypass: Vec<Vec<Vec<AtomicBool>>>,
     bus_plugin_params: Vec<Vec<Vec<AtomicU32>>>,
@@ -48,6 +49,7 @@ impl SharedParams {
             bus_send_gain: gain_vec(bus_count),
             bus_return_gain: gain_vec(bus_count),
             send_gain: (0..strip_count).map(|_| zero_vec(bus_count)).collect(),
+            send_delay: (0..strip_count).map(|_| zero_vec(bus_count)).collect(),
             plugin_params: (0..strip_count)
                 .map(|_| {
                     (0..PLUGIN_CHAINS)
@@ -202,6 +204,23 @@ impl SharedParams {
     pub fn set_send_gain(&self, strip: usize, bus: usize, value: f32) {
         if let Some(slot) = self.send_gain.get(strip).and_then(|sends| sends.get(bus)) {
             slot.store(value.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    pub fn send_delay(&self, strip: usize, bus: usize) -> f32 {
+        self.send_delay
+            .get(strip)
+            .and_then(|sends| sends.get(bus))
+            .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
+            .unwrap_or(0.0)
+    }
+
+    pub fn set_send_delay(&self, strip: usize, bus: usize, value: f32) {
+        if let Some(slot) = self.send_delay.get(strip).and_then(|sends| sends.get(bus)) {
+            slot.store(
+                value.clamp(0.0, vibemix_core::model::MAX_SEND_DELAY_MS).to_bits(),
+                Ordering::Relaxed,
+            );
         }
     }
 
@@ -622,6 +641,10 @@ mod tests {
         assert_eq!(params.send_gain(0, 1), 0.5);
         assert_eq!(params.send_gain(1, 2), 0.25);
         assert_eq!(params.send_gain(1, 1), 0.0);
+
+        params.set_send_delay(0, 1, 12.5);
+        assert_eq!(params.send_delay(0, 1), 12.5);
+        assert_eq!(params.send_delay(0, 0), 0.0);
     }
 
     #[test]

@@ -72,6 +72,11 @@ pub enum ControlMessage {
         bus: u32,
         gain: f32,
     },
+    SetSendDelay {
+        strip: u32,
+        bus: u32,
+        ms: f32,
+    },
     AddStrip,
     AddBus,
     RemoveStrip {
@@ -234,6 +239,14 @@ impl ControlMessage {
                     OscType::Int(*strip as i32),
                     OscType::Int(*bus as i32),
                     OscType::Float(*gain),
+                ],
+            },
+            SetSendDelay { strip, bus, ms } => OscMessage {
+                addr: addr::SEND_DELAY.to_string(),
+                args: vec![
+                    OscType::Int(*strip as i32),
+                    OscType::Int(*bus as i32),
+                    OscType::Float(*ms),
                 ],
             },
             AddStrip => OscMessage {
@@ -521,6 +534,11 @@ impl ControlMessage {
                 bus: int(args, 1)? as u32,
                 gain: float(args, 2)?,
             }),
+            addr::SEND_DELAY => Some(ControlMessage::SetSendDelay {
+                strip: int(args, 0)? as u32,
+                bus: int(args, 1)? as u32,
+                ms: float(args, 2)?,
+            }),
             addr::STRIP_ADD => Some(ControlMessage::AddStrip),
             addr::BUS_ADD => Some(ControlMessage::AddBus),
             addr::STRIP_REMOVE => Some(ControlMessage::RemoveStrip {
@@ -736,6 +754,11 @@ mod tests {
             strip: 1,
             bus: 2,
             gain: 0.75,
+        });
+        roundtrip(ControlMessage::SetSendDelay {
+            strip: 1,
+            bus: 2,
+            ms: 12.5,
         });
     }
 

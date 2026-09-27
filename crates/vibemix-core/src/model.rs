@@ -43,7 +43,13 @@ pub struct Send {
     pub bus: BusId,
     pub gain: Gain,
     pub pre_fader: bool,
+    /// Alignment delay for this send, in milliseconds (`0..MAX_SEND_DELAY_MS`),
+    /// used to phase-align parallel paths (e.g. dry vs. latency-inducing FX).
+    #[serde(default)]
+    pub delay_ms: f32,
 }
+
+pub const MAX_SEND_DELAY_MS: f32 = 500.0;
 
 impl Send {
     pub fn new(bus: BusId) -> Self {
@@ -51,6 +57,7 @@ impl Send {
             bus,
             gain: Gain::UNITY,
             pre_fader: false,
+            delay_ms: 0.0,
         }
     }
 }
@@ -280,6 +287,7 @@ mod tests {
         model.strips[0]
             .plugins_post
             .push(PluginSlot::new(PluginId(0), "http://example.com/post"));
+        model.strips[0].sends[0].delay_ms = 12.5;
         model.strips[0].connections = Some(StripConnections {
             in_l: vec!["system:capture_1".to_string(), "app:out_l".to_string()],
             in_r: vec!["system:capture_2".to_string()],
@@ -307,6 +315,7 @@ mod tests {
         assert!(parsed.buses[0].return_inputs);
         assert_eq!(parsed.buses[0].send_gain, Gain(0.5));
         assert_eq!(parsed.buses[0].return_gain, Gain(0.75));
+        assert_eq!(parsed.strips[0].sends[0].delay_ms, 12.5);
         assert_eq!(
             parsed.buses[0]
                 .connections

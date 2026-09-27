@@ -385,6 +385,24 @@ impl Controller {
                     catalog: false,
                 }
             }
+            ControlMessage::SetSendDelay { strip, bus, ms } => {
+                let ms = ms.clamp(0.0, vibemix_core::model::MAX_SEND_DELAY_MS);
+                self.params
+                    .set_send_delay(strip as usize, bus as usize, ms);
+                if let Some(target) = self.model.strip_mut(StripId(strip)) {
+                    if let Some(send) = target.sends.iter_mut().find(|send| send.bus.0 == bus) {
+                        send.delay_ms = ms;
+                    } else {
+                        let mut send = Send::new(BusId(bus));
+                        send.delay_ms = ms;
+                        target.sends.push(send);
+                    }
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
             ControlMessage::AddStrip => Actions {
                 snapshot: self.add_strip(),
                 catalog: false,
@@ -1208,7 +1226,12 @@ impl Controller {
 
     fn send_state(&self, address: SocketAddr) {
         let message = ControlMessage::State {
-            json: build_state_json(&self.model, &self.params, &self.plugins),
+            json: build_state_json(
+                &self.model,
+                &self.params,
+                &self.plugins,
+                self.engine.sample_rate(),
+            ),
         };
         if let Ok(bytes) = message.encode() {
             let _ = self.socket.send_to(&bytes, address);
@@ -1411,6 +1434,7 @@ fn build_state_json(
     model: &MixerModel,
     params: &SharedParams,
     plugins: &[PluginInfo],
+    sample_rate: u32,
 ) -> String {
     let strips: Vec<serde_json::Value> = model
         .strips
@@ -1420,7 +1444,13 @@ fn build_state_json(
             let sends: Vec<serde_json::Value> = strip
                 .sends
                 .iter()
-                .map(|send| serde_json::json!({ "bus": send.bus.0, "gain": send.gain.0 }))
+                .map(|send| {
+                    serde_json::json!({
+                        "bus": send.bus.0,
+                        "gain": send.gain.0,
+                        "delay_ms": send.delay_ms,
+                    })
+                })
                 .collect();
             serde_json::json!({
                 "id": strip.id.0,
@@ -1471,7 +1501,13 @@ fn build_state_json(
         None => serde_json::Value::Null,
     };
 
-    serde_json::json!({ "strips": strips, "buses": buses, "window": window }).to_string()
+    serde_json::json!({
+        "strips": strips,
+        "buses": buses,
+        "window": window,
+        "sample_rate": sample_rate,
+    })
+    .to_string()
 }
 
 fn free_strip_slot(params: &SharedParams) -> Option<usize> {
@@ -1516,9 +1552,11 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
 
         for bus in 0..params.bus_count() {
             params.set_send_gain(index, bus, 0.0);
+            params.set_send_delay(index, bus, 0.0);
         }
         for send in &strip.sends {
             params.set_send_gain(index, send.bus.0 as usize, send.gain.0);
+            params.set_send_delay(index, send.bus.0 as usize, send.delay_ms);
         }
     }
 }
