@@ -206,7 +206,7 @@ struct MixerGraph {
     send_scratch: [Vec<f32>; 2],
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
-    buffer_size: usize,
+    capacity: usize,
 }
 
 impl MixerGraph {
@@ -689,7 +689,8 @@ impl ProcessHandler for MixerGraph {
         let paused = self.params.state_pause();
         self.params.set_state_ack(paused);
 
-        let frames = scope.n_frames() as usize;
+        let raw_frames = scope.n_frames() as usize;
+        let frames = raw_frames.min(self.capacity);
 
         for accumulator in &mut self.bus_accum {
             accumulator[0][..frames].fill(0.0);
@@ -699,33 +700,33 @@ impl ProcessHandler for MixerGraph {
         self.process_strips(scope, frames, paused);
         self.process_buses(scope, frames);
 
+        if raw_frames > frames {
+            // Period beyond the fixed buffer capacity: silence the tail of the
+            // bus outputs rather than emit stale samples.
+            for slot in &mut self.buses {
+                let Some(ports) = slot.as_mut() else {
+                    continue;
+                };
+                let out_l = ports.out_l.as_mut_slice(scope);
+                let out_r = ports.out_r.as_mut_slice(scope);
+                out_l[frames..raw_frames].fill(0.0);
+                out_r[frames..raw_frames].fill(0.0);
+            }
+        }
+
         Control::Continue
     }
 
     fn buffer_size(&mut self, _client: &Client, size: Frames) -> Control {
         let size = size as usize;
-        if size != self.buffer_size {
-            self.buffer_size = size;
-            if size > PluginInstance::max_frames() {
-                tracing::warn!(
-                    size,
-                    max = PluginInstance::max_frames(),
-                    "host period exceeds plugin max; plugins process only the first max frames"
-                );
-            } else {
-                tracing::info!(size, "host period changed");
-            }
-        }
-
-        self.strip_scratch[0].resize(size, 0.0);
-        self.strip_scratch[1].resize(size, 0.0);
-        self.send_scratch[0].resize(size, 0.0);
-        self.send_scratch[1].resize(size, 0.0);
-        self.bus_scratch[0].resize(size, 0.0);
-        self.bus_scratch[1].resize(size, 0.0);
-        for accumulator in &mut self.bus_accum {
-            accumulator[0].resize(size, 0.0);
-            accumulator[1].resize(size, 0.0);
+        if size > self.capacity {
+            tracing::warn!(
+                size,
+                capacity = self.capacity,
+                "host period exceeds buffer capacity; processing is truncated"
+            );
+        } else {
+            tracing::debug!(size, "host period changed");
         }
         Control::Continue
     }
@@ -766,6 +767,9 @@ impl JackEngine {
         let bus_count = params.bus_count();
         let sample_rate = client.sample_rate() as f64;
         let buffer_size = client.buffer_size() as usize;
+        // Buffer capacity is fixed for the client's lifetime so the audio
+        // callback never allocates; periods larger than this are truncated.
+        let capacity = buffer_size.max(PluginInstance::max_frames());
         let max_delay_samples =
             (vibemix_core::model::MAX_SEND_DELAY_MS as f64 / 1000.0 * sample_rate).ceil() as usize + 1;
 
@@ -851,13 +855,13 @@ impl JackEngine {
                 })
                 .collect(),
             sample_rate: sample_rate as f32,
-            strip_scratch: [vec![0.0; buffer_size], vec![0.0; buffer_size]],
-            send_scratch: [vec![0.0; buffer_size], vec![0.0; buffer_size]],
-            bus_scratch: [vec![0.0; buffer_size], vec![0.0; buffer_size]],
+            strip_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            send_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             bus_accum: (0..bus_count)
-                .map(|_| [vec![0.0f32; buffer_size], vec![0.0f32; buffer_size]])
+                .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
                 .collect(),
-            buffer_size,
+            capacity,
         };
 
         let active = client
