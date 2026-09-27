@@ -7,12 +7,15 @@ use std::time::{Duration, Instant};
 
 use vibemix_core::config::config_dir;
 use vibemix_core::ids::{BusId, StripId};
-use vibemix_core::model::{Bus, MixerModel, PluginSlot, Send, Strip, WindowGeometry};
+use vibemix_core::model::{
+    Bus, MixerModel, PluginSlot, Send, Strip, WindowGeometry, MAX_SEND_DELAY_MS,
+};
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_lv2::{find_ui, Host, PluginInfo, PluginInstance, UiCandidate, UiWindow};
 use vibemix_proto::ControlMessage;
 
 use crate::backend_jack::{encode_state, make_slot_plugin, JackEngine};
+use crate::dsp;
 use crate::params::{SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS};
 
 const PLUGIN_LOC_STRIP_PRE: u32 = 0;
@@ -45,6 +48,7 @@ pub struct Controller {
     ui_safe: HashMap<String, bool>,
     missing_report: Option<String>,
     pending_session: Option<(bool, String, String)>,
+    sample_rate: u32,
 }
 
 struct UiWriteCtx {
@@ -109,6 +113,7 @@ impl Controller {
 
         let mut engine = engine;
         let missing_report = missing_report_json(&engine.take_missing_connections());
+        let sample_rate = engine.sample_rate();
 
         Ok(Self {
             socket,
@@ -127,6 +132,7 @@ impl Controller {
             ui_safe: HashMap::new(),
             missing_report,
             pending_session: None,
+            sample_rate,
         })
     }
 
@@ -154,6 +160,13 @@ impl Controller {
 
             self.engine.drain_garbage();
             self.pump_uis();
+
+            if let Some(rate) = self.engine.take_pending_sample_rate() {
+                if rate != self.sample_rate {
+                    self.handle_sample_rate(rate);
+                    actions.snapshot = true;
+                }
+            }
 
             let Some(address) = target else {
                 continue;
@@ -193,6 +206,35 @@ impl Controller {
                 let _ = self.socket.send_to(&bytes, address);
             }
         }
+    }
+
+    /// Rebuilds everything that depends on the sample rate (delay-line buffers
+    /// and plugin instances) after a JACK rate change.
+    fn handle_sample_rate(&mut self, rate: u32) {
+        tracing::info!(rate, "sample rate changed; rebuilding rate-dependent state");
+        self.capture_plugin_states();
+
+        let sample_rate = rate as f32;
+        let max_delay_samples = (MAX_SEND_DELAY_MS / 1000.0 * sample_rate).ceil() as usize + 1;
+        let delays: Vec<Vec<dsp::DelayLine>> = (0..self.params.strip_count())
+            .map(|_| {
+                (0..self.params.bus_count())
+                    .map(|_| dsp::DelayLine::new(max_delay_samples))
+                    .collect()
+            })
+            .collect();
+        if let Err(error) = self.engine.set_sample_rate(sample_rate, delays) {
+            tracing::warn!(%error, "failed to push sample-rate change");
+        }
+        self.sample_rate = rate;
+
+        if let Err(error) =
+            self.engine
+                .rebuild_plugins(&self.host, &mut self.model, &self.params, rate as f64)
+        {
+            tracing::warn!(%error, "failed to rebuild plugins after sample-rate change");
+        }
+        self.uis.clear();
     }
 
     fn apply(&mut self, message: ControlMessage) -> Actions {
@@ -571,7 +613,10 @@ impl Controller {
                 }
                 self.catalog_json = build_catalog(&self.plugins);
                 save_catalog(&self.plugins);
-                if let Err(error) = self.engine.rebuild_plugins(&self.host, &mut self.model, &self.params)
+                let sample_rate = self.engine.sample_rate() as f64;
+                if let Err(error) =
+                    self.engine
+                        .rebuild_plugins(&self.host, &mut self.model, &self.params, sample_rate)
                 {
                     tracing::warn!(%error, "failed to rebuild plugins after rescan");
                 }
@@ -617,7 +662,11 @@ impl Controller {
                 if let Err(error) = self.engine.sync_bus_return_ports(&self.params) {
                     tracing::warn!(%error, "failed to sync bus return ports for new session");
                 }
-                match self.engine.rebuild_plugins(&self.host, &mut model, &self.params) {
+                let sample_rate = self.engine.sample_rate() as f64;
+                match self
+                    .engine
+                    .rebuild_plugins(&self.host, &mut model, &self.params, sample_rate)
+                {
                     Ok(()) => {
                         self.uis.clear();
                         self.model = model;
@@ -648,7 +697,11 @@ impl Controller {
                     if let Err(error) = self.engine.sync_bus_return_ports(&self.params) {
                         tracing::warn!(%error, "failed to sync bus return ports for session");
                     }
-                    match self.engine.rebuild_plugins(&self.host, &mut loaded, &self.params) {
+                    let sample_rate = self.engine.sample_rate() as f64;
+                    match self
+                        .engine
+                        .rebuild_plugins(&self.host, &mut loaded, &self.params, sample_rate)
+                    {
                         Ok(()) => {
                             self.uis.clear();
                             self.model = loaded;
@@ -1230,7 +1283,8 @@ impl Controller {
                 &self.model,
                 &self.params,
                 &self.plugins,
-                self.engine.sample_rate(),
+                self.sample_rate,
+                self.engine.xrun_count(),
             ),
         };
         if let Ok(bytes) = message.encode() {
@@ -1435,6 +1489,7 @@ fn build_state_json(
     params: &SharedParams,
     plugins: &[PluginInfo],
     sample_rate: u32,
+    xruns: u64,
 ) -> String {
     let strips: Vec<serde_json::Value> = model
         .strips
@@ -1506,6 +1561,7 @@ fn build_state_json(
         "buses": buses,
         "window": window,
         "sample_rate": sample_rate,
+        "xruns": xruns,
     })
     .to_string()
 }

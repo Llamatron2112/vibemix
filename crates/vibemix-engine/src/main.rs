@@ -2,6 +2,7 @@ mod backend_jack;
 mod control;
 mod dsp;
 mod params;
+mod rt_guard;
 
 use std::sync::Arc;
 
@@ -12,6 +13,9 @@ use vibemix_lv2::{find_ui, Host};
 
 use crate::backend_jack::JackEngine;
 use crate::params::{SharedMeters, SharedParams};
+
+#[global_allocator]
+static GLOBAL_ALLOCATOR: rt_guard::GuardAllocator = rt_guard::GuardAllocator;
 
 #[derive(Debug, Parser)]
 #[command(name = "vibemix-engine", about = "vibemix audio mixer engine")]
@@ -43,6 +47,10 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if std::env::var_os("VIBEMIX_RT_GUARD").is_some() {
+        rt_guard::enable();
+    }
 
     if let Some(uri) = args.smoke.as_deref() {
         run_smoke(uri);

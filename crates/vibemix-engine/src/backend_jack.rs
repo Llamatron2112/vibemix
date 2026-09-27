@@ -1,9 +1,10 @@
+use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use jack::{
-    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, Port, ProcessHandler, ProcessScope,
-    Unowned,
+    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, NotificationHandler, Port,
+    ProcessHandler, ProcessScope, Unowned,
 };
 use rtrb::{Consumer, Producer};
 use vibemix_core::model::{BusConnections, MixerModel, PluginSlot, StripConnections};
@@ -98,6 +99,24 @@ pub struct MissingConnection {
     pub port: String,
 }
 
+/// Forwards JACK notifications we care about to the engine/control thread.
+pub struct Notifications {
+    pending_rate: Arc<AtomicU32>,
+    xruns: Arc<AtomicU64>,
+}
+
+impl NotificationHandler for Notifications {
+    fn sample_rate(&mut self, _client: &Client, srate: Frames) -> Control {
+        self.pending_rate.store(srate, Ordering::SeqCst);
+        Control::Continue
+    }
+
+    fn xrun(&mut self, _client: &Client) -> Control {
+        self.xruns.fetch_add(1, Ordering::SeqCst);
+        Control::Continue
+    }
+}
+
 pub enum EngineCommand {
     AddPlugin {
         strip: usize,
@@ -162,6 +181,10 @@ pub enum EngineCommand {
         chains: Vec<StripChains>,
         bus_chains: Vec<Vec<SlotPlugin>>,
     },
+    SetSampleRate {
+        sample_rate: f32,
+        delays: Vec<Vec<dsp::DelayLine>>,
+    },
 }
 
 struct StripPorts {
@@ -193,6 +216,7 @@ struct MixerGraph {
     garbage: Producer<SlotPlugin>,
     garbage_chains: Producer<Vec<SlotPlugin>>,
     garbage_nested: Producer<Vec<StripChains>>,
+    garbage_delays: Producer<Vec<Vec<dsp::DelayLine>>>,
     strip_gain_smooth: Vec<f32>,
     strip_pan_smooth: Vec<f32>,
     strip_input_smooth: Vec<f32>,
@@ -335,6 +359,23 @@ impl MixerGraph {
                     for chain in old_bus {
                         if let Err(chain) = self.garbage_chains.push(chain) { std::mem::forget(chain); }
                     }
+                }
+                EngineCommand::SetSampleRate {
+                    sample_rate,
+                    delays,
+                } => {
+                    let old = std::mem::replace(&mut self.send_delays, delays);
+                    if let Err(old) = self.garbage_delays.push(old) {
+                        std::mem::forget(old);
+                    }
+                    let old_rate = self.sample_rate;
+                    let ratio = if old_rate > 0.0 { sample_rate / old_rate } else { 1.0 };
+                    for sends in &mut self.send_delay_smooth {
+                        for value in sends.iter_mut() {
+                            *value *= ratio;
+                        }
+                    }
+                    self.sample_rate = sample_rate;
                 }
             }
         }
@@ -690,6 +731,7 @@ impl MixerGraph {
 
 impl ProcessHandler for MixerGraph {
     fn process(&mut self, _client: &Client, scope: &ProcessScope) -> Control {
+        let _rt_guard = crate::rt_guard::AudioScope::enter();
         dsp::flush_denormals();
         self.apply_commands();
 
@@ -740,11 +782,14 @@ impl ProcessHandler for MixerGraph {
 }
 
 pub struct JackEngine {
-    active: jack::AsyncClient<(), MixerGraph>,
+    active: jack::AsyncClient<Notifications, MixerGraph>,
     commands: Producer<EngineCommand>,
     garbage: Consumer<SlotPlugin>,
     garbage_chains: Consumer<Vec<SlotPlugin>>,
     garbage_nested: Consumer<Vec<StripChains>>,
+    garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
+    pending_rate: Arc<AtomicU32>,
+    xruns: Arc<AtomicU64>,
     state_proxies: Vec<StripProxies>,
     plugin_handles: Vec<StripHandles>,
     bus_state_proxies: Vec<Vec<Option<StateProxy>>>,
@@ -839,6 +884,8 @@ impl JackEngine {
             rtrb::RingBuffer::<Vec<SlotPlugin>>::new(garbage_chains_capacity);
         let (garbage_nested_producer, garbage_nested) =
             rtrb::RingBuffer::<Vec<StripChains>>::new(garbage_nested_capacity);
+        let (garbage_delays_producer, garbage_delays) =
+            rtrb::RingBuffer::<Vec<Vec<dsp::DelayLine>>>::new(4);
 
         let graph = MixerGraph {
             params: Arc::clone(&params),
@@ -854,6 +901,7 @@ impl JackEngine {
             garbage: garbage_producer,
             garbage_chains: garbage_chains_producer,
             garbage_nested: garbage_nested_producer,
+            garbage_delays: garbage_delays_producer,
             strip_gain_smooth: vec![0.0; strip_count],
             strip_pan_smooth: vec![0.0; strip_count],
             strip_input_smooth: vec![1.0; strip_count],
@@ -877,8 +925,16 @@ impl JackEngine {
             capacity,
         };
 
+        let pending_rate = Arc::new(AtomicU32::new(0));
+        let xruns = Arc::new(AtomicU64::new(0));
         let active = client
-            .activate_async((), graph)
+            .activate_async(
+                Notifications {
+                    pending_rate: Arc::clone(&pending_rate),
+                    xruns: Arc::clone(&xruns),
+                },
+                graph,
+            )
             .context("activate jack client")?;
 
         if auto_connect {
@@ -891,6 +947,9 @@ impl JackEngine {
             garbage,
             garbage_chains,
             garbage_nested,
+            garbage_delays,
+            pending_rate,
+            xruns,
             state_proxies,
             plugin_handles,
             bus_state_proxies,
@@ -915,6 +974,31 @@ impl JackEngine {
 
     pub fn buffer_size(&self) -> u32 {
         self.active.as_client().buffer_size()
+    }
+
+    /// Returns and clears a pending sample-rate change reported by JACK.
+    pub fn take_pending_sample_rate(&self) -> Option<u32> {
+        let rate = self.pending_rate.swap(0, Ordering::SeqCst);
+        (rate != 0).then_some(rate)
+    }
+
+    pub fn xrun_count(&self) -> u64 {
+        self.xruns.load(Ordering::Relaxed)
+    }
+
+    /// Swaps in delay lines sized for a new sample rate and updates the graph's
+    /// rate used for delay conversion.
+    pub fn set_sample_rate(
+        &mut self,
+        sample_rate: f32,
+        delays: Vec<Vec<dsp::DelayLine>>,
+    ) -> Result<()> {
+        self.commands
+            .push(EngineCommand::SetSampleRate {
+                sample_rate,
+                delays,
+            })
+            .map_err(|_| anyhow!("engine command queue full"))
     }
 
     pub fn add_plugin(
@@ -1511,8 +1595,8 @@ impl JackEngine {
         host: &Host,
         model: &mut MixerModel,
         params: &SharedParams,
+        sample_rate: f64,
     ) -> Result<()> {
-        let sample_rate = self.sample_rate() as f64;
         let buffer_size = self.buffer_size() as usize;
         let built = build_chains(
             host,
@@ -1540,6 +1624,7 @@ impl JackEngine {
         while self.garbage.pop().is_ok() {}
         while self.garbage_chains.pop().is_ok() {}
         while self.garbage_nested.pop().is_ok() {}
+        while self.garbage_delays.pop().is_ok() {}
     }
 }
 

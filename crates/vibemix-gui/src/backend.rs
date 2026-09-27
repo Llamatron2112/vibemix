@@ -29,6 +29,7 @@ static WINDOW_NONCE: AtomicU64 = AtomicU64::new(0);
 static LAST_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
 static PENDING_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
 static SAMPLE_RATE: AtomicU32 = AtomicU32::new(48000);
+static XRUNS: AtomicU32 = AtomicU32::new(0);
 
 struct View {
     structure_json: String,
@@ -211,6 +212,9 @@ fn receive_loop(socket: UdpSocket) {
 
                     if let Some(rate) = sample_rate_from_state(&json) {
                         SAMPLE_RATE.store(rate, Ordering::SeqCst);
+                    }
+                    if let Some(xruns) = xruns_from_state(&json) {
+                        XRUNS.store(xruns, Ordering::SeqCst);
                     }
                 }
                 Some(ControlMessage::SessionResult { ok, path, error }) => {
@@ -402,6 +406,12 @@ fn sample_rate_from_state(json: &str) -> Option<u32> {
     Some(rate as u32)
 }
 
+fn xruns_from_state(json: &str) -> Option<u32> {
+    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+    let xruns = value.get("xruns")?.as_u64()?;
+    Some(xruns.min(u32::MAX as u64) as u32)
+}
+
 fn build_plugins(
     plugins: Option<&Vec<serde_json::Value>>,
     location: u64,
@@ -589,6 +599,7 @@ pub mod qobject {
         #[qproperty(QString, recent_files)]
         #[qproperty(QString, window_geometry)]
         #[qproperty(i32, sample_rate)]
+        #[qproperty(i32, xruns)]
         #[namespace = "vibemix"]
         type Backend = super::BackendRust;
 
@@ -746,6 +757,7 @@ pub struct BackendRust {
     recent_files: QString,
     window_geometry: QString,
     sample_rate: i32,
+    xruns: i32,
 }
 
 impl Default for BackendRust {
@@ -771,6 +783,7 @@ impl Default for BackendRust {
             recent_files: QString::from("[]"),
             window_geometry: QString::from(""),
             sample_rate: 48000,
+            xruns: 0,
         }
     }
 }
@@ -871,6 +884,8 @@ impl qobject::Backend {
 
         self.as_mut()
             .set_sample_rate(SAMPLE_RATE.load(Ordering::SeqCst) as i32);
+        self.as_mut()
+            .set_xruns(XRUNS.load(Ordering::SeqCst) as i32);
     }
 
     pub fn refresh(&self) {

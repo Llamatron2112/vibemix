@@ -23,3 +23,4 @@ tracing-subscriber = { workspace = true }
 rosc = { workspace = true }
 rtrb = { workspace = true }
 jack = { workspace = true }
+libc = "0.2"

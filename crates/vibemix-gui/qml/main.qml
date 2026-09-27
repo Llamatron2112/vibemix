@@ -355,6 +355,13 @@ ApplicationWindow {
                     font.pixelSize: 11
                 }
 
+                Label {
+                    text: backend.xruns + " xruns"
+                    visible: backend.xruns > 0
+                    color: "#e53935"
+                    font.pixelSize: 11
+                }
+
                 Rectangle {
                     implicitWidth: 8
                     implicitHeight: 8

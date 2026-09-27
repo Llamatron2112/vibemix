@@ -44,12 +44,24 @@ PipeWire `pw_filter`) is added in Phase 5.
 
 ## Real-time safety rules
 
-- No heap allocation, locking, syscalls, or panics inside the JACK callback.
-- Parameter changes arrive through an SPSC ring (`rtrb`) and are applied at block start.
-- Scalar parameters (gain, mute, pan) use atomics with one-pole smoothing.
-- Structural changes (add/remove strip or plugin) happen off the RT thread; a brief
-  dropout is accepted until lock-free graph swapping lands.
+- No heap allocation, freeing, locking, syscalls, or panics inside the JACK
+  callback. Audio/accumulator buffers are sized once (`max(buffer, 8192)`) and
+  never resized; a longer period is truncated (bus outputs are zeroed).
+- Parameter changes arrive through an SPSC ring (`rtrb`) and are applied at block
+  start. Scalar parameters (gain, mute, pan, send gain/delay) use atomics with
+  one-pole smoothing, so live changes don't click.
+- Structural changes (add/remove strip, plugin, chain swap) are built on the
+  control thread and swapped in at a block boundary; retired plugin instances
+  and delay lines are handed back over garbage rings and dropped off the RT
+  thread (queues are sized so a full command queue's worth can never overflow;
+  on the pathological full case the object is leaked rather than freed).
+- Sample-rate changes are detected by a JACK notification handler and rebuild
+  delay-line buffers + plugin instances on the control thread (`SetSampleRate`).
+- FTZ/DAZ are enabled on the process thread so plugin tails don't fall into
+  denormals. JACK xruns are counted and surfaced in the GUI.
 - LV2 worker communication uses a dedicated non-RT worker thread.
+- Set `VIBEMIX_RT_GUARD=1` to abort (debug) if any heap operation happens on the
+  audio thread — used when testing/auditing.
 
 ## Mixer model
 
@@ -282,7 +294,8 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/meters` | `int strip_count, in_l…, in_r…, gain_l…, gain_r…, out_l…, out_r…, int bus_count, buses_l…, buses_r…` (linear peak levels, engine to GUI, ~50 Hz) |
 
 Meters and state snapshots are sent to the last address that sent a control
-message. Sessions are TOML-serialized `MixerModel` files, including plugin URIs
+message. State snapshots also carry `window`, `sample_rate` and the `xruns`
+count. Sessions are TOML-serialized `MixerModel` files, including plugin URIs
 and parameter values and the last window size/maximized (`window`). Reordering
 strips/buses (`*/move`) permutes the model's display order only: engine slots,
 ports and parameters are keyed by id, so audio routing is unaffected. The master
