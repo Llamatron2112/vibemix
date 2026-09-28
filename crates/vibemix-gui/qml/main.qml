@@ -836,8 +836,38 @@ ApplicationWindow {
             border.width: 1
             clip: true
 
+            // Right-click the empty space (empty chain or below the rows) for
+            // chain-level actions. The ListView is parented to this MouseArea
+            // so right-clicks on blank areas bubble up to it; row delegates
+            // keep their own menu on top.
+            MouseArea {
+                id: slotBackground
+                anchors.fill: parent
+                acceptedButtons: Qt.RightButton
+                hoverEnabled: true
+                onClicked: slotMenu.popup()
+
+                Menu {
+                    id: slotMenu
+                    MenuItem {
+                        text: "Add plugin…"
+                        onTriggered: root.openPicker(pluginListRoot.location, pluginListRoot.target)
+                    }
+                    MenuItem {
+                        text: backend.clipboard_name.length > 0
+                            ? "Paste \"" + backend.clipboard_name + "\""
+                            : "Paste"
+                        enabled: backend.has_clipboard
+                        onTriggered: backend.pastePlugin(
+                            pluginListRoot.location,
+                            pluginListRoot.target)
+                    }
+                }
+            }
+
             ListView {
                 id: listView
+                parent: slotBackground
                 anchors.fill: parent
                 anchors.margins: 1
                 clip: true
@@ -966,17 +996,14 @@ ApplicationWindow {
                                 pluginListRoot.target,
                                 pluginRow.pluginData.slot)
                         }
+                        MenuSeparator { }
+                        MenuItem {
+                            text: "Add plugin…"
+                            onTriggered: root.openPicker(pluginListRoot.location, pluginListRoot.target)
+                        }
                     }
                 }
             }
-        }
-
-        FlatButton {
-            text: "+"
-            width: root.stripBody
-            implicitHeight: 20
-            enabled: backend.connected
-            onClicked: root.openPicker(pluginListRoot.location, pluginListRoot.target)
         }
     }
 

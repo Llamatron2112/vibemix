@@ -341,8 +341,10 @@ The GUI exposes a File menu (New/Open/Save/Save As/Recent/Quit) backed by
 and warns about unsaved changes (tracked by comparing state snapshots against the
 last saved state) before New/Open/Quit. An Edit menu and `Ctrl+Z`/`Ctrl+Shift+Z`
 drive undo/redo (labels come from `/vibemix/edit/state`); plugin context menus
-offer Copy/Cut/Paste (labelled with the clipboard contents), and strip/bus
-context menus offer Duplicate.
+offer Add plugin…, Copy/Cut/Paste (labelled with the clipboard contents), and
+strip/bus context menus offer Duplicate. Right-clicking a plugin list — a row or
+the blank area of an empty/partly-filled chain — opens the same plugin menu, so
+there is no separate "+" add button.
 
 Plugin messages address a chain with `location` — `0` strip pre-fader, `1` strip
 post-fader, `2` bus insert — and `target` (the strip or bus id).
