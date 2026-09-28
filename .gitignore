@@ -6,6 +6,9 @@
 .cargo/
 .qmlls.ini
 
+# Local Arch packaging (generated per machine)
+packaging/arch/
+
 # Editor / OS
 .idea/
 .vscode/
