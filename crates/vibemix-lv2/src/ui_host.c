@@ -46,6 +46,7 @@ typedef struct {
   Atom wm_delete;
   void* gtk_window;
   void* gtk_box;
+  unsigned long delete_signal;
   SuilHost* host;
   SuilInstance* inst;
   VibemixPortWrite write_cb;
@@ -72,6 +73,7 @@ typedef struct {
   void* (*vbox_new)(int homogeneous, int spacing);
   void* (*box_new)(int orientation, int spacing);
   void (*widget_show_all)(void* widget);
+  void (*widget_hide)(void* widget);
   void (*widget_destroy)(void* widget);
   void* (*widget_get_parent)(void* widget);
   int (*events_pending)(void);
@@ -79,6 +81,7 @@ typedef struct {
   unsigned long (*signal_connect_data)(void* instance, const char* signal,
                                        void* handler, void* data, void* destroy,
                                        int flags);
+  void (*signal_handler_disconnect)(void* instance, unsigned long handler_id);
 } VibemixGtk;
 
 static VibemixGtk g_gtk;
@@ -147,15 +150,6 @@ static int count_uis_of_type(const char* type_uri) {
   return count;
 }
 
-static int gtk_lib_present(const char* name) {
-  void* handle = dlopen(name, RTLD_LAZY);
-  if (!handle) {
-    return 0;
-  }
-  dlclose(handle);
-  return 1;
-}
-
 static int load_symbol(void* lib, const char* name, void* out) {
   void* sym = dlsym(lib, name);
   if (!sym) {
@@ -202,65 +196,47 @@ static int gtk_load(int version) {
   /* Optional symbols. */
   load_symbol(g_gtk.gtk, "gtk_window_set_wmclass", &g_gtk.window_set_wmclass);
   load_symbol(g_gtk.gtk, "gtk_widget_get_parent", &g_gtk.widget_get_parent);
+  load_symbol(g_gtk.gtk, "gtk_widget_hide", &g_gtk.widget_hide);
   if (!load_symbol(g_gtk.gobject, "g_signal_connect_data",
                    &g_gtk.signal_connect_data)) {
     fprintf(stderr, "[vibemix-ui] missing GObject symbol g_signal_connect_data\n");
     return 0;
   }
+  load_symbol(g_gtk.gobject, "g_signal_handler_disconnect",
+              &g_gtk.signal_handler_disconnect);
 
   g_gtk_loaded = 1;
   fprintf(stderr, "[vibemix-ui] hosting GTK%d plugin UIs\n", version);
   return 1;
 }
 
-/* Decide (once) which GTK major version to use, if any. */
+/* Decide (once) which GTK major version to use, if any. This only scans the
+   plugin metadata; it never loads GTK, so discovery stays toolkit-free. */
 int vibemix_gtk_version(void) {
   if (g_gtk_version >= 0) {
     return g_gtk_version;
   }
 
   const char* env = getenv("VIBEMIX_GTK");
-  int forced = 0;
   if (env) {
     if (!strcmp(env, "2") || !strcmp(env, "gtk2")) {
-      forced = 2;
-    } else if (!strcmp(env, "3") || !strcmp(env, "gtk3")) {
-      forced = 3;
+      g_gtk_version = 2;
+      return g_gtk_version;
     }
-  }
-
-  const char* name2 = "libgtk-x11-2.0.so.0";
-  const char* name3 = "libgtk-3.so.0";
-
-  if (forced) {
-    if (gtk_lib_present(forced == 2 ? name2 : name3)) {
-      g_gtk_version = forced;
-    } else {
-      fprintf(stderr, "[vibemix-ui] VIBEMIX_GTK=%s requested but libgtk is missing\n",
-              env);
-      g_gtk_version = 0;
+    if (!strcmp(env, "3") || !strcmp(env, "gtk3")) {
+      g_gtk_version = 3;
+      return g_gtk_version;
     }
-    return g_gtk_version;
   }
 
   int n2 = count_uis_of_type(LV2_UI__GtkUI);
   int n3 = count_uis_of_type(LV2_UI__Gtk3UI);
   if (n2 <= 0 && n3 <= 0) {
     g_gtk_version = 0;
-    return g_gtk_version;
-  }
-
-  /* Prefer the version with more hostable UIs; ties go to GTK3. */
-  int first = (n3 > n2) ? 3 : 2;
-  int second = (first == 3) ? 2 : 3;
-  int count_first = (first == 3) ? n3 : n2;
-  int count_second = (second == 3) ? n3 : n2;
-  if (count_first > 0 && gtk_lib_present(first == 2 ? name2 : name3)) {
-    g_gtk_version = first;
-  } else if (count_second > 0 && gtk_lib_present(second == 2 ? name2 : name3)) {
-    g_gtk_version = second;
   } else {
-    g_gtk_version = 0;
+    /* Prefer the version with more hostable UIs; ties go to GTK2 (where the
+       real-world plugins are today). */
+    g_gtk_version = (n3 > n2) ? 3 : 2;
   }
   return g_gtk_version;
 }
@@ -270,7 +246,14 @@ int vibemix_gtk_available(void) {
   if (version == 0) {
     return 0;
   }
-  if (!g_gtk_loaded && !gtk_load(version)) {
+  if (g_gtk_loaded) {
+    return 1;
+  }
+  /* Load exactly one GTK major version for the life of the process (loading
+     both is unsupported); if it fails, GTK UIs are disabled. */
+  if (!gtk_load(version)) {
+    fprintf(stderr, "[vibemix-ui] GTK%d unavailable; disabling GTK UIs\n", version);
+    g_gtk_version = 0;
     return 0;
   }
   return 1;
@@ -305,6 +288,11 @@ static int gtk_delete_event(void* widget, void* event, void* data) {
   VibemixUi* ui = (VibemixUi*)data;
   if (ui) {
     ui->close_requested = 1;
+    /* Hide right away so the window disappears while the control loop tears
+       it down on its next tick. */
+    if (g_gtk.widget_hide) {
+      g_gtk.widget_hide(widget);
+    }
   }
   return 1; /* TRUE: keep the window; we destroy it on close. */
 }
@@ -444,8 +432,8 @@ static int open_gtk(VibemixUi* ui, const char* ui_type, int headless, const char
     return 0;
   }
   g_gtk.container_add(ui->gtk_window, ui->gtk_box);
-  g_gtk.signal_connect_data(ui->gtk_window, "delete-event",
-                            (void*)gtk_delete_event, ui, NULL, 0);
+  ui->delete_signal = g_gtk.signal_connect_data(ui->gtk_window, "delete-event",
+                                                (void*)gtk_delete_event, ui, NULL, 0);
   (void)headless;
   return 1;
 }
@@ -582,7 +570,7 @@ void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui
     if (!headless) {
       g_gtk.widget_show_all(ui->gtk_window);
     }
-    while (g_gtk.events_pending()) {
+    for (int i = 0; i < 256 && g_gtk.events_pending(); ++i) {
       g_gtk.main_iteration_do(0);
     }
   }
@@ -611,7 +599,9 @@ void vibemix_ui_pump(void* handle) {
       }
     }
   } else if (g_gtk_loaded) {
-    while (g_gtk.events_pending()) {
+    /* Bounded drain: a UI that continuously posts events must not be able to
+       starve the control loop. */
+    for (int i = 0; i < 256 && g_gtk.events_pending(); ++i) {
       g_gtk.main_iteration_do(0);
     }
   }
@@ -642,20 +632,45 @@ void vibemix_ui_close(void* handle) {
   if (!ui) {
     return;
   }
-  if (ui->inst) {
-    suil_instance_free(ui->inst);
-  }
-  if (ui->host) {
-    suil_host_free(ui->host);
-  }
+
   if (ui->kind == 0) {
+    if (ui->inst) {
+      suil_instance_free(ui->inst);
+      ui->inst = NULL;
+    }
+    if (ui->host) {
+      suil_host_free(ui->host);
+      ui->host = NULL;
+    }
     if (ui->dpy) {
       XDestroyWindow(ui->dpy, ui->win);
       XCloseDisplay(ui->dpy);
+      ui->dpy = NULL;
     }
-  } else if (ui->gtk_window && g_gtk_loaded) {
-    g_gtk.widget_destroy(ui->gtk_window);
+  } else {
+    /* Destroy the host window first: it destroys the plugin widget and the
+       plugin's own "destroy" handler clears its internal pointer, so its
+       cleanup (from suil_instance_free) has nothing dangling to touch. This
+       matches the well-tested jalv ordering and avoids calling plugin cleanup
+       while its widgets are still parented. */
+    if (ui->gtk_window && g_gtk_loaded) {
+      if (ui->delete_signal && g_gtk.signal_handler_disconnect) {
+        g_gtk.signal_handler_disconnect(ui->gtk_window, ui->delete_signal);
+        ui->delete_signal = 0;
+      }
+      g_gtk.widget_destroy(ui->gtk_window);
+      ui->gtk_window = NULL;
+    }
+    if (ui->inst) {
+      suil_instance_free(ui->inst);
+      ui->inst = NULL;
+    }
+    if (ui->host) {
+      suil_host_free(ui->host);
+      ui->host = NULL;
+    }
   }
+
   free(ui->resize);
   free(ui);
 }
