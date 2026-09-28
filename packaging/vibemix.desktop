@@ -5,6 +5,7 @@ GenericName=Audio Mixer
 Comment=Modular LV2 audio mixer
 Exec=vibemix
 Icon=vibemix
+StartupWMClass=vibemix-gui
 Terminal=false
 Categories=AudioVideo;Audio;Mixer;
 Keywords=audio;mixer;jack;pipewire;lv2;daw;
