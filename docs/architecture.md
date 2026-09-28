@@ -216,13 +216,22 @@ when the plugin is instantiated. Save runs under a brief cooperative pause so
 the plugin's `save()` never races the RT callback, and `state:mapPath` is
 provided so file-path state (e.g. convolution IRs) round-trips.
 
-Native plugin UIs: the engine hosts X11-native UIs in X11 windows via `suil`
-(they appear through XWayland and are composited as normal windows). The engine
-owns the windows because LV2 UIs need same-process instance access, and pumps
-them in its control loop. Open/close from the GUI "UI" button
-(`/vibemix/plugin/ui` and `/vibemix/plugin/ui/close`). Only X11 UIs are
-hostable (215 plugins incl. LSP/x42); Gtk UIs (Calf) are not, and the UIs are
-separate floating windows (no embedding into the QML window).
+Native plugin UIs: the engine hosts plugin UIs in their own floating windows
+via `suil` (no embedding into the QML window). X11 UIs (LSP, x42, …) appear
+through XWayland; GTK2/GTK3 UIs (e.g. Calf) are hosted in a `GtkWindow`. The
+engine owns the windows because LV2 UIs need same-process instance access, and
+pumps them in its control loop. Open/close from the GUI "UI" button
+(`/vibemix/plugin/ui` and `/vibemix/plugin/ui/close`). A plugin offering both
+X11 and GTK is hosted as X11 (preferred).
+
+GTK is an **optional runtime dependency**, loaded with `dlopen()` and skipped
+when absent, so the engine runs on a system with no GTK at all. GTK2 and GTK3
+cannot be initialized in the same process, so exactly one major version is
+chosen: by default the version that actually has hostable plugin UIs (`ui:GtkUI`
+= GTK2, `ui:Gtk3UI` = GTK3; Calf → GTK2), overridable with
+`VIBEMIX_GTK=gtk2|gtk3`. GTK hosting advertises `ui:makeResident` (Calf requires
+it) and `ui:windowTitle`. Installing a GTK plugin after the catalog was built
+needs `/vibemix/plugins/rescan`.
 
 The host provides `ui:resize`, `ui:showInterface` (with the retained
 `LV2UI_Resize` kept alive for the UI), and `options:options` carrying
@@ -254,8 +263,8 @@ rather than taking the engine down. The smoke test runs headless (the window is
 never mapped) and also exercises the output-forwarding path, so it produces no
 visible flash.
 
-Not supported: Gtk/Qt plugin UIs. meters.lv2 EBU R128 stays blacklisted (it
-aborts on its own internal buffer).
+Not supported: Qt plugin UIs (and GTK4). meters.lv2 EBU R128 stays blacklisted
+(it aborts on its own internal buffer).
 
 This hosts ~209 mono/stereo plugins (LSP, Calf, x42 convolvers, meters.lv2, …).
 

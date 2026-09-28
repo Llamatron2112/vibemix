@@ -18,6 +18,12 @@
    StartupWMClass in packaging/vibemix.desktop). */
 #define VIBEMIX_WM_CLASS "vibemix-gui"
 
+/* GTK is an optional runtime dependency: it is dlopen()ed on demand and the
+   engine still runs when it (or its plugin UIs) are absent. GTK2 and GTK3
+   cannot be initialized in the same process, so exactly one major version is
+   chosen (VIBEMIX_GTK=gtk2|gtk3 overrides the automatic choice). */
+#define VIBEMIX_GTK_RESIDENT_FEATURE "http://lv2plug.in/ns/extensions/ui#makeResident"
+
 #include <lv2/atom/atom.h>
 #include <lv2/data-access/data-access.h>
 #include <lv2/instance-access/instance-access.h>
@@ -34,9 +40,12 @@ typedef struct {
 } VibemixUridMap;
 
 typedef struct {
+  int kind; /* 0 = X11, 2 = GTK2, 3 = GTK3 */
   Display* dpy;
   Window win;
   Atom wm_delete;
+  void* gtk_window;
+  void* gtk_box;
   SuilHost* host;
   SuilInstance* inst;
   VibemixPortWrite write_cb;
@@ -49,6 +58,33 @@ typedef struct {
   LV2_Options_Option options[3];
   LV2_Feature options_feature;
 } VibemixUi;
+
+/* GTK entry points resolved from the dlopen()ed libraries. */
+typedef struct {
+  void* gtk;
+  void* gobject;
+  int (*init_check)(int* argc, char*** argv);
+  void* (*window_new)(int type);
+  void (*window_set_title)(void* window, const char* title);
+  void (*window_set_wmclass)(void* window, const char* name, const char* klass);
+  void (*window_resize)(void* window, int width, int height);
+  void (*container_add)(void* container, void* widget);
+  void* (*vbox_new)(int homogeneous, int spacing);
+  void* (*box_new)(int orientation, int spacing);
+  void (*widget_show_all)(void* widget);
+  void (*widget_destroy)(void* widget);
+  void* (*widget_get_parent)(void* widget);
+  int (*events_pending)(void);
+  int (*main_iteration_do)(int blocking);
+  unsigned long (*signal_connect_data)(void* instance, const char* signal,
+                                       void* handler, void* data, void* destroy,
+                                       int flags);
+} VibemixGtk;
+
+static VibemixGtk g_gtk;
+static int g_gtk_loaded = 0;   /* symbols resolved */
+static int g_gtk_inited = 0;   /* gtk_init_check() has run */
+static int g_gtk_version = -1; /* -1 = undecided, 0 = none, 2, 3 */
 
 static LilvWorld* g_world = NULL;
 
@@ -72,6 +108,174 @@ static const void* data_access_fn(const char* uri) {
 }
 static LV2_Extension_Data_Feature g_data = {data_access_fn};
 
+static LilvWorld* ensure_world(void) {
+  if (!g_world) {
+    g_world = lilv_world_new();
+    lilv_world_load_all(g_world);
+  }
+  return g_world;
+}
+
+/* Number of plugins that expose at least one UI of `type_uri`. */
+static int count_uis_of_type(const char* type_uri) {
+  LilvWorld* world = ensure_world();
+  const LilvPlugins* plugins = lilv_world_get_all_plugins(world);
+  int count = 0;
+  LILV_FOREACH(plugins, pit, plugins) {
+    const LilvPlugin* plugin = lilv_plugins_get(plugins, pit);
+    LilvUIs* uis = lilv_plugin_get_uis(plugin);
+    int hit = 0;
+    LILV_FOREACH(uis, it, uis) {
+      const LilvUI* ui = lilv_uis_get(uis, it);
+      const LilvNodes* classes = lilv_ui_get_classes(ui);
+      LILV_FOREACH(nodes, cit, classes) {
+        const char* cls = lilv_node_as_uri(lilv_nodes_get(classes, cit));
+        if (!strcmp(cls, type_uri)) {
+          hit = 1;
+          break;
+        }
+      }
+      if (hit) {
+        break;
+      }
+    }
+    lilv_uis_free(uis);
+    if (hit) {
+      count++;
+    }
+  }
+  return count;
+}
+
+static int gtk_lib_present(const char* name) {
+  void* handle = dlopen(name, RTLD_LAZY);
+  if (!handle) {
+    return 0;
+  }
+  dlclose(handle);
+  return 1;
+}
+
+static int load_symbol(void* lib, const char* name, void* out) {
+  void* sym = dlsym(lib, name);
+  if (!sym) {
+    return 0;
+  }
+  memcpy(out, &sym, sizeof(sym));
+  return 1;
+}
+
+#define GTK_REQUIRE(field, name)                             \
+  do {                                                       \
+    if (!load_symbol(g_gtk.gtk, (name), &g_gtk.field)) {     \
+      fprintf(stderr, "[vibemix-ui] missing GTK symbol %s\n", (name)); \
+      return 0;                                              \
+    }                                                        \
+  } while (0)
+
+static int gtk_load(int version) {
+  memset(&g_gtk, 0, sizeof(g_gtk));
+  const char* gtk_name = (version == 2) ? "libgtk-x11-2.0.so.0" : "libgtk-3.so.0";
+  g_gtk.gtk = dlopen(gtk_name, RTLD_NOW | RTLD_GLOBAL);
+  if (!g_gtk.gtk) {
+    return 0;
+  }
+  g_gtk.gobject = dlopen("libgobject-2.0.so.0", RTLD_NOW | RTLD_GLOBAL);
+  if (!g_gtk.gobject) {
+    g_gtk.gobject = g_gtk.gtk;
+  }
+
+  GTK_REQUIRE(init_check, "gtk_init_check");
+  GTK_REQUIRE(window_new, "gtk_window_new");
+  GTK_REQUIRE(window_set_title, "gtk_window_set_title");
+  GTK_REQUIRE(window_resize, "gtk_window_resize");
+  GTK_REQUIRE(container_add, "gtk_container_add");
+  GTK_REQUIRE(widget_show_all, "gtk_widget_show_all");
+  GTK_REQUIRE(widget_destroy, "gtk_widget_destroy");
+  GTK_REQUIRE(events_pending, "gtk_events_pending");
+  GTK_REQUIRE(main_iteration_do, "gtk_main_iteration_do");
+  if (version == 2) {
+    GTK_REQUIRE(vbox_new, "gtk_vbox_new");
+  } else {
+    GTK_REQUIRE(box_new, "gtk_box_new");
+  }
+  /* Optional symbols. */
+  load_symbol(g_gtk.gtk, "gtk_window_set_wmclass", &g_gtk.window_set_wmclass);
+  load_symbol(g_gtk.gtk, "gtk_widget_get_parent", &g_gtk.widget_get_parent);
+  if (!load_symbol(g_gtk.gobject, "g_signal_connect_data",
+                   &g_gtk.signal_connect_data)) {
+    fprintf(stderr, "[vibemix-ui] missing GObject symbol g_signal_connect_data\n");
+    return 0;
+  }
+
+  g_gtk_loaded = 1;
+  fprintf(stderr, "[vibemix-ui] hosting GTK%d plugin UIs\n", version);
+  return 1;
+}
+
+/* Decide (once) which GTK major version to use, if any. */
+int vibemix_gtk_version(void) {
+  if (g_gtk_version >= 0) {
+    return g_gtk_version;
+  }
+
+  const char* env = getenv("VIBEMIX_GTK");
+  int forced = 0;
+  if (env) {
+    if (!strcmp(env, "2") || !strcmp(env, "gtk2")) {
+      forced = 2;
+    } else if (!strcmp(env, "3") || !strcmp(env, "gtk3")) {
+      forced = 3;
+    }
+  }
+
+  const char* name2 = "libgtk-x11-2.0.so.0";
+  const char* name3 = "libgtk-3.so.0";
+
+  if (forced) {
+    if (gtk_lib_present(forced == 2 ? name2 : name3)) {
+      g_gtk_version = forced;
+    } else {
+      fprintf(stderr, "[vibemix-ui] VIBEMIX_GTK=%s requested but libgtk is missing\n",
+              env);
+      g_gtk_version = 0;
+    }
+    return g_gtk_version;
+  }
+
+  int n2 = count_uis_of_type(LV2_UI__GtkUI);
+  int n3 = count_uis_of_type(LV2_UI__Gtk3UI);
+  if (n2 <= 0 && n3 <= 0) {
+    g_gtk_version = 0;
+    return g_gtk_version;
+  }
+
+  /* Prefer the version with more hostable UIs; ties go to GTK3. */
+  int first = (n3 > n2) ? 3 : 2;
+  int second = (first == 3) ? 2 : 3;
+  int count_first = (first == 3) ? n3 : n2;
+  int count_second = (second == 3) ? n3 : n2;
+  if (count_first > 0 && gtk_lib_present(first == 2 ? name2 : name3)) {
+    g_gtk_version = first;
+  } else if (count_second > 0 && gtk_lib_present(second == 2 ? name2 : name3)) {
+    g_gtk_version = second;
+  } else {
+    g_gtk_version = 0;
+  }
+  return g_gtk_version;
+}
+
+int vibemix_gtk_available(void) {
+  int version = vibemix_gtk_version();
+  if (version == 0) {
+    return 0;
+  }
+  if (!g_gtk_loaded && !gtk_load(version)) {
+    return 0;
+  }
+  return 1;
+}
+
 static int ui_x_error(Display* dpy, XErrorEvent* event) {
   char buffer[256];
   XGetErrorText(dpy, event->error_code, buffer, sizeof(buffer));
@@ -82,10 +286,27 @@ static int ui_x_error(Display* dpy, XErrorEvent* event) {
 
 static int ui_resize_cb(void* handle, int width, int height) {
   VibemixUi* ui = (VibemixUi*)handle;
-  if (ui && ui->dpy) {
-    XResizeWindow(ui->dpy, ui->win, (unsigned)width, (unsigned)height);
+  if (!ui) {
+    return 0;
+  }
+  if (ui->kind == 0) {
+    if (ui->dpy) {
+      XResizeWindow(ui->dpy, ui->win, (unsigned)width, (unsigned)height);
+    }
+  } else if (ui->gtk_window && g_gtk.window_resize) {
+    g_gtk.window_resize(ui->gtk_window, width, height);
   }
   return 0;
+}
+
+static int gtk_delete_event(void* widget, void* event, void* data) {
+  (void)widget;
+  (void)event;
+  VibemixUi* ui = (VibemixUi*)data;
+  if (ui) {
+    ui->close_requested = 1;
+  }
+  return 1; /* TRUE: keep the window; we destroy it on close. */
 }
 
 static void suil_write(SuilController controller, uint32_t port_index, uint32_t size,
@@ -109,14 +330,11 @@ int vibemix_ui_supported(const char* host_type, const char* ui_type) {
 int vibemix_ui_find(const char* plugin_uri, const char* want_type, char* ui_uri,
                     int ui_uri_cap, char* bundle, int bundle_cap, char* binary,
                     int binary_cap) {
-  if (!g_world) {
-    g_world = lilv_world_new();
-    lilv_world_load_all(g_world);
-  }
+  LilvWorld* world = ensure_world();
 
-  LilvNode* pnode = lilv_new_uri(g_world, plugin_uri);
+  LilvNode* pnode = lilv_new_uri(world, plugin_uri);
   const LilvPlugin* plugin =
-      lilv_plugins_get_by_uri(lilv_world_get_all_plugins(g_world), pnode);
+      lilv_plugins_get_by_uri(lilv_world_get_all_plugins(world), pnode);
   lilv_node_free(pnode);
   if (!plugin) {
     return 0;
@@ -156,34 +374,26 @@ int vibemix_ui_find(const char* plugin_uri, const char* want_type, char* ui_uri,
   return found;
 }
 
-void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui_type,
-                      const char* bundle_path, const char* binary_path,
-                      void* plugin_handle, void* urid_map, void* urid_unmap,
-                      VibemixPortWrite write_cb, void* write_user, int headless,
-                      const char* title) {
-  vibemix_ui_init();
+/* Create the X11 host window and set its app identity. */
+static int open_x11(VibemixUi* ui, int headless, const char* title) {
   XSetErrorHandler(ui_x_error);
   Display* dpy = XOpenDisplay(NULL);
   if (!dpy) {
-    return NULL;
+    fprintf(stderr, "[vibemix-ui] cannot open X display\n");
+    return 0;
   }
-
-  VibemixUi* ui = (VibemixUi*)calloc(1, sizeof(VibemixUi));
+  ui->kind = 0;
   ui->dpy = dpy;
-  ui->write_cb = write_cb;
-  ui->write_user = write_user;
-  ui->shown = 1;
 
   int screen = DefaultScreen(dpy);
   ui->win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen), 80, 80, 760, 520, 0,
                                 BlackPixel(dpy, screen), WhitePixel(dpy, screen));
-  const char* window_title = (title && *title) ? title : "vibemix plugin UI";
-  XStoreName(dpy, ui->win, window_title);
+  XStoreName(dpy, ui->win, title);
   {
     Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
     Atom utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
     XChangeProperty(dpy, ui->win, net_wm_name, utf8_string, 8, PropModeReplace,
-                    (const unsigned char*)window_title, (int)strlen(window_title));
+                    (const unsigned char*)title, (int)strlen(title));
   }
   {
     XClassHint class_hint;
@@ -201,6 +411,91 @@ void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui
   XSetWMProtocols(dpy, ui->win, &ui->wm_delete, 1);
   if (!headless) {
     XMapWindow(dpy, ui->win);
+  }
+  return 1;
+}
+
+/* Create the GTK host window and container widget. */
+static int open_gtk(VibemixUi* ui, const char* ui_type, int headless, const char* title) {
+  if (!vibemix_gtk_available()) {
+    return 0;
+  }
+  if (!g_gtk_inited) {
+    if (!g_gtk.init_check(NULL, NULL)) {
+      fprintf(stderr, "[vibemix-ui] gtk_init_check failed\n");
+      return 0;
+    }
+    g_gtk_inited = 1;
+  }
+
+  int version = !strcmp(ui_type, LV2_UI__Gtk3UI) ? 3 : 2;
+  ui->kind = version;
+  ui->gtk_window = g_gtk.window_new(0 /* GTK_WINDOW_TOPLEVEL */);
+  if (!ui->gtk_window) {
+    return 0;
+  }
+  g_gtk.window_set_title(ui->gtk_window, title);
+  if (g_gtk.window_set_wmclass) {
+    g_gtk.window_set_wmclass(ui->gtk_window, VIBEMIX_WM_CLASS, VIBEMIX_WM_CLASS);
+  }
+  ui->gtk_box = (version == 3) ? g_gtk.box_new(1 /* VERTICAL */, 0)
+                               : g_gtk.vbox_new(0, 0);
+  if (!ui->gtk_box) {
+    return 0;
+  }
+  g_gtk.container_add(ui->gtk_window, ui->gtk_box);
+  g_gtk.signal_connect_data(ui->gtk_window, "delete-event",
+                            (void*)gtk_delete_event, ui, NULL, 0);
+  (void)headless;
+  return 1;
+}
+
+void vibemix_ui_set_title(void* handle, const char* title) {
+  VibemixUi* ui = (VibemixUi*)handle;
+  if (!ui || !title || !*title) {
+    return;
+  }
+  if (ui->kind == 0) {
+    if (ui->dpy) {
+      XStoreName(ui->dpy, ui->win, title);
+      Atom net_wm_name = XInternAtom(ui->dpy, "_NET_WM_NAME", False);
+      Atom utf8_string = XInternAtom(ui->dpy, "UTF8_STRING", False);
+      XChangeProperty(ui->dpy, ui->win, net_wm_name, utf8_string, 8, PropModeReplace,
+                      (const unsigned char*)title, (int)strlen(title));
+    }
+  } else if (ui->gtk_window) {
+    g_gtk.window_set_title(ui->gtk_window, title);
+  }
+}
+
+void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui_type,
+                      const char* bundle_path, const char* binary_path,
+                      void* plugin_handle, void* urid_map, void* urid_unmap,
+                      VibemixPortWrite write_cb, void* write_user, int headless,
+                      const char* title) {
+  vibemix_ui_init();
+
+  int is_gtk = (!strcmp(ui_type, LV2_UI__GtkUI) || !strcmp(ui_type, LV2_UI__Gtk3UI));
+  const char* window_title = (title && *title) ? title : "vibemix plugin UI";
+
+  VibemixUi* ui = (VibemixUi*)calloc(1, sizeof(VibemixUi));
+  ui->write_cb = write_cb;
+  ui->write_user = write_user;
+  ui->shown = 1;
+
+  void* parent_data = NULL;
+  if (is_gtk) {
+    if (!open_gtk(ui, ui_type, headless, window_title)) {
+      free(ui);
+      return NULL;
+    }
+    parent_data = ui->gtk_box;
+  } else {
+    if (!open_x11(ui, headless, window_title)) {
+      free(ui);
+      return NULL;
+    }
+    parent_data = (void*)(uintptr_t)ui->win;
   }
 
   ui->resize = (LV2UI_Resize*)malloc(sizeof(LV2UI_Resize));
@@ -231,8 +526,9 @@ void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui
   ui->options_feature.URI = LV2_OPTIONS__options;
   ui->options_feature.data = ui->options;
 
-  LV2_Feature parent_feature = {"http://lv2plug.in/ns/extensions/ui#parent",
-                                (void*)(uintptr_t)ui->win};
+  int resident = 1;
+  char* ui_title = NULL;
+  LV2_Feature parent_feature = {LV2_UI__parent, parent_data};
   LV2_Feature instance_feature = {LV2_INSTANCE_ACCESS_URI, plugin_handle};
   LV2_Feature data_feature = {LV2_DATA_ACCESS_URI, &g_data};
   LV2_Feature map_feature = {LV2_URID__map, urid_map};
@@ -240,10 +536,13 @@ void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui
   LV2_Feature resize_feature = {"http://lv2plug.in/ns/extensions/ui#resize", ui->resize};
   LV2_Feature show_feature = {"http://lv2plug.in/ns/extensions/ui#showInterface",
                               &ui->shown};
+  LV2_Feature resident_feature = {VIBEMIX_GTK_RESIDENT_FEATURE, &resident};
+  LV2_Feature title_feature = {LV2_UI__windowTitle, &ui_title};
   const LV2_Feature* features[] = {&parent_feature,   &instance_feature,
                                    &data_feature,     &map_feature,
                                    &unmap_feature,    &resize_feature,
                                    &show_feature,     &ui->options_feature,
+                                   &resident_feature, &title_feature,
                                    NULL};
 
   ui->host = suil_host_new(suil_write, suil_index, NULL, NULL);
@@ -257,16 +556,40 @@ void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui
     dlopen(binary_path, RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
   }
 
-  ui->inst = suil_instance_new(ui->host, (SuilController)ui,
-                               "http://lv2plug.in/ns/extensions/ui#X11UI", plugin_uri,
+  /* For GTK UIs the container type matches the UI type (native hosting). */
+  const char* container_type = is_gtk ? ui_type : LV2_UI__X11UI;
+  ui->inst = suil_instance_new(ui->host, (SuilController)ui, container_type, plugin_uri,
                                ui_uri, ui_type, bundle_path, binary_path, features);
   if (!ui->inst) {
+    fprintf(stderr, "[vibemix-ui] failed to instantiate UI %s\n", ui_uri);
     suil_host_free(ui->host);
-    XDestroyWindow(dpy, ui->win);
-    XCloseDisplay(dpy);
+    if (ui->kind == 0 && ui->dpy) {
+      XDestroyWindow(ui->dpy, ui->win);
+      XCloseDisplay(ui->dpy);
+    } else if (ui->gtk_window) {
+      g_gtk.widget_destroy(ui->gtk_window);
+    }
     free(ui->resize);
     free(ui);
     return NULL;
+  }
+
+  if (is_gtk) {
+    void* widget = suil_instance_get_widget(ui->inst);
+    if (widget && g_gtk.widget_get_parent && !g_gtk.widget_get_parent(widget)) {
+      g_gtk.container_add(ui->gtk_box, widget);
+    }
+    if (!headless) {
+      g_gtk.widget_show_all(ui->gtk_window);
+    }
+    while (g_gtk.events_pending()) {
+      g_gtk.main_iteration_do(0);
+    }
+  }
+
+  /* The UI may have proposed a window title via ui:windowTitle. */
+  if (ui_title && *ui_title) {
+    vibemix_ui_set_title(ui, ui_title);
   }
 
   return ui;
@@ -278,12 +601,18 @@ void vibemix_ui_pump(void* handle) {
     return;
   }
 
-  while (XPending(ui->dpy)) {
-    XEvent event;
-    XNextEvent(ui->dpy, &event);
-    if (event.type == ClientMessage &&
-        (Atom)event.xclient.data.l[0] == ui->wm_delete) {
-      ui->close_requested = 1;
+  if (ui->kind == 0) {
+    while (XPending(ui->dpy)) {
+      XEvent event;
+      XNextEvent(ui->dpy, &event);
+      if (event.type == ClientMessage &&
+          (Atom)event.xclient.data.l[0] == ui->wm_delete) {
+        ui->close_requested = 1;
+      }
+    }
+  } else if (g_gtk_loaded) {
+    while (g_gtk.events_pending()) {
+      g_gtk.main_iteration_do(0);
     }
   }
 
@@ -319,9 +648,13 @@ void vibemix_ui_close(void* handle) {
   if (ui->host) {
     suil_host_free(ui->host);
   }
-  if (ui->dpy) {
-    XDestroyWindow(ui->dpy, ui->win);
-    XCloseDisplay(ui->dpy);
+  if (ui->kind == 0) {
+    if (ui->dpy) {
+      XDestroyWindow(ui->dpy, ui->win);
+      XCloseDisplay(ui->dpy);
+    }
+  } else if (ui->gtk_window && g_gtk_loaded) {
+    g_gtk.widget_destroy(ui->gtk_window);
   }
   free(ui->resize);
   free(ui);

@@ -18,6 +18,9 @@ Notes:
 - `lld` provides a fast linker; Qt's Cargo link step fails with the default `ld.bfd`.
 - `clang` / `libclang` are **not** required for `cxx-qt` (a C++17 compiler is enough).
 - Optional LV2 test plugins: `sudo dnf install calf lsp-plugins-lv2 x42-plugins zam-plugins`.
+- Optional **GTK plugin UIs** (e.g. Calf's GTK2 GUI, packaged separately on some
+  distros): `gtk2` and/or `gtk3` at runtime. Nothing is linked against at build
+  time; the engine `dlopen`s GTK and simply skips GTK UIs when it is missing.
 
 ## Verify
 
@@ -78,7 +81,21 @@ Environment variables:
 - `VIBEMIX_CONFIG_DIR` — config directory (default `$XDG_CONFIG_HOME/vibemix`,
   i.e. `~/.config/vibemix`); holds `recent.json`, `catalog.json` and `sessions/`.
 - `VIBEMIX_LV2_BLACKLIST` — comma-separated plugin URIs to refuse to load.
+- `VIBEMIX_GTK` — force the GTK major version used to host plugin UIs:
+  `gtk2`, `gtk3`, or unset/`auto` (pick the version that has hostable UIs). GTK2
+  and GTK3 cannot coexist in one process, so only one is ever used.
 - `VIBEMIX_RT_GUARD=1` — abort (debug) on any heap operation on the audio thread.
+
+## Optional runtime dependencies (packaging)
+
+GTK is optional: it enables hosting GTK2/GTK3 plugin UIs (e.g. Calf) and is
+`dlopen`ed at runtime. Declare it as a *weak/optional* dependency so packagers
+install it when available without making vibemix uninstallable without it:
+
+- Arch (`PKGBUILD`): `optdepends=('gtk3: GTK3 plugin UIs' 'gtk2: GTK2 plugin UIs')`
+- RPM (Fedora/openSUSE): `Recommends: gtk3` (optionally `gtk2`)
+- Debian/Ubuntu: `Recommends: libgtk-3-0` (optionally `libgtk2.0-0`)
+- Gentoo: USE flags; Flatpak/AppImage: bundle or leave to the host
 
 ## PipeWire instead of jackd
 

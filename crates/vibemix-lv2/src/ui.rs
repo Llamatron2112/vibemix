@@ -4,6 +4,27 @@ use std::os::raw::{c_char, c_int, c_void};
 use crate::urid::UridMap;
 
 pub const X11_UI_TYPE: &str = "http://lv2plug.in/ns/extensions/ui#X11UI";
+pub const GTK2_UI_TYPE: &str = "http://lv2plug.in/ns/extensions/ui#GtkUI";
+pub const GTK3_UI_TYPE: &str = "http://lv2plug.in/ns/extensions/ui#Gtk3UI";
+
+/// Which toolkit a hostable UI uses. X11 is preferred when a plugin offers
+/// both (it is the most predictable to embed).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum UiKind {
+    X11,
+    Gtk2,
+    Gtk3,
+}
+
+impl UiKind {
+    pub fn ui_type(self) -> &'static str {
+        match self {
+            UiKind::X11 => X11_UI_TYPE,
+            UiKind::Gtk2 => GTK2_UI_TYPE,
+            UiKind::Gtk3 => GTK3_UI_TYPE,
+        }
+    }
+}
 
 pub type PortWrite = extern "C" fn(*mut c_void, u32, u32, u32, *const c_void);
 
@@ -21,6 +42,9 @@ struct Lv2UridUnmap {
 
 extern "C" {
     fn vibemix_ui_init();
+
+    /// Chosen GTK major version: 0 (none), 2 or 3. Decided once per process.
+    fn vibemix_gtk_version() -> c_int;
 
     fn vibemix_ui_find(
         plugin_uri: *const c_char,
@@ -71,11 +95,12 @@ pub struct UiCandidate {
     pub ui_uri: String,
     pub bundle: String,
     pub binary: String,
+    pub kind: UiKind,
 }
 
-pub fn find_ui(plugin_uri: &str) -> Option<UiCandidate> {
+fn find_ui_of_type(plugin_uri: &str, want: &str, kind: UiKind) -> Option<UiCandidate> {
     let plugin = CString::new(plugin_uri).ok()?;
-    let want = CString::new(X11_UI_TYPE).ok()?;
+    let want = CString::new(want).ok()?;
 
     let mut ui_uri = [0 as c_char; 2048];
     let mut bundle = [0 as c_char; 2048];
@@ -107,7 +132,21 @@ pub fn find_ui(plugin_uri: &str) -> Option<UiCandidate> {
         ui_uri: to_string(&ui_uri),
         bundle: to_string(&bundle),
         binary: to_string(&binary),
+        kind,
     })
+}
+
+/// Finds a hostable UI for a plugin, preferring X11, then the GTK major
+/// version selected at runtime (GTK is optional; see `VIBEMIX_GTK`).
+pub fn find_ui(plugin_uri: &str) -> Option<UiCandidate> {
+    if let Some(candidate) = find_ui_of_type(plugin_uri, X11_UI_TYPE, UiKind::X11) {
+        return Some(candidate);
+    }
+    match unsafe { vibemix_gtk_version() } {
+        2 => find_ui_of_type(plugin_uri, GTK2_UI_TYPE, UiKind::Gtk2),
+        3 => find_ui_of_type(plugin_uri, GTK3_UI_TYPE, UiKind::Gtk3),
+        _ => None,
+    }
 }
 
 pub struct UiWindow {
@@ -160,7 +199,7 @@ pub unsafe fn open(
 ) -> Option<UiWindow> {
     let plugin = CString::new(plugin_uri).ok()?;
     let ui_uri = CString::new(candidate.ui_uri.as_str()).ok()?;
-    let ui_type = CString::new(X11_UI_TYPE).ok()?;
+    let ui_type = CString::new(candidate.kind.ui_type()).ok()?;
     let bundle = CString::new(candidate.bundle.as_str()).ok()?;
     let binary = CString::new(candidate.binary.as_str()).ok()?;
     let title = CString::new(title).unwrap_or_default();
