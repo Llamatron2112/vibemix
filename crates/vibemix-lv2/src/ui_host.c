@@ -7,9 +7,16 @@
 
 #include <dlfcn.h>
 #include <GL/glx.h>
+#include <X11/Xatom.h>
 #include <X11/Xlib.h>
+#include <X11/Xutil.h>
 #include <lilv/lilv.h>
 #include <suil/suil.h>
+
+/* WM_CLASS applied to every engine-hosted plugin window so desktop
+   environments group them under the vibemix application (matching the
+   StartupWMClass in packaging/vibemix.desktop). */
+#define VIBEMIX_WM_CLASS "vibemix-gui"
 
 #include <lv2/atom/atom.h>
 #include <lv2/data-access/data-access.h>
@@ -152,7 +159,8 @@ int vibemix_ui_find(const char* plugin_uri, const char* want_type, char* ui_uri,
 void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui_type,
                       const char* bundle_path, const char* binary_path,
                       void* plugin_handle, void* urid_map, void* urid_unmap,
-                      VibemixPortWrite write_cb, void* write_user, int headless) {
+                      VibemixPortWrite write_cb, void* write_user, int headless,
+                      const char* title) {
   vibemix_ui_init();
   XSetErrorHandler(ui_x_error);
   Display* dpy = XOpenDisplay(NULL);
@@ -169,7 +177,26 @@ void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui
   int screen = DefaultScreen(dpy);
   ui->win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen), 80, 80, 760, 520, 0,
                                 BlackPixel(dpy, screen), WhitePixel(dpy, screen));
-  XStoreName(dpy, ui->win, "vibemix plugin UI");
+  const char* window_title = (title && *title) ? title : "vibemix plugin UI";
+  XStoreName(dpy, ui->win, window_title);
+  {
+    Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+    Atom utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+    XChangeProperty(dpy, ui->win, net_wm_name, utf8_string, 8, PropModeReplace,
+                    (const unsigned char*)window_title, (int)strlen(window_title));
+  }
+  {
+    XClassHint class_hint;
+    class_hint.res_name = (char*)VIBEMIX_WM_CLASS;
+    class_hint.res_class = (char*)VIBEMIX_WM_CLASS;
+    XSetClassHint(dpy, ui->win, &class_hint);
+  }
+  {
+    Atom net_wm_pid = XInternAtom(dpy, "_NET_WM_PID", False);
+    long pid = (long)getpid();
+    XChangeProperty(dpy, ui->win, net_wm_pid, XA_CARDINAL, 32, PropModeReplace,
+                    (unsigned char*)&pid, 1);
+  }
   ui->wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
   XSetWMProtocols(dpy, ui->win, &ui->wm_delete, 1);
   if (!headless) {

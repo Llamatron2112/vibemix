@@ -361,6 +361,7 @@ impl Host {
 
     /// # Safety
     /// `plugin_handle` must be valid, and `write_user` must outlive the window.
+    #[allow(clippy::too_many_arguments)]
     pub unsafe fn open_ui(
         &self,
         plugin_uri: &str,
@@ -369,6 +370,7 @@ impl Host {
         write_cb: ui::PortWrite,
         write_user: *mut c_void,
         headless: bool,
+        title: &str,
     ) -> Option<UiWindow> {
         ui::open(
             self.urid,
@@ -378,6 +380,7 @@ impl Host {
             write_cb,
             write_user,
             headless,
+            title,
         )
     }
 

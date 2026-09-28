@@ -148,7 +148,15 @@ fn run_smoke_ui(uri: &str) -> ! {
     };
     let handle = instance.handle();
     let Some(window) = (unsafe {
-        host.open_ui(uri, &candidate, handle, no_write, std::ptr::null_mut(), true)
+        host.open_ui(
+            uri,
+            &candidate,
+            handle,
+            no_write,
+            std::ptr::null_mut(),
+            true,
+            uri,
+        )
     }) else {
         std::process::exit(2);
     };

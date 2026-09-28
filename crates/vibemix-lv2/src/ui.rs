@@ -45,6 +45,7 @@ extern "C" {
         write_cb: PortWrite,
         write_user: *mut c_void,
         headless: c_int,
+        title: *const c_char,
     ) -> *mut c_void;
 
     fn vibemix_ui_pump(handle: *mut c_void);
@@ -146,6 +147,7 @@ impl Drop for UiWindow {
 /// # Safety
 /// `plugin_handle` must be a valid handle to a live plugin instance, and
 /// `write_user` must stay valid for as long as the returned window lives.
+#[allow(clippy::too_many_arguments)]
 pub unsafe fn open(
     urid: &'static UridMap,
     plugin_uri: &str,
@@ -154,12 +156,14 @@ pub unsafe fn open(
     write_cb: PortWrite,
     write_user: *mut c_void,
     headless: bool,
+    title: &str,
 ) -> Option<UiWindow> {
     let plugin = CString::new(plugin_uri).ok()?;
     let ui_uri = CString::new(candidate.ui_uri.as_str()).ok()?;
     let ui_type = CString::new(X11_UI_TYPE).ok()?;
     let bundle = CString::new(candidate.bundle.as_str()).ok()?;
     let binary = CString::new(candidate.binary.as_str()).ok()?;
+    let title = CString::new(title).unwrap_or_default();
 
     let (handle, map_fn, unmap_fn) = urid.parts();
     let mut map = Box::new(Lv2UridMap {
@@ -184,6 +188,7 @@ pub unsafe fn open(
             write_cb,
             write_user,
             headless as c_int,
+            title.as_ptr(),
         )
     };
     if window.is_null() {

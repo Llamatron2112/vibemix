@@ -2,7 +2,7 @@
 Type=Application
 Name=vibemix
 GenericName=Audio Mixer
-Comment=Modular LV2 audio mixer
+Comment=Advanced lv2 audio mixer
 Exec=vibemix
 Icon=vibemix
 StartupWMClass=vibemix-gui

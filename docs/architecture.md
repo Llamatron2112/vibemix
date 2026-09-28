@@ -230,6 +230,11 @@ The host provides `ui:resize`, `ui:showInterface` (with the retained
 `ui:idleInterface` — each control-loop iteration, so animated UIs (including
 LSP's OpenGL UIs) update.
 
+Each plugin window is created with `WM_CLASS=vibemix-gui` (matching
+`StartupWMClass` in `packaging/vibemix.desktop`), `_NET_WM_PID`, and
+`_NET_WM_NAME` set to the plugin's name, so desktop environments group it under
+the vibemix application/icon rather than a generic one.
+
 The engine calls `XInitThreads()` before its first Xlib call. Plugin UIs such
 as LSP's X11/GL toolkit use Xlib from multiple threads and call `XInitThreads`
 themselves, but that is only effective if it happens first; otherwise their

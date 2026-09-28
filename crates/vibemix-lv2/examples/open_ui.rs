@@ -30,7 +30,15 @@ fn main() {
     let handle = instance.handle();
 
     let Some(window) = (unsafe {
-        host.open_ui(&uri, &candidate, handle, write, std::ptr::null_mut(), false)
+        host.open_ui(
+            &uri,
+            &candidate,
+            handle,
+            write,
+            std::ptr::null_mut(),
+            false,
+            &uri,
+        )
     }) else {
         eprintln!("open_ui failed");
         std::process::exit(1);

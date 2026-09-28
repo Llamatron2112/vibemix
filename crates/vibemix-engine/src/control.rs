@@ -1086,6 +1086,29 @@ impl Controller {
             return;
         }
 
+        // Title the native window with the plugin's name (user rename wins,
+        // then the catalog name, then the URI).
+        let model_name = if let Some(chain) = strip_chain(location) {
+            self.model
+                .strip(StripId(target))
+                .and_then(|entry| strip_plugin_list(entry, chain).get(slot as usize))
+                .map(|plugin| plugin.name.clone())
+        } else {
+            self.model
+                .bus(BusId(target))
+                .and_then(|entry| entry.plugins.get(slot as usize))
+                .map(|plugin| plugin.name.clone())
+        };
+        let title = model_name
+            .filter(|name| !name.is_empty())
+            .or_else(|| {
+                self.plugins
+                    .iter()
+                    .find(|info| info.uri == uri)
+                    .map(|info| info.name.clone())
+            })
+            .unwrap_or_else(|| uri.clone());
+
         let candidate = self
             .ui_cache
             .entry(uri.clone())
@@ -1134,6 +1157,7 @@ impl Controller {
                 ui_port_write,
                 &mut *context as *mut UiWriteCtx as *mut std::ffi::c_void,
                 false,
+                &title,
             )
         }) else {
             tracing::warn!(%uri, "failed to open plugin UI");
