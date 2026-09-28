@@ -30,6 +30,9 @@ static LAST_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
 static PENDING_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
 static SAMPLE_RATE: AtomicU32 = AtomicU32::new(48000);
 static XRUNS: AtomicU32 = AtomicU32::new(0);
+static CLIPBOARD: Mutex<(bool, u32, String)> = Mutex::new((false, 0, String::new()));
+static EDIT_STATE: Mutex<(u32, u32, String, String)> =
+    Mutex::new((0, 0, String::new(), String::new()));
 
 struct View {
     structure_json: String,
@@ -245,6 +248,21 @@ fn receive_loop(socket: UdpSocket) {
                 Some(ControlMessage::MissingConnections { json }) => {
                     if let Ok(mut guard) = PENDING_REPORT.lock() {
                         *guard = Some(json);
+                    }
+                }
+                Some(ControlMessage::Clipboard { has, location, name }) => {
+                    if let Ok(mut guard) = CLIPBOARD.lock() {
+                        *guard = (has, location, name);
+                    }
+                }
+                Some(ControlMessage::EditState {
+                    undo_depth,
+                    redo_depth,
+                    undo_label,
+                    redo_label,
+                }) => {
+                    if let Ok(mut guard) = EDIT_STATE.lock() {
+                        *guard = (undo_depth, redo_depth, undo_label, redo_label);
                     }
                 }
                 Some(ControlMessage::Meters {
@@ -600,6 +618,13 @@ pub mod qobject {
         #[qproperty(QString, window_geometry)]
         #[qproperty(i32, sample_rate)]
         #[qproperty(i32, xruns)]
+        #[qproperty(bool, has_clipboard)]
+        #[qproperty(i32, clipboard_location)]
+        #[qproperty(QString, clipboard_name)]
+        #[qproperty(i32, undo_depth)]
+        #[qproperty(i32, redo_depth)]
+        #[qproperty(QString, undo_label)]
+        #[qproperty(QString, redo_label)]
         #[namespace = "vibemix"]
         type Backend = super::BackendRust;
 
@@ -728,6 +753,34 @@ pub mod qobject {
         fn close_plugin_ui(&self, location: i32, target: i32, slot: i32);
 
         #[qinvokable]
+        #[cxx_name = "copyPlugin"]
+        fn copy_plugin(&self, location: i32, target: i32, slot: i32);
+
+        #[qinvokable]
+        #[cxx_name = "cutPlugin"]
+        fn cut_plugin(&self, location: i32, target: i32, slot: i32);
+
+        #[qinvokable]
+        #[cxx_name = "pastePlugin"]
+        fn paste_plugin(&self, location: i32, target: i32);
+
+        #[qinvokable]
+        #[cxx_name = "duplicateStrip"]
+        fn duplicate_strip(&self, strip: i32);
+
+        #[qinvokable]
+        #[cxx_name = "duplicateBus"]
+        fn duplicate_bus(&self, bus: i32);
+
+        #[qinvokable]
+        #[cxx_name = "undo"]
+        fn undo(&self);
+
+        #[qinvokable]
+        #[cxx_name = "redo"]
+        fn redo(&self);
+
+        #[qinvokable]
         #[cxx_name = "saveSession"]
         fn save_session(&self, path: &QString, width: i32, height: i32, maximized: bool);
 
@@ -758,6 +811,13 @@ pub struct BackendRust {
     window_geometry: QString,
     sample_rate: i32,
     xruns: i32,
+    has_clipboard: bool,
+    clipboard_location: i32,
+    clipboard_name: QString,
+    undo_depth: i32,
+    redo_depth: i32,
+    undo_label: QString,
+    redo_label: QString,
 }
 
 impl Default for BackendRust {
@@ -784,6 +844,13 @@ impl Default for BackendRust {
             window_geometry: QString::from(""),
             sample_rate: 48000,
             xruns: 0,
+            has_clipboard: false,
+            clipboard_location: 0,
+            clipboard_name: QString::from(""),
+            undo_depth: 0,
+            redo_depth: 0,
+            undo_label: QString::from(""),
+            redo_label: QString::from(""),
         }
     }
 }
@@ -886,6 +953,19 @@ impl qobject::Backend {
             .set_sample_rate(SAMPLE_RATE.load(Ordering::SeqCst) as i32);
         self.as_mut()
             .set_xruns(XRUNS.load(Ordering::SeqCst) as i32);
+
+        if let Ok(clipboard) = CLIPBOARD.lock() {
+            self.as_mut().set_has_clipboard(clipboard.0);
+            self.as_mut().set_clipboard_location(clipboard.1 as i32);
+            self.as_mut()
+                .set_clipboard_name(QString::from(clipboard.2.as_str()));
+        }
+        if let Ok(edit) = EDIT_STATE.lock() {
+            self.as_mut().set_undo_depth(edit.0 as i32);
+            self.as_mut().set_redo_depth(edit.1 as i32);
+            self.as_mut().set_undo_label(QString::from(edit.2.as_str()));
+            self.as_mut().set_redo_label(QString::from(edit.3.as_str()));
+        }
     }
 
     pub fn refresh(&self) {
@@ -1122,6 +1202,54 @@ impl qobject::Backend {
             target: target as u32,
             slot: slot as u32,
         });
+    }
+
+    pub fn copy_plugin(&self, location: i32, target: i32, slot: i32) {
+        note_action("copy plugin");
+        send(ControlMessage::CopyPlugin {
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+        });
+    }
+
+    pub fn cut_plugin(&self, location: i32, target: i32, slot: i32) {
+        note_action("cut plugin");
+        send(ControlMessage::CutPlugin {
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+        });
+    }
+
+    pub fn paste_plugin(&self, location: i32, target: i32) {
+        note_action("paste plugin");
+        send(ControlMessage::PastePlugin {
+            location: location as u32,
+            target: target as u32,
+        });
+    }
+
+    pub fn duplicate_strip(&self, strip: i32) {
+        note_action("duplicate strip");
+        send(ControlMessage::DuplicateStrip {
+            strip: strip as u32,
+        });
+    }
+
+    pub fn duplicate_bus(&self, bus: i32) {
+        note_action("duplicate bus");
+        send(ControlMessage::DuplicateBus { bus: bus as u32 });
+    }
+
+    pub fn undo(&self) {
+        note_action("undo");
+        send(ControlMessage::Undo);
+    }
+
+    pub fn redo(&self) {
+        note_action("redo");
+        send(ControlMessage::Redo);
     }
 
     pub fn save_session(&self, path: &QString, width: i32, height: i32, maximized: bool) {

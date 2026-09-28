@@ -1748,7 +1748,7 @@ fn set_bus_controls(
     }
 }
 
-fn instantiate_slot(
+pub fn instantiate_slot(
     host: &Host,
     plugin: &PluginSlot,
     sample_rate: f64,

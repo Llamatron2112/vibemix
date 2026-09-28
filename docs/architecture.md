@@ -39,8 +39,8 @@ library.
 
 The `AudioBackend` trait in `vibemix-core` is a provisional seam. Its current
 shape does not yet carry RT port buffers, so the engine uses the concrete
-`JackEngine` for now; the trait will be finalized when a second backend (native
-PipeWire `pw_filter`) is added in Phase 5.
+`JackEngine` for now; the trait would be finalized if a second backend (a native
+PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
 
 ## Real-time safety rules
 
@@ -280,6 +280,7 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/strip/add` | none |
 | `/vibemix/strip/remove` | `int strip` |
 | `/vibemix/strip/move` | `int strip, int to_index` (display order only) |
+| `/vibemix/strip/duplicate` | `int strip` (clone with plugins) |
 | `/vibemix/bus/gain` | `int bus, float gain` |
 | `/vibemix/bus/mute` | `int bus, int mute` |
 | `/vibemix/bus/name` | `int bus, string name` |
@@ -290,6 +291,7 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/bus/return_gain` | `int bus, float gain` (trim on the device's return) |
 | `/vibemix/bus/add` | none |
 | `/vibemix/bus/remove` | `int bus` |
+| `/vibemix/bus/duplicate` | `int bus` (master cannot be duplicated) |
 | `/vibemix/send/gain` | `int strip, int bus, float gain` |
 | `/vibemix/send/delay` | `int strip, int bus, float ms` (0..500, alignment delay) |
 | `/vibemix/plugin/add` | `int location, int target, string uri` |
@@ -299,6 +301,10 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/plugin/bypass` | `int location, int target, int slot, int bypassed` |
 | `/vibemix/plugin/ui` | `int location, int target, int slot` (open native UI window) |
 | `/vibemix/plugin/ui/close` | `int location, int target, int slot` |
+| `/vibemix/plugin/copy` | `int location, int target, int slot` |
+| `/vibemix/plugin/cut` | `int location, int target, int slot` |
+| `/vibemix/plugin/paste` | `int location, int target` (append to that chain) |
+| `/vibemix/plugin/clipboard` | `int has, int location, string name` (engine to GUI) |
 | `/vibemix/state/query` | none |
 | `/vibemix/state` | `string json` (engine to GUI: strips/buses with plugins + control metadata) |
 | `/vibemix/catalog` | `string json` (engine to GUI: hostable plugins) |
@@ -307,6 +313,9 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/session/load` | `string path` |
 | `/vibemix/session/new` | none (reset to a minimal default session) |
 | `/vibemix/session/result` | `int ok, string path, string error` (engine to GUI: save/load/new outcome) |
+| `/vibemix/edit/undo` | none |
+| `/vibemix/edit/redo` | none |
+| `/vibemix/edit/state` | `int undo_depth, int redo_depth, string undo_label, string redo_label` (engine to GUI) |
 | `/vibemix/connections/missing` | `string json` (engine to GUI: saved connections that could not be restored) |
 | `/vibemix/meters` | `int strip_count, in_l…, in_r…, gain_l…, gain_r…, out_l…, out_r…, int bus_count, buses_l…, buses_r…` (linear peak levels, engine to GUI, ~50 Hz) |
 
@@ -325,7 +334,10 @@ itself (old sessions without it leave the window unchanged).
 The GUI exposes a File menu (New/Open/Save/Save As/Recent/Quit) backed by
 `QtQuick.Dialogs` file dialogs, defaulting to `$XDG_CONFIG_HOME/vibemix/sessions`,
 and warns about unsaved changes (tracked by comparing state snapshots against the
-last saved state) before New/Open/Quit.
+last saved state) before New/Open/Quit. An Edit menu and `Ctrl+Z`/`Ctrl+Shift+Z`
+drive undo/redo (labels come from `/vibemix/edit/state`); plugin context menus
+offer Copy/Cut/Paste (labelled with the clipboard contents), and strip/bus
+context menus offer Duplicate.
 
 Plugin messages address a chain with `location` — `0` strip pre-fader, `1` strip
 post-fader, `2` bus insert — and `target` (the strip or bus id).
@@ -343,4 +355,29 @@ post-fader, `2` bus insert — and `target` (the strip or bus id).
   smoothing, sample-rate-change handling, xrun counter, alloc guard), lock-free
   graph swap, and source-install packaging (`just install`, desktop entry/icon).
   Done (no AppImage/Flatpak).
-- **Phase 5** - non-mixer-style arbitrary module graph and port matrix.
+- **Phase 5** - editor quality-of-life: single-plugin clipboard (copy/cut/paste,
+  chain-aware), duplicate strip/bus, and snapshot-based undo/redo. Done.
+- **Unscheduled** - a native PipeWire `pw_filter` backend (finalizing the
+  `AudioBackend` trait). No arbitrary module graph / port matrix is planned; the
+  strip/bus/preset mixer topology is the design.
+
+## Editing history and clipboard
+
+Plugin copy/cut/paste keeps one `PluginSlot` (uri, name, params, LV2 state,
+bypass) plus the chain it came from; paste appends to the chain selected by the
+destination `location`. Copying captures the live control values and plugin
+state, so native-UI edits are included. Duplicate strip/bus clones the model
+entry, registers its ports, and re-instantiates each plugin from a captured
+snapshot (external JACK `connections` are not copied; the master bus cannot be
+duplicated).
+
+Undo is snapshot-based and lives in the engine (`Controller`). Before every
+mutating message the current `MixerModel` is cloned onto a bounded stack
+(count and total-byte caps; window geometry is excluded). Continuous parameters
+(fader/knob/plugin-param drags) coalesce over ~450 ms into one entry. On undo
+the snapshot is diffed against the current model: if only values changed the
+parameters are re-applied in place, otherwise (add/remove/move/duplicate/paste,
+or a plugin's LV2 state changed) the graph is rebuilt like a session load and
+open plugin UIs are closed. Native plugin-window edits are not individually
+tracked and may be reverted when undoing past them. New/loaded sessions clear
+the history.

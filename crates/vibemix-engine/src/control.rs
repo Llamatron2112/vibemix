@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::process::{Command, Stdio};
@@ -11,10 +11,10 @@ use vibemix_core::model::{
     Bus, MixerModel, PluginSlot, Send, Strip, WindowGeometry, MAX_SEND_DELAY_MS,
 };
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
-use vibemix_lv2::{find_ui, Host, PluginInfo, PluginInstance, SharedOutputs, UiCandidate, UiWindow};
+use vibemix_lv2::{find_ui, Host, PluginInfo, SharedOutputs, UiCandidate, UiWindow};
 use vibemix_proto::ControlMessage;
 
-use crate::backend_jack::{encode_state, make_slot_plugin, JackEngine};
+use crate::backend_jack::{encode_state, instantiate_slot, JackEngine};
 use crate::dsp;
 use crate::params::{SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS};
 
@@ -28,6 +28,41 @@ struct Actions {
     snapshot: bool,
     catalog: bool,
 }
+
+/// One plugin copied for later pasting, plus the chain it was copied from.
+#[derive(Clone)]
+struct PluginClipboard {
+    slot: PluginSlot,
+    location: u32,
+}
+
+/// A full mixer-model snapshot for undo/redo.
+struct UndoEntry {
+    model: MixerModel,
+    label: String,
+    bytes: usize,
+}
+
+/// Identifies a continuously-edited parameter so rapid changes (a fader or
+/// knob drag) collapse into a single undo step.
+#[derive(Clone, PartialEq, Eq)]
+enum EditKey {
+    StripGain(u32),
+    StripPan(u32),
+    StripInput(u32),
+    BusGain(u32),
+    BusSendGain(u32),
+    BusReturnGain(u32),
+    SendGain(u32, u32),
+    SendDelay(u32, u32),
+    PluginParam(u32, u32, u32, u32),
+}
+
+const EDIT_COALESCE: Duration = Duration::from_millis(450);
+const MAX_UNDO_ENTRIES: usize = 64;
+const MAX_UNDO_BYTES: usize = 64 * 1024 * 1024;
+/// Plugin location that selects a bus insert chain (0/1 are strip pre/post).
+const PLUGIN_LOC_BUS: u32 = 2;
 
 pub struct Controller {
     socket: UdpSocket,
@@ -49,6 +84,13 @@ pub struct Controller {
     missing_report: Option<String>,
     pending_session: Option<(bool, String, String)>,
     sample_rate: u32,
+    clipboard: Option<PluginClipboard>,
+    clipboard_dirty: bool,
+    undo_stack: VecDeque<UndoEntry>,
+    redo_stack: Vec<UndoEntry>,
+    undo_bytes: usize,
+    undo_coalesce: Option<(Instant, EditKey)>,
+    edit_dirty: bool,
 }
 
 struct UiWriteCtx {
@@ -192,6 +234,13 @@ impl Controller {
             missing_report,
             pending_session: None,
             sample_rate,
+            clipboard: None,
+            clipboard_dirty: false,
+            undo_stack: VecDeque::new(),
+            redo_stack: Vec::new(),
+            undo_bytes: 0,
+            undo_coalesce: None,
+            edit_dirty: false,
         })
     }
 
@@ -242,6 +291,14 @@ impl Controller {
             }
             if actions.snapshot {
                 self.send_state(address);
+            }
+            if self.clipboard_dirty {
+                self.clipboard_dirty = false;
+                self.send_clipboard(address);
+            }
+            if self.edit_dirty || actions.snapshot {
+                self.edit_dirty = false;
+                self.send_edit_state(address);
             }
 
             let levels = self.meters.levels();
@@ -298,6 +355,11 @@ impl Controller {
 
     fn apply(&mut self, message: ControlMessage) -> Actions {
         tracing::debug!(?message, "control message");
+
+        if let Some((label, key)) = edit_label(&message) {
+            self.push_undo(label, key);
+        }
+
         match message {
             ControlMessage::SetStripGain { strip, gain } => {
                 let gain = gain.clamp(0.0, 4.0);
@@ -543,6 +605,14 @@ impl Controller {
                     catalog: false,
                 }
             }
+            ControlMessage::DuplicateStrip { strip } => Actions {
+                snapshot: self.duplicate_strip(strip),
+                catalog: false,
+            },
+            ControlMessage::DuplicateBus { bus } => Actions {
+                snapshot: self.duplicate_bus(bus),
+                catalog: false,
+            },
             ControlMessage::AddPlugin {
                 location,
                 target,
@@ -659,6 +729,36 @@ impl Controller {
                 self.uis.remove(&(location, target, slot));
                 Actions::default()
             }
+            ControlMessage::CopyPlugin {
+                location,
+                target,
+                slot,
+            } => {
+                self.copy_plugin(location, target, slot);
+                Actions::default()
+            }
+            ControlMessage::CutPlugin {
+                location,
+                target,
+                slot,
+            } => Actions {
+                snapshot: self.cut_plugin(location, target, slot),
+                catalog: false,
+            },
+            ControlMessage::PastePlugin { location, target } => Actions {
+                snapshot: self.paste_plugin(location, target),
+                catalog: false,
+            },
+            ControlMessage::Clipboard { .. } => Actions::default(),
+            ControlMessage::Undo => Actions {
+                snapshot: self.undo(),
+                catalog: false,
+            },
+            ControlMessage::Redo => Actions {
+                snapshot: self.redo(),
+                catalog: false,
+            },
+            ControlMessage::EditState { .. } => Actions::default(),
             ControlMessage::QueryState => Actions {
                 snapshot: true,
                 catalog: true,
@@ -731,6 +831,7 @@ impl Controller {
                         self.uis.clear();
                         self.model = model;
                         self.engine.sync_port_names(&self.model);
+                        self.clear_history();
                         self.pending_session = Some((true, String::new(), String::new()));
                         Actions {
                             snapshot: true,
@@ -769,6 +870,7 @@ impl Controller {
                             self.missing_report = missing_report_json(
                                 &self.engine.restore_connections(&self.model),
                             );
+                            self.clear_history();
                             self.pending_session = Some((true, path.clone(), String::new()));
                             Actions {
                                 snapshot: true,
@@ -1177,7 +1279,15 @@ impl Controller {
             tracing::warn!(%uri, "plugin not in catalog");
             return false;
         };
+        let mut plugin = PluginSlot::new(plugin_id(0), uri);
+        plugin.name = info.name;
+        plugin.params = info.controls.iter().map(|control| control.default).collect();
+        self.insert_plugin_slot(location, target, plugin)
+    }
 
+    /// Appends a fully-described plugin slot (uri, params, LV2 state, bypass) to
+    /// a strip chain or bus. Shared by add, paste and duplicate.
+    fn insert_plugin_slot(&mut self, location: u32, target: u32, mut plugin: PluginSlot) -> bool {
         let slot = if let Some(chain) = strip_chain(location) {
             match self.model.strip(StripId(target)) {
                 Some(strip) if strip_plugin_list(strip, chain).len() < MAX_PLUGINS => {
@@ -1200,27 +1310,23 @@ impl Controller {
             }
         };
 
-        if !self.plugin_is_safe(uri) {
+        if !self.plugin_is_safe(&plugin.uri) {
             return false;
         }
 
         let sample_rate = self.engine.sample_rate() as f64;
         let buffer_size = self.engine.buffer_size() as usize;
-        let max_block = PluginInstance::max_frames();
-        let Some(instance) = self.host.instantiate(uri, sample_rate, buffer_size, max_block) else {
-            tracing::warn!(%uri, "plugin instantiate failed");
-            return false;
-        };
-        let proxy = instance.state_proxy();
-        let handle = instance.handle() as usize;
-        let Some(slot_plugin) =
-            make_slot_plugin(&self.host, uri, sample_rate, buffer_size, max_block, instance)
+        let Some((slot_plugin, proxy, handle)) =
+            instantiate_slot(&self.host, &plugin, sample_rate, buffer_size)
         else {
-            tracing::warn!(%uri, "plugin is not mono/stereo");
+            tracing::warn!(uri = %plugin.uri, "plugin instantiate failed");
             return false;
         };
 
-        let params: Vec<f32> = info.controls.iter().map(|control| control.default).collect();
+        plugin.id = plugin_id(slot);
+        plugin.missing = false;
+        let uri = plugin.uri.clone();
+        let params = std::mem::take(&mut plugin.params);
 
         if let Some(chain) = strip_chain(location) {
             if let Err(error) =
@@ -1234,10 +1340,10 @@ impl Controller {
                 self.params
                     .set_plugin_param(target as usize, chain, slot as usize, param, *value);
             }
+            self.params
+                .set_plugin_bypass(target as usize, chain, slot as usize, plugin.bypassed);
+            plugin.params = params;
             if let Some(strip) = self.model.strip_mut(StripId(target)) {
-                let mut plugin = PluginSlot::new(plugin_id(slot), uri);
-                plugin.name = info.name;
-                plugin.params = params;
                 strip_plugin_list_mut(strip, chain).push(plugin);
             }
         } else {
@@ -1252,16 +1358,359 @@ impl Controller {
                 self.params
                     .set_bus_plugin_param(target as usize, slot as usize, param, *value);
             }
+            self.params
+                .set_bus_plugin_bypass(target as usize, slot as usize, plugin.bypassed);
+            plugin.params = params;
             if let Some(bus) = self.model.bus_mut(BusId(target)) {
-                let mut plugin = PluginSlot::new(plugin_id(slot), uri);
-                plugin.name = info.name;
-                plugin.params = params;
                 bus.plugins.push(plugin);
             }
         }
 
-        tracing::info!(location, target, slot, %uri, "added plugin");
+        tracing::info!(location, target, slot, uri = %uri, "inserted plugin");
         true
+    }
+
+    /// Captures a single model slot plus the live control values and LV2 state
+    /// (including native-UI edits), for copy/paste and duplication.
+    fn capture_slot_state(&self, location: u32, target: u32, slot: u32) -> Option<PluginSlot> {
+        let mut plugin = if let Some(chain) = strip_chain(location) {
+            strip_plugin_list(self.model.strip(StripId(target))?, chain)
+                .get(slot as usize)
+                .cloned()?
+        } else {
+            self.model
+                .bus(BusId(target))?
+                .plugins
+                .get(slot as usize)
+                .cloned()?
+        };
+
+        let controls = self
+            .plugins
+            .iter()
+            .find(|info| info.uri == plugin.uri)
+            .map(|info| info.controls.len().min(MAX_PARAMS))
+            .unwrap_or_else(|| plugin.params.len().min(MAX_PARAMS));
+        if plugin.params.len() < controls {
+            plugin.params.resize(controls, 0.0);
+        }
+
+        if let Some(chain) = strip_chain(location) {
+            for param in 0..controls {
+                plugin.params[param] =
+                    self.params.plugin_param(target as usize, chain, slot as usize, param);
+            }
+            plugin.bypassed = self
+                .params
+                .plugin_bypass(target as usize, chain, slot as usize);
+            if let Some(proxy) = self.engine.state_proxy(target as usize, chain, slot as usize) {
+                if proxy.supports_save() {
+                    plugin.state = encode_state(&self.host, &proxy.save());
+                }
+            }
+        } else {
+            for param in 0..controls {
+                plugin.params[param] =
+                    self.params.bus_plugin_param(target as usize, slot as usize, param);
+            }
+            plugin.bypassed = self.params.bus_plugin_bypass(target as usize, slot as usize);
+            if let Some(proxy) = self.engine.bus_state_proxy(target as usize, slot as usize) {
+                if proxy.supports_save() {
+                    plugin.state = encode_state(&self.host, &proxy.save());
+                }
+            }
+        }
+        Some(plugin)
+    }
+
+    fn copy_plugin(&mut self, location: u32, target: u32, slot: u32) -> bool {
+        match self.capture_slot_state(location, target, slot) {
+            Some(copied) => {
+                self.clipboard = Some(PluginClipboard {
+                    slot: copied,
+                    location,
+                });
+                self.clipboard_dirty = true;
+                tracing::info!(location, target, slot, "copied plugin");
+                true
+            }
+            None => false,
+        }
+    }
+
+    fn cut_plugin(&mut self, location: u32, target: u32, slot: u32) -> bool {
+        if !self.copy_plugin(location, target, slot) {
+            return false;
+        }
+        self.remove_plugin(location, target, slot)
+    }
+
+    fn paste_plugin(&mut self, location: u32, target: u32) -> bool {
+        let Some(clipboard) = self.clipboard.clone() else {
+            tracing::warn!("paste with empty clipboard");
+            return false;
+        };
+        self.insert_plugin_slot(location, target, clipboard.slot)
+    }
+
+    fn duplicate_strip(&mut self, strip_id: u32) -> bool {
+        let Some(source) = self.model.strip(StripId(strip_id)).cloned() else {
+            return false;
+        };
+        let Some(slot) = free_strip_slot(&self.params) else {
+            tracing::warn!("no free strip slot to duplicate into");
+            return false;
+        };
+        if let Err(error) = self.engine.add_strip_ports(slot) {
+            tracing::warn!(%error, slot, "failed to register strip ports");
+            return false;
+        }
+
+        let pre: Vec<PluginSlot> = source
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(index, plugin)| {
+                self.capture_slot_state(PLUGIN_LOC_STRIP_PRE, strip_id, index as u32)
+                    .unwrap_or_else(|| plugin.clone())
+            })
+            .collect();
+        let post: Vec<PluginSlot> = source
+            .plugins_post
+            .iter()
+            .enumerate()
+            .map(|(index, plugin)| {
+                self.capture_slot_state(PLUGIN_LOC_STRIP_POST, strip_id, index as u32)
+                    .unwrap_or_else(|| plugin.clone())
+            })
+            .collect();
+
+        self.params.set_strip_active(slot, true);
+        self.params.set_strip_gain(slot, source.gain.0);
+        self.params.set_strip_pan(slot, source.pan.0);
+        self.params.set_strip_input_gain_db(slot, source.input_gain_db);
+        self.params.set_strip_mute(slot, source.mute);
+        self.params.set_strip_solo(slot, source.solo);
+        for bus in 0..self.params.bus_count() {
+            self.params.set_send_gain(slot, bus, 0.0);
+            self.params.set_send_delay(slot, bus, 0.0);
+        }
+        for send in &source.sends {
+            self.params
+                .set_send_gain(slot, send.bus.0 as usize, send.gain.0);
+            self.params
+                .set_send_delay(slot, send.bus.0 as usize, send.delay_ms);
+        }
+
+        let mut duplicate = Strip::new(StripId(slot as u32), format!("{} copy", source.name));
+        duplicate.gain = source.gain;
+        duplicate.pan = source.pan;
+        duplicate.input_gain_db = source.input_gain_db;
+        duplicate.mute = source.mute;
+        duplicate.solo = source.solo;
+        duplicate.sends = source.sends.clone();
+        self.model.strips.push(duplicate);
+
+        let target = slot as u32;
+        for plugin in pre {
+            self.insert_plugin_slot(PLUGIN_LOC_STRIP_PRE, target, plugin);
+        }
+        for plugin in post {
+            self.insert_plugin_slot(PLUGIN_LOC_STRIP_POST, target, plugin);
+        }
+
+        self.engine.sync_port_names(&self.model);
+        tracing::info!(slot, source = strip_id, "duplicated strip");
+        true
+    }
+
+    fn duplicate_bus(&mut self, bus_id: u32) -> bool {
+        if bus_id == 0 {
+            tracing::warn!("master bus cannot be duplicated");
+            return false;
+        }
+        let Some(source) = self.model.bus(BusId(bus_id)).cloned() else {
+            return false;
+        };
+        let Some(slot) = free_bus_slot(&self.params) else {
+            tracing::warn!("no free bus slot to duplicate into");
+            return false;
+        };
+        if let Err(error) = self.engine.add_bus_ports(slot) {
+            tracing::warn!(%error, slot, "failed to register bus ports");
+            return false;
+        }
+        if source.return_inputs {
+            if let Err(error) = self.engine.add_bus_return_ports(slot) {
+                tracing::warn!(%error, slot, "failed to register bus return ports");
+            }
+        }
+
+        let plugins: Vec<PluginSlot> = source
+            .plugins
+            .iter()
+            .enumerate()
+            .map(|(index, plugin)| {
+                self.capture_slot_state(PLUGIN_LOC_BUS, bus_id, index as u32)
+                    .unwrap_or_else(|| plugin.clone())
+            })
+            .collect();
+
+        self.params.set_bus_active(slot, true);
+        self.params.set_bus_gain(slot, source.gain.0);
+        self.params.set_bus_mute(slot, source.mute);
+        self.params.set_bus_mix_master(slot, source.mix_to_master);
+        self.params.set_bus_return(slot, source.return_inputs);
+        self.params.set_bus_send_gain(slot, source.send_gain.0);
+        self.params.set_bus_return_gain(slot, source.return_gain.0);
+
+        let mut duplicate = Bus::new(BusId(slot as u32), format!("{} copy", source.name));
+        duplicate.gain = source.gain;
+        duplicate.mute = source.mute;
+        duplicate.mix_to_master = source.mix_to_master;
+        duplicate.return_inputs = source.return_inputs;
+        duplicate.send_gain = source.send_gain;
+        duplicate.return_gain = source.return_gain;
+        let insert_at = self.model.buses.len().saturating_sub(1);
+        self.model.buses.insert(insert_at, duplicate);
+
+        for plugin in plugins {
+            self.insert_plugin_slot(PLUGIN_LOC_BUS, slot as u32, plugin);
+        }
+
+        self.engine.sync_port_names(&self.model);
+        tracing::info!(slot, source = bus_id, "duplicated bus");
+        true
+    }
+
+    fn snapshot_entry(&self, label: &str) -> UndoEntry {
+        let mut model = self.model.clone();
+        model.window = None;
+        let bytes = model_bytes(&model);
+        UndoEntry {
+            model,
+            label: label.to_string(),
+            bytes,
+        }
+    }
+
+    fn push_undo(&mut self, label: &str, key: Option<EditKey>) {
+        if let (Some(key), Some((instant, last))) = (key.as_ref(), self.undo_coalesce.as_ref()) {
+            if last == key && instant.elapsed() < EDIT_COALESCE {
+                self.undo_coalesce = Some((Instant::now(), key.clone()));
+                return;
+            }
+        }
+
+        let entry = self.snapshot_entry(label);
+        self.undo_bytes += entry.bytes;
+        self.undo_stack.push_back(entry);
+        while self.undo_stack.len() > MAX_UNDO_ENTRIES
+            || (self.undo_bytes > MAX_UNDO_BYTES && self.undo_stack.len() > 1)
+        {
+            if let Some(dropped) = self.undo_stack.pop_front() {
+                self.undo_bytes = self.undo_bytes.saturating_sub(dropped.bytes);
+            }
+        }
+        self.redo_stack.clear();
+        self.undo_coalesce = key.map(|key| (Instant::now(), key));
+        self.edit_dirty = true;
+    }
+
+    fn undo(&mut self) -> bool {
+        let Some(entry) = self.undo_stack.pop_back() else {
+            return false;
+        };
+        self.undo_bytes = self.undo_bytes.saturating_sub(entry.bytes);
+        let current = self.snapshot_entry(&entry.label);
+        self.redo_stack.push(current);
+        self.restore_model(entry.model);
+        self.undo_coalesce = None;
+        self.edit_dirty = true;
+        true
+    }
+
+    fn redo(&mut self) -> bool {
+        let Some(entry) = self.redo_stack.pop() else {
+            return false;
+        };
+        let current = self.snapshot_entry(&entry.label);
+        self.undo_bytes += current.bytes;
+        self.undo_stack.push_back(current);
+        self.restore_model(entry.model);
+        self.undo_coalesce = None;
+        self.edit_dirty = true;
+        true
+    }
+
+    fn restore_model(&mut self, snapshot: MixerModel) {
+        let structure_changed = !structure_eq(&self.model, &snapshot);
+        let window = self.model.window.clone();
+        self.model = snapshot;
+        self.model.window = window;
+        self.model.normalize_buses();
+
+        apply_model(&self.params, &self.model);
+
+        if structure_changed {
+            if let Err(error) = self.engine.sync_strip_ports(&self.params) {
+                tracing::warn!(%error, "failed to sync strip ports on undo");
+            }
+            if let Err(error) = self.engine.sync_bus_ports(&self.params) {
+                tracing::warn!(%error, "failed to sync bus ports on undo");
+            }
+            if let Err(error) = self.engine.sync_bus_return_ports(&self.params) {
+                tracing::warn!(%error, "failed to sync bus return ports on undo");
+            }
+            self.uis.clear();
+            let sample_rate = self.engine.sample_rate() as f64;
+            if let Err(error) =
+                self.engine
+                    .rebuild_plugins(&self.host, &mut self.model, &self.params, sample_rate)
+            {
+                tracing::warn!(%error, "failed to rebuild plugins on undo");
+            }
+            self.missing_report =
+                missing_report_json(&self.engine.restore_connections(&self.model));
+        } else {
+            self.apply_model_plugin_params();
+        }
+
+        self.engine.sync_port_names(&self.model);
+    }
+
+    fn apply_model_plugin_params(&self) {
+        for strip in &self.model.strips {
+            let index = strip.id.0 as usize;
+            for chain in 0..PLUGIN_CHAINS {
+                for (slot, plugin) in strip_plugin_list(strip, chain).iter().enumerate() {
+                    for (param, value) in plugin.params.iter().enumerate().take(MAX_PARAMS) {
+                        self.params
+                            .set_plugin_param(index, chain, slot, param, *value);
+                    }
+                    self.params
+                        .set_plugin_bypass(index, chain, slot, plugin.bypassed);
+                }
+            }
+        }
+        for bus in &self.model.buses {
+            let index = bus.id.0 as usize;
+            for (slot, plugin) in bus.plugins.iter().enumerate() {
+                for (param, value) in plugin.params.iter().enumerate().take(MAX_PARAMS) {
+                    self.params
+                        .set_bus_plugin_param(index, slot, param, *value);
+                }
+                self.params.set_bus_plugin_bypass(index, slot, plugin.bypassed);
+            }
+        }
+    }
+
+    fn clear_history(&mut self) {
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.undo_bytes = 0;
+        self.undo_coalesce = None;
+        self.edit_dirty = true;
     }
 
     fn remove_plugin(&mut self, location: u32, target: u32, slot: u32) -> bool {
@@ -1441,6 +1890,151 @@ impl Controller {
             let _ = self.socket.send_to(&bytes, address);
         }
     }
+
+    fn send_clipboard(&self, address: SocketAddr) {
+        let (has, location, name) = match &self.clipboard {
+            Some(clipboard) => (true, clipboard.location, clipboard.slot.name.clone()),
+            None => (false, 0, String::new()),
+        };
+        let message = ControlMessage::Clipboard {
+            has,
+            location,
+            name,
+        };
+        if let Ok(bytes) = message.encode() {
+            let _ = self.socket.send_to(&bytes, address);
+        }
+    }
+
+    fn send_edit_state(&self, address: SocketAddr) {
+        let message = ControlMessage::EditState {
+            undo_depth: self.undo_stack.len() as u32,
+            redo_depth: self.redo_stack.len() as u32,
+            undo_label: self
+                .undo_stack
+                .back()
+                .map(|entry| entry.label.clone())
+                .unwrap_or_default(),
+            redo_label: self
+                .redo_stack
+                .last()
+                .map(|entry| entry.label.clone())
+                .unwrap_or_default(),
+        };
+        if let Ok(bytes) = message.encode() {
+            let _ = self.socket.send_to(&bytes, address);
+        }
+    }
+}
+
+/// Returns the undo label and (for continuous parameters) the coalescing key
+/// for a mutating message, or `None` if the message does not change the model.
+fn edit_label(message: &ControlMessage) -> Option<(&'static str, Option<EditKey>)> {
+    use ControlMessage::*;
+    Some(match message {
+        SetStripGain { strip, .. } => ("Set strip gain", Some(EditKey::StripGain(*strip))),
+        SetStripPan { strip, .. } => ("Set strip pan", Some(EditKey::StripPan(*strip))),
+        SetStripInputGain { strip, .. } => ("Set input gain", Some(EditKey::StripInput(*strip))),
+        SetStripMute { .. } => ("Toggle strip mute", None),
+        SetStripSolo { .. } => ("Toggle strip solo", None),
+        SetStripName { .. } => ("Rename strip", None),
+        MoveStrip { .. } => ("Move strip", None),
+        SetBusGain { bus, .. } => ("Set bus gain", Some(EditKey::BusGain(*bus))),
+        SetBusSendGain { bus, .. } => ("Set bus send gain", Some(EditKey::BusSendGain(*bus))),
+        SetBusReturnGain { bus, .. } => ("Set bus return gain", Some(EditKey::BusReturnGain(*bus))),
+        SetBusMute { .. } => ("Toggle bus mute", None),
+        SetBusName { .. } => ("Rename bus", None),
+        MoveBus { .. } => ("Move bus", None),
+        SetBusMixMaster { .. } => ("Toggle mix to master", None),
+        SetBusReturn { .. } => ("Toggle external return", None),
+        SetSendGain { strip, bus, .. } => ("Set send gain", Some(EditKey::SendGain(*strip, *bus))),
+        SetSendDelay { strip, bus, .. } => {
+            ("Set send delay", Some(EditKey::SendDelay(*strip, *bus)))
+        }
+        AddStrip => ("Add strip", None),
+        AddBus => ("Add bus", None),
+        RemoveStrip { .. } => ("Remove strip", None),
+        RemoveBus { .. } => ("Remove bus", None),
+        DuplicateStrip { .. } => ("Duplicate strip", None),
+        DuplicateBus { .. } => ("Duplicate bus", None),
+        AddPlugin { .. } => ("Add plugin", None),
+        RemovePlugin { .. } => ("Remove plugin", None),
+        MovePlugin { .. } => ("Move plugin", None),
+        SetPluginParam {
+            location,
+            target,
+            slot,
+            param,
+            ..
+        } => (
+            "Set plugin parameter",
+            Some(EditKey::PluginParam(*location, *target, *slot, *param)),
+        ),
+        SetPluginBypass { .. } => ("Toggle plugin bypass", None),
+        CutPlugin { .. } => ("Cut plugin", None),
+        PastePlugin { .. } => ("Paste plugin", None),
+        _ => return None,
+    })
+}
+
+/// Whether two models have the same engine-visible structure (ignoring order,
+/// scalar values and window geometry). A change means undo must rebuild.
+fn structure_eq(a: &MixerModel, b: &MixerModel) -> bool {
+    if a.strips.len() != b.strips.len() || a.buses.len() != b.buses.len() {
+        return false;
+    }
+    let strips_match = a.strips.iter().all(|strip| {
+        b.strips.iter().any(|other| {
+            other.id == strip.id
+                && plugin_lists_eq(&strip.plugins, &other.plugins)
+                && plugin_lists_eq(&strip.plugins_post, &other.plugins_post)
+                && sends_eq(&strip.sends, &other.sends)
+        })
+    });
+    if !strips_match {
+        return false;
+    }
+    a.buses.iter().all(|bus| {
+        b.buses.iter().any(|other| {
+            other.id == bus.id
+                && other.return_inputs == bus.return_inputs
+                && plugin_lists_eq(&bus.plugins, &other.plugins)
+        })
+    })
+}
+
+fn plugin_lists_eq(a: &[PluginSlot], b: &[PluginSlot]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.uri == y.uri && x.state == y.state)
+}
+
+fn sends_eq(a: &[Send], b: &[Send]) -> bool {
+    a.len() == b.len()
+        && a.iter()
+            .zip(b)
+            .all(|(x, y)| x.bus == y.bus && x.pre_fader == y.pre_fader)
+}
+
+fn model_bytes(model: &MixerModel) -> usize {
+    let mut total = 128 + model.name.len();
+    let plugin_bytes = |plugin: &PluginSlot| {
+        64 + plugin.uri.len() + plugin.name.len() + plugin.state.len() + plugin.params.len() * 4
+    };
+    for strip in &model.strips {
+        total += 64 + strip.name.len();
+        for plugin in strip.plugins.iter().chain(strip.plugins_post.iter()) {
+            total += plugin_bytes(plugin);
+        }
+    }
+    for bus in &model.buses {
+        total += 64 + bus.name.len();
+        for plugin in &bus.plugins {
+            total += plugin_bytes(plugin);
+        }
+    }
+    total
 }
 
 fn missing_report_json(missing: &[crate::backend_jack::MissingConnection]) -> Option<String> {

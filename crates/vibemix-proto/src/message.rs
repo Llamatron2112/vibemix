@@ -85,6 +85,12 @@ pub enum ControlMessage {
     RemoveBus {
         bus: u32,
     },
+    DuplicateStrip {
+        strip: u32,
+    },
+    DuplicateBus {
+        bus: u32,
+    },
     AddPlugin {
         location: u32,
         target: u32,
@@ -124,6 +130,25 @@ pub enum ControlMessage {
         target: u32,
         slot: u32,
     },
+    CopyPlugin {
+        location: u32,
+        target: u32,
+        slot: u32,
+    },
+    CutPlugin {
+        location: u32,
+        target: u32,
+        slot: u32,
+    },
+    PastePlugin {
+        location: u32,
+        target: u32,
+    },
+    Clipboard {
+        has: bool,
+        location: u32,
+        name: String,
+    },
     Catalog {
         json: String,
     },
@@ -146,6 +171,14 @@ pub enum ControlMessage {
         ok: bool,
         path: String,
         error: String,
+    },
+    Undo,
+    Redo,
+    EditState {
+        undo_depth: u32,
+        redo_depth: u32,
+        undo_label: String,
+        redo_label: String,
     },
     MissingConnections {
         json: String,
@@ -265,6 +298,14 @@ impl ControlMessage {
                 addr: addr::BUS_REMOVE.to_string(),
                 args: vec![OscType::Int(*bus as i32)],
             },
+            DuplicateStrip { strip } => OscMessage {
+                addr: addr::STRIP_DUPLICATE.to_string(),
+                args: vec![OscType::Int(*strip as i32)],
+            },
+            DuplicateBus { bus } => OscMessage {
+                addr: addr::BUS_DUPLICATE.to_string(),
+                args: vec![OscType::Int(*bus as i32)],
+            },
             AddPlugin {
                 location,
                 target,
@@ -365,6 +406,45 @@ impl ControlMessage {
                     OscType::Int(*slot as i32),
                 ],
             },
+            CopyPlugin {
+                location,
+                target,
+                slot,
+            } => OscMessage {
+                addr: addr::PLUGIN_COPY.to_string(),
+                args: vec![
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                ],
+            },
+            CutPlugin {
+                location,
+                target,
+                slot,
+            } => OscMessage {
+                addr: addr::PLUGIN_CUT.to_string(),
+                args: vec![
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                ],
+            },
+            PastePlugin { location, target } => OscMessage {
+                addr: addr::PLUGIN_PASTE.to_string(),
+                args: vec![
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                ],
+            },
+            Clipboard { has, location, name } => OscMessage {
+                addr: addr::PLUGIN_CLIPBOARD.to_string(),
+                args: vec![
+                    OscType::Int(*has as i32),
+                    OscType::Int(*location as i32),
+                    OscType::String(name.clone()),
+                ],
+            },
             QueryState => OscMessage {
                 addr: addr::STATE_QUERY.to_string(),
                 args: Vec::new(),
@@ -401,6 +481,28 @@ impl ControlMessage {
                     OscType::Int(*ok as i32),
                     OscType::String(path.clone()),
                     OscType::String(error.clone()),
+                ],
+            },
+            Undo => OscMessage {
+                addr: addr::EDIT_UNDO.to_string(),
+                args: Vec::new(),
+            },
+            Redo => OscMessage {
+                addr: addr::EDIT_REDO.to_string(),
+                args: Vec::new(),
+            },
+            EditState {
+                undo_depth,
+                redo_depth,
+                undo_label,
+                redo_label,
+            } => OscMessage {
+                addr: addr::EDIT_STATE.to_string(),
+                args: vec![
+                    OscType::Int(*undo_depth as i32),
+                    OscType::Int(*redo_depth as i32),
+                    OscType::String(undo_label.clone()),
+                    OscType::String(redo_label.clone()),
                 ],
             },
             MissingConnections { json } => OscMessage {
@@ -547,6 +649,12 @@ impl ControlMessage {
             addr::BUS_REMOVE => Some(ControlMessage::RemoveBus {
                 bus: int(args, 0)? as u32,
             }),
+            addr::STRIP_DUPLICATE => Some(ControlMessage::DuplicateStrip {
+                strip: int(args, 0)? as u32,
+            }),
+            addr::BUS_DUPLICATE => Some(ControlMessage::DuplicateBus {
+                bus: int(args, 0)? as u32,
+            }),
             addr::PLUGIN_ADD => Some(ControlMessage::AddPlugin {
                 location: int(args, 0)? as u32,
                 target: int(args, 1)? as u32,
@@ -590,6 +698,25 @@ impl ControlMessage {
                 target: int(args, 1)? as u32,
                 slot: int(args, 2)? as u32,
             }),
+            addr::PLUGIN_COPY => Some(ControlMessage::CopyPlugin {
+                location: int(args, 0)? as u32,
+                target: int(args, 1)? as u32,
+                slot: int(args, 2)? as u32,
+            }),
+            addr::PLUGIN_CUT => Some(ControlMessage::CutPlugin {
+                location: int(args, 0)? as u32,
+                target: int(args, 1)? as u32,
+                slot: int(args, 2)? as u32,
+            }),
+            addr::PLUGIN_PASTE => Some(ControlMessage::PastePlugin {
+                location: int(args, 0)? as u32,
+                target: int(args, 1)? as u32,
+            }),
+            addr::PLUGIN_CLIPBOARD => Some(ControlMessage::Clipboard {
+                has: int(args, 0)? != 0,
+                location: int(args, 1)? as u32,
+                name: string(args, 2)?,
+            }),
             addr::STATE_QUERY => Some(ControlMessage::QueryState),
             addr::STATE => Some(ControlMessage::State {
                 json: string(args, 0)?,
@@ -608,6 +735,14 @@ impl ControlMessage {
                 ok: int(args, 0)? != 0,
                 path: string(args, 1)?,
                 error: string(args, 2)?,
+            }),
+            addr::EDIT_UNDO => Some(ControlMessage::Undo),
+            addr::EDIT_REDO => Some(ControlMessage::Redo),
+            addr::EDIT_STATE => Some(ControlMessage::EditState {
+                undo_depth: int(args, 0)? as u32,
+                redo_depth: int(args, 1)? as u32,
+                undo_label: string(args, 2)?,
+                redo_label: string(args, 3)?,
             }),
             addr::CONNECTIONS_MISSING => Some(ControlMessage::MissingConnections {
                 json: string(args, 0)?,
@@ -812,6 +947,25 @@ mod tests {
             target: 1,
             slot: 0,
         });
+        roundtrip(ControlMessage::CopyPlugin {
+            location: 1,
+            target: 0,
+            slot: 2,
+        });
+        roundtrip(ControlMessage::CutPlugin {
+            location: 0,
+            target: 3,
+            slot: 1,
+        });
+        roundtrip(ControlMessage::PastePlugin {
+            location: 2,
+            target: 1,
+        });
+        roundtrip(ControlMessage::Clipboard {
+            has: true,
+            location: 1,
+            name: "Compressor".to_string(),
+        });
     }
 
     #[test]
@@ -820,6 +974,8 @@ mod tests {
         roundtrip(ControlMessage::AddBus);
         roundtrip(ControlMessage::RemoveStrip { strip: 2 });
         roundtrip(ControlMessage::RemoveBus { bus: 1 });
+        roundtrip(ControlMessage::DuplicateStrip { strip: 2 });
+        roundtrip(ControlMessage::DuplicateBus { bus: 1 });
         roundtrip(ControlMessage::SaveSession {
             path: "/tmp/session.toml".to_string(),
             width: 1280,
@@ -841,6 +997,14 @@ mod tests {
             error: "no such file".to_string(),
         });
         roundtrip(ControlMessage::QueryState);
+        roundtrip(ControlMessage::Undo);
+        roundtrip(ControlMessage::Redo);
+        roundtrip(ControlMessage::EditState {
+            undo_depth: 2,
+            redo_depth: 1,
+            undo_label: "Paste plugin".to_string(),
+            redo_label: "Move plugin".to_string(),
+        });
         roundtrip(ControlMessage::MissingConnections {
             json: "[{\"port\":\"system:capture_9\"}]".to_string(),
         });

@@ -326,6 +326,20 @@ ApplicationWindow {
         }
 
         Menu {
+            title: "Edit"
+            MenuItem {
+                text: backend.undo_label.length > 0 ? "Undo " + backend.undo_label : "Undo"
+                enabled: backend.connected && backend.undo_depth > 0
+                onTriggered: backend.undo()
+            }
+            MenuItem {
+                text: backend.redo_label.length > 0 ? "Redo " + backend.redo_label : "Redo"
+                enabled: backend.connected && backend.redo_depth > 0
+                onTriggered: backend.redo()
+            }
+        }
+
+        Menu {
             title: "Add"
             MenuItem {
                 text: "Add strip"
@@ -385,6 +399,16 @@ ApplicationWindow {
         sequence: "Ctrl+Shift+S"
         enabled: backend.connected
         onActivated: saveDialog.open()
+    }
+    Shortcut {
+        sequence: "Ctrl+Z"
+        enabled: backend.connected && backend.undo_depth > 0
+        onActivated: backend.undo()
+    }
+    Shortcut {
+        sequence: "Ctrl+Shift+Z"
+        enabled: backend.connected && backend.redo_depth > 0
+        onActivated: backend.redo()
     }
 
     FileDialog {
@@ -907,6 +931,32 @@ ApplicationWindow {
                                 pluginListRoot.target,
                                 pluginRow.pluginIndex,
                                 pluginRow.pluginIndex + 1)
+                        }
+                        MenuSeparator { }
+                        MenuItem {
+                            text: "Copy"
+                            enabled: pluginRow.pluginData.missing !== true
+                            onTriggered: backend.copyPlugin(
+                                pluginListRoot.location,
+                                pluginListRoot.target,
+                                pluginRow.pluginData.slot)
+                        }
+                        MenuItem {
+                            text: "Cut"
+                            enabled: pluginRow.pluginData.missing !== true
+                            onTriggered: backend.cutPlugin(
+                                pluginListRoot.location,
+                                pluginListRoot.target,
+                                pluginRow.pluginData.slot)
+                        }
+                        MenuItem {
+                            text: backend.clipboard_name.length > 0
+                                ? "Paste \"" + backend.clipboard_name + "\""
+                                : "Paste"
+                            enabled: backend.has_clipboard
+                            onTriggered: backend.pastePlugin(
+                                pluginListRoot.location,
+                                pluginListRoot.target)
                         }
                         MenuSeparator { }
                         MenuItem {
@@ -1992,6 +2042,11 @@ ApplicationWindow {
                             }
                             MenuSeparator { }
                             MenuItem {
+                                text: "Duplicate"
+                                onTriggered: backend.duplicateStrip(stripCard.stripData.id)
+                            }
+                            MenuSeparator { }
+                            MenuItem {
                                 text: "Remove strip"
                                 onTriggered: backend.removeStrip(stripCard.stripData.id)
                             }
@@ -2275,6 +2330,12 @@ ApplicationWindow {
                                 onTriggered: backend.setBusReturn(
                                     busCard.busData.id,
                                     !(busCard.busData.return_inputs === true))
+                            }
+                            MenuSeparator { }
+                            MenuItem {
+                                text: "Duplicate"
+                                enabled: busCard.reorderable
+                                onTriggered: backend.duplicateBus(busCard.busData.id)
                             }
                             MenuSeparator { }
                             MenuItem {
