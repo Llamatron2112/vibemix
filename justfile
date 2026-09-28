@@ -30,7 +30,8 @@ release:
     cargo build --release --workspace
 
 # Install binaries, launcher, desktop entry and icon.
-install:
+# Depends on `release` so `target/release/*` is always fresh.
+install: release
     install -Dm755 target/release/vibemix-engine {{PREFIX}}/bin/vibemix-engine
     install -Dm755 target/release/vibemix-gui {{PREFIX}}/bin/vibemix-gui
     install -Dm755 packaging/vibemix {{PREFIX}}/bin/vibemix
