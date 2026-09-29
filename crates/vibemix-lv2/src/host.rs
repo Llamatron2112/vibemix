@@ -684,6 +684,16 @@ pub struct PluginInstance {
 
 unsafe impl Send for PluginInstance {}
 
+impl Drop for PluginInstance {
+    fn drop(&mut self) {
+        // Join the worker thread before the LV2 instance is deactivated and its
+        // library possibly unloaded. Plugins may still be executing `work()`
+        // (e.g. resizing FFTW plans) on the worker thread; freeing the instance
+        // first unloads the plugin `.so` out from under it (use-after-unload).
+        self.worker.take();
+    }
+}
+
 impl PluginInstance {
     pub fn max_frames() -> usize {
         MAX_FRAMES

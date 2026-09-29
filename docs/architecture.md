@@ -308,13 +308,17 @@ not implement is listed as `unsupported` with that feature's name. The only
 remaining blacklist is the optional operator escape hatch
 `VIBEMIX_LV2_BLACKLIST=uri1,uri2`.
 
-Two host bugs surfaced by the sweep and fixed here: `lv2_raw` types
+Three host bugs surfaced by the sweep and fixed here: `lv2_raw` types
 `LV2_Descriptor::extension_data` as required, so a plugin that (legally) leaves
-it NULL made `lilv`'s shim call a null pointer (EQ10Q); and output
+it NULL made `lilv`'s shim call a null pointer (EQ10Q); output
 `atom:Sequence` ports were not re-armed with their capacity between blocks, so
 atom-output meters (bitscope, signal-distribution histogram) asserted on the
-second block. `--debug` (or `VIBEMIX_DEBUG=1`) logs the child's signal and keeps
-its stderr; smoke children always run with core dumps disabled.
+second block; and `PluginInstance` dropped the LV2 instance (freeing it and
+`dlclose`-ing the plugin library) before joining the worker thread, so a plugin
+still executing `work()` on that thread (Gxdetune resizing its FFTW plans) ran
+code from an unloaded library (`Drop for PluginInstance` now joins the worker
+first). `--debug` (or `VIBEMIX_DEBUG=1`) logs the child's signal and keeps its
+stderr; smoke children always run with core dumps disabled.
 
 ## Control protocol
 
