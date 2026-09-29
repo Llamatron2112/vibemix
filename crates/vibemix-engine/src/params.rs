@@ -24,6 +24,7 @@ pub struct SharedParams {
     bus_return_gain: Vec<AtomicU32>,
     send_gain: Vec<Vec<AtomicU32>>,
     send_delay: Vec<Vec<AtomicU32>>,
+    send_pre_fader: Vec<Vec<AtomicBool>>,
     plugin_params: Vec<Vec<Vec<Vec<AtomicU32>>>>,
     plugin_bypass: Vec<Vec<Vec<AtomicBool>>>,
     bus_plugin_params: Vec<Vec<Vec<AtomicU32>>>,
@@ -52,6 +53,9 @@ impl SharedParams {
             bus_return_gain: gain_vec(bus_count),
             send_gain: (0..strip_count).map(|_| zero_vec(bus_count)).collect(),
             send_delay: (0..strip_count).map(|_| zero_vec(bus_count)).collect(),
+            send_pre_fader: (0..strip_count)
+                .map(|_| (0..bus_count).map(|_| AtomicBool::new(false)).collect())
+                .collect(),
             plugin_params: (0..strip_count)
                 .map(|_| {
                     (0..PLUGIN_CHAINS)
@@ -243,6 +247,24 @@ impl SharedParams {
                 value.clamp(0.0, vibemix_core::model::MAX_SEND_DELAY_MS).to_bits(),
                 Ordering::Relaxed,
             );
+        }
+    }
+
+    pub fn send_pre_fader(&self, strip: usize, bus: usize) -> bool {
+        self.send_pre_fader
+            .get(strip)
+            .and_then(|sends| sends.get(bus))
+            .map(|value| value.load(Ordering::Relaxed))
+            .unwrap_or(false)
+    }
+
+    pub fn set_send_pre_fader(&self, strip: usize, bus: usize, value: bool) {
+        if let Some(slot) = self
+            .send_pre_fader
+            .get(strip)
+            .and_then(|sends| sends.get(bus))
+        {
+            slot.store(value, Ordering::Relaxed);
         }
     }
 

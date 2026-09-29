@@ -556,6 +556,7 @@ fn split_state(json: &str) -> (String, String) {
             // does not reset the strip/bus repeaters) rather than in the
             // structural snapshot.
             let mut send_delays = serde_json::Map::new();
+            let mut send_pre = serde_json::Map::new();
             let sends: serde_json::Value = strip
                 .get("sends")
                 .and_then(serde_json::Value::as_array)
@@ -570,6 +571,11 @@ fn split_state(json: &str) -> (String, String) {
                                 .cloned()
                                 .unwrap_or(serde_json::json!(0.0));
                             send_delays.insert(bus.to_string(), delay);
+                            let pre = send
+                                .get("pre_fader")
+                                .cloned()
+                                .unwrap_or(serde_json::json!(false));
+                            send_pre.insert(bus.to_string(), pre);
                         }
                     }
                     serde_json::Value::Object(map)
@@ -593,6 +599,7 @@ fn split_state(json: &str) -> (String, String) {
                     "solo": strip.get("solo").cloned().unwrap_or(serde_json::json!(false)),
                     "sends": sends,
                     "send_delays": serde_json::Value::Object(send_delays),
+                    "send_pre": serde_json::Value::Object(send_pre),
                 }),
             );
         }
@@ -777,6 +784,10 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setSendDelay"]
         fn update_send_delay(&self, strip: i32, bus: i32, ms: f32);
+
+        #[qinvokable]
+        #[cxx_name = "setSendPreFader"]
+        fn update_send_pre_fader(&self, strip: i32, bus: i32, pre: bool);
 
         #[qinvokable]
         #[cxx_name = "addStrip"]
@@ -1274,6 +1285,15 @@ impl qobject::Backend {
             strip: strip as u32,
             bus: bus as u32,
             ms,
+        });
+    }
+
+    pub fn update_send_pre_fader(&self, strip: i32, bus: i32, pre: bool) {
+        note_action("send pre-fader");
+        send(ControlMessage::SetSendPreFader {
+            strip: strip as u32,
+            bus: bus as u32,
+            pre,
         });
     }
 

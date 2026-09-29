@@ -733,6 +733,23 @@ impl Controller {
                     catalog: false,
                 }
             }
+            ControlMessage::SetSendPreFader { strip, bus, pre } => {
+                self.params
+                    .set_send_pre_fader(strip as usize, bus as usize, pre);
+                if let Some(target) = self.model.strip_mut(StripId(strip)) {
+                    if let Some(send) = target.sends.iter_mut().find(|send| send.bus.0 == bus) {
+                        send.pre_fader = pre;
+                    } else {
+                        let mut send = Send::new(BusId(bus));
+                        send.pre_fader = pre;
+                        target.sends.push(send);
+                    }
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
             ControlMessage::AddStrip => Actions {
                 snapshot: self.add_strip(),
                 catalog: false,
@@ -3156,10 +3173,12 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
         for bus in 0..params.bus_count() {
             params.set_send_gain(index, bus, 0.0);
             params.set_send_delay(index, bus, 0.0);
+            params.set_send_pre_fader(index, bus, false);
         }
         for send in &strip.sends {
             params.set_send_gain(index, send.bus.0 as usize, send.gain.0);
             params.set_send_delay(index, send.bus.0 as usize, send.delay_ms);
+            params.set_send_pre_fader(index, send.bus.0 as usize, send.pre_fader);
         }
     }
 }

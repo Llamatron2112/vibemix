@@ -260,6 +260,9 @@ struct MixerGraph {
     send_delays: Vec<Vec<dsp::DelayLine>>,
     sample_rate: f32,
     strip_scratch: [Vec<f32>; 2],
+    /// Per-strip pre-fader tap (after the pre-fader insert chain, before the
+    /// fader/pan), used by pre-fader sends.
+    strip_pre_fader: Vec<[Vec<f32>; 2]>,
     send_scratch: [Vec<f32>; 2],
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
@@ -591,6 +594,12 @@ impl MixerGraph {
                 self.run_plugins(index, 0, frames);
             }
 
+            // Pre-fader tap: after the pre-fader insert chain, before fader/pan.
+            self.strip_pre_fader[index][0][..frames]
+                .copy_from_slice(&self.strip_scratch[0][..frames]);
+            self.strip_pre_fader[index][1][..frames]
+                .copy_from_slice(&self.strip_scratch[1][..frames]);
+
             let muted =
                 self.params.strip_mute(index) || (any_solo && !self.params.strip_solo(index));
             let target = if muted {
@@ -640,10 +649,19 @@ impl MixerGraph {
                     *smoothed
                 };
 
+                let (src_l, src_r) = if self.params.send_pre_fader(index, bus) {
+                    (
+                        &self.strip_pre_fader[index][0],
+                        &self.strip_pre_fader[index][1],
+                    )
+                } else {
+                    (&self.strip_scratch[0], &self.strip_scratch[1])
+                };
+
                 let [send_l, send_r] = &mut self.send_scratch;
                 self.send_delays[index][bus].process(
-                    &self.strip_scratch[0][..frames],
-                    &self.strip_scratch[1][..frames],
+                    &src_l[..frames],
+                    &src_r[..frames],
                     &mut send_l[..frames],
                     &mut send_r[..frames],
                     delay,
@@ -1056,6 +1074,9 @@ impl JackEngine {
                 .collect(),
             sample_rate: sample_rate as f32,
             strip_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            strip_pre_fader: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
             send_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             bus_accum: (0..bus_count)

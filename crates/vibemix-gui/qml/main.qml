@@ -211,6 +211,11 @@ ApplicationWindow {
         var delay = entry.send_delays[busId]
         return delay === undefined ? 0 : delay
     }
+    function sendPreFader(stripId, busId) {
+        var entry = values.strips[stripId]
+        if (!entry || !entry.send_pre) return false
+        return entry.send_pre[busId] === true
+    }
     function pluginFailed(entry) {
         return entry.status === "failed" || entry.status === "unsupported"
     }
@@ -1581,12 +1586,14 @@ ApplicationWindow {
         property bool dragging: false
         property real liveValue: 0
         property real delay: 0
+        property bool preFader: false
         property var formatValue: function(v) { return Number(v).toFixed(2) }
         readonly property string valueText: slider.formatValue ? slider.formatValue(slider.displayValue) : ""
         readonly property bool interacting: slider.dragging || valueTimer.running
         readonly property real displayValue: slider.interacting ? slider.liveValue : slider.value
         signal moved(real value)
         signal delayMoved(real ms)
+        signal preFaderToggled(bool pre)
 
         implicitWidth: 56
         implicitHeight: 10
@@ -1729,6 +1736,12 @@ ApplicationWindow {
             MenuItem {
                 text: "Set delay…"
                 onTriggered: sendDelayEntry.openFor(slider.delay)
+            }
+            MenuItem {
+                text: "Pre-fader"
+                checkable: true
+                checked: slider.preFader
+                onTriggered: slider.preFaderToggled(!slider.preFader)
             }
         }
 
@@ -3458,6 +3471,7 @@ ApplicationWindow {
                                             width: parent.width
                                             value: root.sendLevel(stripCard.stripData.id, sendRow.busData.id)
                                             delay: root.sendDelay(stripCard.stripData.id, sendRow.busData.id)
+                                            preFader: root.sendPreFader(stripCard.stripData.id, sendRow.busData.id)
                                             formatValue: root.gainText
                                             onMoved: (v) => backend.setSendGain(
                                                 stripCard.stripData.id,
@@ -3467,6 +3481,10 @@ ApplicationWindow {
                                                 stripCard.stripData.id,
                                                 sendRow.busData.id,
                                                 ms)
+                                            onPreFaderToggled: (pre) => backend.setSendPreFader(
+                                                stripCard.stripData.id,
+                                                sendRow.busData.id,
+                                                pre)
                                         }
                                     }
                                 }

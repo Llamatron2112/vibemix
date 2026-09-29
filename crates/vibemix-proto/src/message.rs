@@ -77,6 +77,11 @@ pub enum ControlMessage {
         bus: u32,
         ms: f32,
     },
+    SetSendPreFader {
+        strip: u32,
+        bus: u32,
+        pre: bool,
+    },
     AddStrip,
     AddBus,
     RemoveStrip {
@@ -347,6 +352,14 @@ impl ControlMessage {
                     OscType::Int(*strip as i32),
                     OscType::Int(*bus as i32),
                     OscType::Float(*ms),
+                ],
+            },
+            SetSendPreFader { strip, bus, pre } => OscMessage {
+                addr: addr::SEND_PRE_FADER.to_string(),
+                args: vec![
+                    OscType::Int(*strip as i32),
+                    OscType::Int(*bus as i32),
+                    OscType::Int(*pre as i32),
                 ],
             },
             AddStrip => OscMessage {
@@ -851,6 +864,11 @@ impl ControlMessage {
                 bus: int(args, 1)? as u32,
                 ms: float(args, 2)?,
             }),
+            addr::SEND_PRE_FADER => Some(ControlMessage::SetSendPreFader {
+                strip: int(args, 0)? as u32,
+                bus: int(args, 1)? as u32,
+                pre: int(args, 2)? != 0,
+            }),
             addr::STRIP_ADD => Some(ControlMessage::AddStrip),
             addr::BUS_ADD => Some(ControlMessage::AddBus),
             addr::STRIP_REMOVE => Some(ControlMessage::RemoveStrip {
@@ -1185,6 +1203,11 @@ mod tests {
             strip: 1,
             bus: 2,
             ms: 12.5,
+        });
+        roundtrip(ControlMessage::SetSendPreFader {
+            strip: 1,
+            bus: 2,
+            pre: true,
         });
     }
 
