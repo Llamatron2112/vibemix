@@ -32,6 +32,8 @@ public:
         tresult result = AudioEffect::initialize(context);
         if (result != kResultOk) return result;
         addAudioInput(STR16("In"), SpeakerArr::kStereo);
+        // Auxiliary input used to test sidechain routing.
+        addAudioInput(STR16("Sidechain"), SpeakerArr::kStereo, kAux);
         addAudioOutput(STR16("Out"), SpeakerArr::kStereo);
         return kResultOk;
     }
@@ -52,11 +54,21 @@ public:
         }
         const int32 samples = data.numSamples;
         const int32 channels = std::min(data.inputs[0].numChannels, data.outputs[0].numChannels);
+        // The aux (sidechain) input is bus 1; add half of it to the output so
+        // sidechain routing is observable.
+        const bool has_sidechain = data.numInputs > 1 &&
+                                   data.inputs[1].channelBuffers32 != nullptr;
         for (int32 c = 0; c < channels; ++c) {
             const float* input = data.inputs[0].channelBuffers32[c];
             float* output = data.outputs[0].channelBuffers32[c];
             if (!input || !output) continue;
-            for (int32 s = 0; s < samples; ++s) output[s] = input[s] * gain_;
+            const float* sidechain =
+                (has_sidechain && c < data.inputs[1].numChannels)
+                    ? data.inputs[1].channelBuffers32[c]
+                    : nullptr;
+            for (int32 s = 0; s < samples; ++s) {
+                output[s] = input[s] * gain_ + (sidechain ? sidechain[s] * 0.5f : 0.0f);
+            }
         }
         return kResultOk;
     }

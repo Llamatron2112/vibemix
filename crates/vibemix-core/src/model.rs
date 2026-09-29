@@ -46,6 +46,10 @@ pub struct PluginSlot {
     /// `None` means any channel (omni).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub midi_channel: Option<u8>,
+    /// Bus whose summed strip sends feed this plugin's sidechain input. The
+    /// master (bus 0) is not a valid source. `None` = no sidechain.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub sidechain_bus: Option<BusId>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -65,6 +69,7 @@ impl PluginSlot {
             bypassed: false,
             missing: false,
             midi_channel: None,
+            sidechain_bus: None,
         }
     }
 }

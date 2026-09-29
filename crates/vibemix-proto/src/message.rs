@@ -125,6 +125,13 @@ pub enum ControlMessage {
         slot: u32,
         bypassed: bool,
     },
+    SetPluginSidechain {
+        location: u32,
+        target: u32,
+        slot: u32,
+        /// Source bus, or `-1` to clear.
+        bus: i32,
+    },
     OpenPluginUi {
         location: u32,
         target: u32,
@@ -480,6 +487,20 @@ impl ControlMessage {
                     OscType::Int(*target as i32),
                     OscType::Int(*slot as i32),
                     OscType::Int(*bypassed as i32),
+                ],
+            },
+            SetPluginSidechain {
+                location,
+                target,
+                slot,
+                bus,
+            } => OscMessage {
+                addr: addr::PLUGIN_SIDECHAIN.to_string(),
+                args: vec![
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*bus),
                 ],
             },
             OpenPluginUi {
@@ -923,6 +944,12 @@ impl ControlMessage {
                 slot: int(args, 2)? as u32,
                 bypassed: int(args, 3)? != 0,
             }),
+            addr::PLUGIN_SIDECHAIN => Some(ControlMessage::SetPluginSidechain {
+                location: int(args, 0)? as u32,
+                target: int(args, 1)? as u32,
+                slot: int(args, 2)? as u32,
+                bus: int(args, 3)?,
+            }),
             addr::PLUGIN_UI => Some(ControlMessage::OpenPluginUi {
                 location: int(args, 0)? as u32,
                 target: int(args, 1)? as u32,
@@ -1257,6 +1284,18 @@ mod tests {
             target: 1,
             slot: 2,
             bypassed: true,
+        });
+        roundtrip(ControlMessage::SetPluginSidechain {
+            location: 0,
+            target: 1,
+            slot: 0,
+            bus: 3,
+        });
+        roundtrip(ControlMessage::SetPluginSidechain {
+            location: 0,
+            target: 1,
+            slot: 0,
+            bus: -1,
         });
         roundtrip(ControlMessage::OpenPluginUi {
             location: 1,

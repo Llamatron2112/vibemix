@@ -27,6 +27,14 @@ pub trait PluginNode: Send {
 
     /// Restores serialized state produced by the matching host (empty = no-op).
     fn load_state(&mut self, state: &str);
+
+    /// Whether the plugin has a sidechain input bus (VST3 aux input).
+    fn has_sidechain(&self) -> bool {
+        false
+    }
+
+    /// Feeds the plugin's sidechain input (no-op when it has none).
+    fn write_sidechain(&mut self, _left: &[f32], _right: &[f32]) {}
 }
 
 impl PluginNode for vibemix_lv2::PluginInstance {
@@ -113,5 +121,13 @@ impl PluginNode for vibemix_vst3::PluginInstance {
     fn load_state(&mut self, state: &str) {
         let bytes = vibemix_vst3::decode_blob(state);
         vibemix_vst3::PluginInstance::load_state(self, &bytes);
+    }
+
+    fn has_sidechain(&self) -> bool {
+        vibemix_vst3::PluginInstance::has_sidechain(self)
+    }
+
+    fn write_sidechain(&mut self, left: &[f32], right: &[f32]) {
+        vibemix_vst3::PluginInstance::write_sidechain(self, left, right, left.len());
     }
 }

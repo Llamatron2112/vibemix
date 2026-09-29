@@ -79,6 +79,9 @@ pub struct PluginEntry {
     pub bundle: Option<String>,
     #[serde(default)]
     pub has_ui: bool,
+    /// Whether the plugin exposes a sidechain (aux) input (VST3 only).
+    #[serde(default)]
+    pub has_sidechain: bool,
     #[serde(default)]
     pub inputs: usize,
     #[serde(default)]

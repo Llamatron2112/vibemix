@@ -202,7 +202,8 @@ fn run_probe_vst3(bundle: &str, class_id: &str) -> ! {
     let (setup, active, processing, _) = instance.status();
     eprintln!(
         "probe: in={in_ch} out={out_ch} params={params} set_all={set_all} \
-         setup={setup} active={active} processing={processing} buses={} {}",
+         setup={setup} active={active} processing={processing} sidechain={} buses={} {}",
+        instance.has_sidechain(),
         instance.bus_info(),
         instance.editor_info()
     );
@@ -248,6 +249,24 @@ fn run_probe_vst3(bundle: &str, class_id: &str) -> ! {
             eprintln!("probe: block {block_index} out_peak={peak}");
         }
     }
+    if std::env::var_os("VIBEMIX_PROBE_SIDECHAIN").is_some() && instance.has_sidechain() {
+        let sidechain = vec![1.0f32; block];
+        let mut peak = 0.0f32;
+        for _ in 0..8 {
+            for channel in 0..in_ch {
+                instance.input_buffer_mut(channel)[..block].fill(0.0);
+            }
+            instance.write_sidechain(&sidechain, &sidechain, block);
+            instance.run(block);
+            for channel in 0..out_ch {
+                for sample in instance.output_buffer(channel)[..block].iter() {
+                    peak = peak.max(sample.abs());
+                }
+            }
+        }
+        eprintln!("probe: sidechain-driven out_peak={peak}");
+    }
+
     let (_, _, _, last) = instance.status();
     eprintln!("probe: final out_peak={last_peak} last_process={last}");
     if std::env::var_os("VIBEMIX_PROBE_VIEW").is_some() {

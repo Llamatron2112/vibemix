@@ -28,6 +28,7 @@ fn discovers_and_hosts_the_test_effect() {
     assert_eq!(instance.audio_input_count(), 2);
     assert_eq!(instance.audio_output_count(), 2);
     assert_eq!(instance.control_count(), 1);
+    assert!(instance.has_sidechain());
 
     let control = &instance.controls()[0];
     assert_eq!(control.name, "Gain");
@@ -47,6 +48,18 @@ fn discovers_and_hosts_the_test_effect() {
         .flat_map(|channel| instance.output_buffer(channel).iter().copied())
         .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
     assert!((peak - 0.125).abs() < 1e-3, "output peak was {peak}");
+
+    // Driving the sidechain input adds half of it to the output.
+    let sidechain = vec![1.0f32; 512];
+    instance.write_sidechain(&sidechain, &sidechain, 512);
+    instance.run(512);
+    let sidechain_peak = (0..instance.audio_output_count())
+        .flat_map(|channel| instance.output_buffer(channel).iter().copied())
+        .fold(0.0f32, |acc, sample| acc.max(sample.abs()));
+    assert!(
+        (sidechain_peak - 0.625).abs() < 1e-3,
+        "sidechain output peak was {sidechain_peak}"
+    );
 
     let state = instance.save_state();
     assert_eq!(state.len(), 4);

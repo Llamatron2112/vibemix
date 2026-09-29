@@ -776,6 +776,7 @@ impl Controller {
                 self.params.set_bus_active(bus as usize, false);
                 self.params.set_bus_return(bus as usize, false);
                 self.model.buses.retain(|entry| entry.id.0 != bus);
+                self.clear_sidechain_for_bus(bus);
                 self.engine.clear_bus_plugins(bus as usize).ok();
                 if let Err(error) = self.engine.remove_bus_ports(bus as usize) {
                     tracing::warn!(%error, bus, "failed to unregister bus ports");
@@ -898,6 +899,48 @@ impl Controller {
                     if let Some(bus) = self.model.bus_mut(BusId(target)) {
                         if let Some(plugin) = bus.plugins.get_mut(slot as usize) {
                             plugin.bypassed = bypassed;
+                        }
+                    }
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetPluginSidechain {
+                location,
+                target,
+                slot,
+                bus,
+            } => {
+                // Bus 0 (master) is not a valid sidechain source.
+                let source = usize::try_from(bus)
+                    .ok()
+                    .filter(|value| *value > 0 && *value < self.model.buses.len())
+                    .map(|value| BusId(value as u32));
+                if let Some(chain) = strip_chain(location) {
+                    self.params.set_plugin_sidechain(
+                        target as usize,
+                        chain,
+                        slot as usize,
+                        source.map(|value| value.0 as usize),
+                    );
+                    if let Some(strip) = self.model.strip_mut(StripId(target)) {
+                        if let Some(plugin) =
+                            strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
+                        {
+                            plugin.sidechain_bus = source;
+                        }
+                    }
+                } else {
+                    self.params.set_bus_plugin_sidechain(
+                        target as usize,
+                        slot as usize,
+                        source.map(|value| value.0 as usize),
+                    );
+                    if let Some(bus) = self.model.bus_mut(BusId(target)) {
+                        if let Some(plugin) = bus.plugins.get_mut(slot as usize) {
+                            plugin.sidechain_bus = source;
                         }
                     }
                 }
@@ -1478,6 +1521,31 @@ impl Controller {
         safe
     }
 
+    /// Clears any plugin sidechain that referenced the removed bus.
+    fn clear_sidechain_for_bus(&mut self, removed: u32) {
+        let target = Some(BusId(removed));
+        for strip in &mut self.model.strips {
+            let strip_id = strip.id.0 as usize;
+            for chain in 0..PLUGIN_CHAINS {
+                for (slot, plugin) in strip_plugin_list_mut(strip, chain).iter_mut().enumerate() {
+                    if plugin.sidechain_bus == target {
+                        plugin.sidechain_bus = None;
+                        self.params.set_plugin_sidechain(strip_id, chain, slot, None);
+                    }
+                }
+            }
+        }
+        for bus in &mut self.model.buses {
+            let bus_id = bus.id.0 as usize;
+            for (slot, plugin) in bus.plugins.iter_mut().enumerate() {
+                if plugin.sidechain_bus == target {
+                    plugin.sidechain_bus = None;
+                    self.params.set_bus_plugin_sidechain(bus_id, slot, None);
+                }
+            }
+        }
+    }
+
     fn open_ui(&mut self, location: u32, target: u32, slot: u32) {
         let key = (location, target, slot);
         if self.uis.contains_key(&key) {
@@ -1848,6 +1916,7 @@ impl Controller {
             .map(ControlInfo::from)
             .collect();
         self.plugins[index].has_ui = instance.has_editor();
+        self.plugins[index].has_sidechain = instance.has_sidechain();
     }
 
     /// Fills VST3 parameter metadata (and editor availability) for plugins that
@@ -2715,7 +2784,7 @@ fn plugin_lists_eq(a: &[PluginSlot], b: &[PluginSlot]) -> bool {
     a.len() == b.len()
         && a.iter()
             .zip(b)
-            .all(|(x, y)| x.uri == y.uri && x.state == y.state)
+            .all(|(x, y)| x.uri == y.uri && x.state == y.state && x.sidechain_bus == y.sidechain_bus)
 }
 
 fn sends_eq(a: &[Send], b: &[Send]) -> bool {
@@ -2892,6 +2961,7 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
                 name: info.name,
                 bundle: None,
                 has_ui: info.has_ui,
+                has_sidechain: false,
                 inputs: info.audio_inputs.len(),
                 outputs: info.audio_outputs.len(),
                 midi: !info.midi_inputs.is_empty(),
@@ -2908,6 +2978,7 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
             name: info.name,
             bundle: Some(info.bundle),
             has_ui: false,
+            has_sidechain: false,
             inputs: 0,
             outputs: 0,
             midi: false,
@@ -2935,6 +3006,8 @@ struct CatalogEntry {
     #[serde(default)]
     has_ui: bool,
     #[serde(default)]
+    has_sidechain: bool,
+    #[serde(default)]
     inputs: usize,
     #[serde(default)]
     outputs: usize,
@@ -2957,6 +3030,7 @@ fn load_catalog() -> Vec<PluginEntry> {
             name: entry.name,
             bundle: entry.bundle,
             has_ui: entry.has_ui,
+            has_sidechain: entry.has_sidechain,
             inputs: entry.inputs,
             outputs: entry.outputs,
             midi: entry.midi,
@@ -2976,6 +3050,7 @@ fn save_catalog(plugins: &[PluginEntry]) {
             format: entry.format,
             bundle: entry.bundle.clone(),
             has_ui: entry.has_ui,
+            has_sidechain: entry.has_sidechain,
             inputs: entry.inputs,
             outputs: entry.outputs,
             midi: entry.midi,
@@ -3003,6 +3078,7 @@ fn plugin_list_json<F: Fn(usize, usize) -> f32>(
             let info = catalog.iter().find(|entry| entry.id == plugin.uri);
             let controls = info.map(|entry| entry.controls.as_slice()).unwrap_or(&[]);
             let has_ui = info.map(|entry| entry.has_ui).unwrap_or(false);
+            let has_sidechain = info.map(|entry| entry.has_sidechain).unwrap_or(false);
             let control_list: Vec<serde_json::Value> = controls
                 .iter()
                 .enumerate()
@@ -3033,6 +3109,8 @@ fn plugin_list_json<F: Fn(usize, usize) -> f32>(
                 "bypassed": plugin.bypassed,
                 "missing": plugin.missing,
                 "has_ui": has_ui,
+                "has_sidechain": has_sidechain,
+                "sidechain_bus": plugin.sidechain_bus.map(|bus| bus.0),
                 "midi_channel": plugin.midi_channel,
                 "controls": control_list,
             })
@@ -3159,6 +3237,9 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
         params.set_bus_return(index, bus.return_inputs && index != 0);
         params.set_bus_send_gain(index, bus.send_gain.0);
         params.set_bus_return_gain(index, bus.return_gain.0);
+        for (slot, plugin) in bus.plugins.iter().enumerate() {
+            params.set_bus_plugin_sidechain(index, slot, plugin.sidechain_bus.map(|b| b.0 as usize));
+        }
     }
 
     for strip in &model.strips {
@@ -3180,6 +3261,27 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
             params.set_send_delay(index, send.bus.0 as usize, send.delay_ms);
             params.set_send_pre_fader(index, send.bus.0 as usize, send.pre_fader);
         }
+
+        for (chain, plugins) in [&strip.plugins, &strip.plugins_post].into_iter().enumerate() {
+            for (slot, plugin) in plugins.iter().enumerate() {
+                params.set_plugin_sidechain(
+                    index,
+                    chain,
+                    slot,
+                    plugin.sidechain_bus.map(|b| b.0 as usize),
+                );
+            }
+        }
+    }
+}
+
+/// Clears a plugin's sidechain if it points at the master or a missing bus.
+fn clear_invalid_sidechain(plugin: &mut PluginSlot, bus_count: usize) {
+    if let Some(bus) = plugin.sidechain_bus {
+        let id = bus.0 as usize;
+        if id == 0 || id >= bus_count {
+            plugin.sidechain_bus = None;
+        }
     }
 }
 
@@ -3190,9 +3292,15 @@ pub fn clamp_to_capacity(model: &mut MixerModel, strips: usize, buses: usize) {
         strip.sends.retain(|send| (send.bus.0 as usize) < buses);
         strip.plugins.truncate(MAX_PLUGINS);
         strip.plugins_post.truncate(MAX_PLUGINS);
+        for plugin in strip.plugins.iter_mut().chain(strip.plugins_post.iter_mut()) {
+            clear_invalid_sidechain(plugin, buses);
+        }
     }
     for bus in &mut model.buses {
         bus.plugins.truncate(MAX_PLUGINS);
+        for plugin in bus.plugins.iter_mut() {
+            clear_invalid_sidechain(plugin, buses);
+        }
         if bus.id.0 == 0 {
             bus.return_inputs = false;
         }

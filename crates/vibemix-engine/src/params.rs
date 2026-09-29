@@ -29,6 +29,9 @@ pub struct SharedParams {
     plugin_bypass: Vec<Vec<Vec<AtomicBool>>>,
     bus_plugin_params: Vec<Vec<Vec<AtomicU32>>>,
     bus_plugin_bypass: Vec<Vec<AtomicBool>>,
+    /// Sidechain source bus per plugin slot (`bus + 1`; 0 = none).
+    plugin_sidechain: Vec<Vec<Vec<AtomicU32>>>,
+    bus_plugin_sidechain: Vec<Vec<AtomicU32>>,
     state_pause: AtomicBool,
     state_ack: AtomicBool,
     beats_per_bar: AtomicU32,
@@ -79,6 +82,16 @@ impl SharedParams {
                 .collect(),
             bus_plugin_bypass: (0..bus_count)
                 .map(|_| (0..MAX_PLUGINS).map(|_| AtomicBool::new(false)).collect())
+                .collect(),
+            plugin_sidechain: (0..strip_count)
+                .map(|_| {
+                    (0..PLUGIN_CHAINS)
+                        .map(|_| (0..MAX_PLUGINS).map(|_| AtomicU32::new(0)).collect())
+                        .collect()
+                })
+                .collect(),
+            bus_plugin_sidechain: (0..bus_count)
+                .map(|_| (0..MAX_PLUGINS).map(|_| AtomicU32::new(0)).collect())
                 .collect(),
             state_pause: AtomicBool::new(false),
             state_ack: AtomicBool::new(false),
@@ -265,6 +278,49 @@ impl SharedParams {
             .and_then(|sends| sends.get(bus))
         {
             slot.store(value, Ordering::Relaxed);
+        }
+    }
+
+    pub fn plugin_sidechain(&self, strip: usize, chain: usize, slot: usize) -> Option<usize> {
+        self.plugin_sidechain
+            .get(strip)
+            .and_then(|chains| chains.get(chain))
+            .and_then(|slots| slots.get(slot))
+            .map(|value| value.load(Ordering::Relaxed))
+            .filter(|value| *value != 0)
+            .map(|value| (value - 1) as usize)
+    }
+
+    pub fn set_plugin_sidechain(&self, strip: usize, chain: usize, slot: usize, bus: Option<usize>) {
+        if let Some(slot) = self
+            .plugin_sidechain
+            .get(strip)
+            .and_then(|chains| chains.get(chain))
+            .and_then(|slots| slots.get(slot))
+        {
+            slot.store(bus.map(|b| b as u32 + 1).unwrap_or(0), Ordering::Relaxed);
+        }
+    }
+
+    pub fn bus_plugin_sidechain(&self, bus: usize, slot: usize) -> Option<usize> {
+        self.bus_plugin_sidechain
+            .get(bus)
+            .and_then(|slots| slots.get(slot))
+            .map(|value| value.load(Ordering::Relaxed))
+            .filter(|value| *value != 0)
+            .map(|value| (value - 1) as usize)
+    }
+
+    pub fn set_bus_plugin_sidechain(&self, bus: usize, slot: usize, sidechain: Option<usize>) {
+        if let Some(slot) = self
+            .bus_plugin_sidechain
+            .get(bus)
+            .and_then(|slots| slots.get(slot))
+        {
+            slot.store(
+                sidechain.map(|b| b as u32 + 1).unwrap_or(0),
+                Ordering::Relaxed,
+            );
         }
     }
 

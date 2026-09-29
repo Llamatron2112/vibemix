@@ -264,6 +264,8 @@ struct MixerGraph {
     /// fader/pan), used by pre-fader sends.
     strip_pre_fader: Vec<[Vec<f32>; 2]>,
     send_scratch: [Vec<f32>; 2],
+    /// Silence fed to a plugin's sidechain input when nothing is routed.
+    sidechain_silence: [Vec<f32>; 2],
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
     capacity: usize,
@@ -459,6 +461,13 @@ impl MixerGraph {
                     if midi_sync {
                         instance.write_position(&position);
                     }
+                    feed_sidechain(
+                        &mut **instance,
+                        self.params.plugin_sidechain(index, chain, slot),
+                        &self.bus_accum,
+                        &self.sidechain_silence,
+                        frames,
+                    );
                     instance.run(frames);
 
                     let out_l = instance.output_buffer(0);
@@ -475,6 +484,13 @@ impl MixerGraph {
                         if midi_sync {
                             instance.write_position(&position);
                         }
+                        feed_sidechain(
+                            &mut **instance,
+                            self.params.plugin_sidechain(index, chain, slot),
+                            &self.bus_accum,
+                            &self.sidechain_silence,
+                            frames,
+                        );
                         instance.run(frames);
                         let out = instance.output_buffer(0);
                         self.strip_scratch[channel][..frames].copy_from_slice(&out[..frames]);
@@ -520,6 +536,13 @@ impl MixerGraph {
                     if midi_sync {
                         instance.write_position(&position);
                     }
+                    feed_sidechain(
+                        &mut **instance,
+                        self.params.bus_plugin_sidechain(bus, slot),
+                        &self.bus_accum,
+                        &self.sidechain_silence,
+                        frames,
+                    );
                     instance.run(frames);
 
                     let out_l = instance.output_buffer(0);
@@ -536,6 +559,13 @@ impl MixerGraph {
                         if midi_sync {
                             instance.write_position(&position);
                         }
+                        feed_sidechain(
+                            &mut **instance,
+                            self.params.bus_plugin_sidechain(bus, slot),
+                            &self.bus_accum,
+                            &self.sidechain_silence,
+                            frames,
+                        );
                         instance.run(frames);
                         let out = instance.output_buffer(0);
                         self.bus_scratch[channel][..frames].copy_from_slice(&out[..frames]);
@@ -1078,6 +1108,7 @@ impl JackEngine {
                 .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
                 .collect(),
             send_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            sidechain_silence: [vec![0.0; capacity], vec![0.0; capacity]],
             bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             bus_accum: (0..bus_count)
                 .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
@@ -1923,6 +1954,24 @@ fn set_bus_controls(
     for param in 0..controls {
         instance.set_control(param, params.bus_plugin_param(bus, slot, param));
     }
+}
+
+/// Feeds a plugin's sidechain input from the given source bus (or silence).
+fn feed_sidechain(
+    instance: &mut dyn PluginNode,
+    source: Option<usize>,
+    bus_accum: &[[Vec<f32>; 2]],
+    silence: &[Vec<f32>; 2],
+    frames: usize,
+) {
+    if !instance.has_sidechain() {
+        return;
+    }
+    let (left, right) = match source {
+        Some(bus) if bus < bus_accum.len() => (&bus_accum[bus][0], &bus_accum[bus][1]),
+        _ => (&silence[0], &silence[1]),
+    };
+    instance.write_sidechain(&left[..frames], &right[..frames]);
 }
 
 pub fn instantiate_slot(

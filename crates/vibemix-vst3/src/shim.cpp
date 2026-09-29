@@ -136,6 +136,10 @@ struct Hosted {
     std::vector<std::vector<float*>> aux_out_ptrs;
     std::vector<float> silence_frames;
     std::vector<float> aux_out_frames;
+    // First non-CV aux input bus (sidechain), or -1 if none. Its channel
+    // buffers are dedicated so the host can write a sidechain signal.
+    int32 sidechain_bus = -1;
+    std::vector<float> sidechain_frames;
     ParameterChanges changes;
     ParameterChanges out_changes;
     EventList events;
@@ -314,6 +318,16 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     hosted->out_channels =
         (hosted->component->getBusInfo(kAudio, kOutput, 0, bus) == kResultOk) ? bus.channelCount : 0;
 
+    // First non-CV auxiliary input bus: the sidechain the host can drive.
+    for (int32 b = 1; b < in_buses; ++b) {
+        BusInfo info {};
+        if (hosted->component->getBusInfo(kAudio, kInput, b, info) != kResultOk) continue;
+        if (info.busType == kAux && (info.flags & BusInfo::kIsControlVoltage) == 0) {
+            hosted->sidechain_bus = b;
+            break;
+        }
+    }
+
     // Ask for the layout we will actually deliver (mono/stereo on bus 0), so
     // plugins that require an explicit arrangement configure correctly.
     const int32 num_arr_in = in_buses > 0 ? in_buses : 0;
@@ -323,6 +337,13 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
         std::vector<SpeakerArrangement> arr_out(num_arr_out, SpeakerArr::kEmpty);
         arr_in[0] = hosted->in_channels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
         arr_out[0] = hosted->out_channels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
+        if (hosted->sidechain_bus > 0 && hosted->sidechain_bus < num_arr_in) {
+            BusInfo sidechain {};
+            if (hosted->component->getBusInfo(kAudio, kInput, hosted->sidechain_bus, sidechain) ==
+                kResultOk)
+                arr_in[hosted->sidechain_bus] =
+                    sidechain.channelCount == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
+        }
         hosted->processor->setBusArrangements(arr_in.data(), num_arr_in, arr_out.data(),
                                               num_arr_out);
     }
@@ -338,6 +359,8 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     // Buses are nominally active after setActive, but some plugins (e.g. JUCE's
     // wrapper) only route audio for buses the host explicitly activates.
     if (in_buses > 0) hosted->component->activateBus(kAudio, kInput, 0, true);
+    if (hosted->sidechain_bus >= 0)
+        hosted->component->activateBus(kAudio, kInput, hosted->sidechain_bus, true);
     if (out_buses > 0) hosted->component->activateBus(kAudio, kOutput, 0, true);
 
     hosted->processing_result = hosted->processor->setProcessing(true);
@@ -373,9 +396,21 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
             hosted->component->getBusInfo(kAudio, kInput, b, info) == kResultOk
                 ? info.channelCount
                 : 0;
-        hosted->aux_in_ptrs[b].assign(channels, hosted->silence_frames.data());
+        auto& ptrs = hosted->aux_in_ptrs[b];
+        if (b == hosted->sidechain_bus && channels > 0) {
+            // Dedicated per-channel buffers so the host can write a sidechain.
+            hosted->sidechain_frames.assign(
+                static_cast<size_t>(channels) * kScratchFrames, 0.0f);
+            ptrs.assign(channels, nullptr);
+            for (int32 j = 0; j < channels; ++j) {
+                ptrs[j] = hosted->sidechain_frames.data() +
+                          static_cast<size_t>(j) * kScratchFrames;
+            }
+        } else {
+            ptrs.assign(channels, hosted->silence_frames.data());
+        }
         hosted->in_bus_buffers[b].numChannels = channels;
-        hosted->in_bus_buffers[b].channelBuffers32 = hosted->aux_in_ptrs[b].data();
+        hosted->in_bus_buffers[b].channelBuffers32 = ptrs.data();
     }
     int32 aux_out_offset = 0;
     for (int32 b = 1; b < out_buses; ++b) {
@@ -552,6 +587,28 @@ int vst3_has_editor(void* handle) {
     const int ok = view->isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) == kResultTrue;
     view->release();
     return ok;
+}
+
+/// Whether the plugin has an auxiliary (sidechain) input bus.
+int vst3_has_sidechain(void* handle) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    return (hosted && hosted->sidechain_bus >= 0) ? 1 : 0;
+}
+
+/// Writes a stereo sidechain signal into the plugin's sidechain input bus.
+void vst3_write_sidechain(void* handle, const float* left, const float* right, int frames) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted || hosted->sidechain_bus < 0 || frames <= 0) return;
+    auto& ptrs = hosted->aux_in_ptrs[hosted->sidechain_bus];
+    const int32 channels = hosted->in_bus_buffers[hosted->sidechain_bus].numChannels;
+    if (channels >= 2) {
+        if (left) std::memcpy(ptrs[0], left, sizeof(float) * (size_t)frames);
+        if (right) std::memcpy(ptrs[1], right, sizeof(float) * (size_t)frames);
+        for (int32 j = 2; j < channels; ++j) std::memset(ptrs[j], 0, sizeof(float) * (size_t)frames);
+    } else if (channels == 1) {
+        for (int32 s = 0; s < frames; ++s)
+            ptrs[0][s] = 0.5f * ((left ? left[s] : 0.0f) + (right ? right[s] : 0.0f));
+    }
 }
 
 /// Writes a short description of the component's audio buses to `out`.

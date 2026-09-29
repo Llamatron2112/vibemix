@@ -391,6 +391,7 @@ mod tests {
             name: id.to_string(),
             bundle: None,
             has_ui: false,
+            has_sidechain: false,
             inputs,
             outputs,
             midi: false,

@@ -79,6 +79,13 @@ extern "C" {
     fn vst3_bus_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_editor_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_has_editor(handle: *mut c_void) -> c_int;
+    fn vst3_has_sidechain(handle: *mut c_void) -> c_int;
+    fn vst3_write_sidechain(
+        handle: *mut c_void,
+        left: *const f32,
+        right: *const f32,
+        frames: c_int,
+    );
     fn vst3_smoke_editor(instance: *mut c_void) -> c_int;
     fn vst3_take_param_edit(handle: *mut c_void, index: *mut c_int, value: *mut f32) -> c_int;
     fn vst3_take_restart_flags(handle: *mut c_void) -> c_int;
@@ -350,6 +357,23 @@ impl PluginInstance {
     /// Whether the plugin offers an X11-embeddable editor.
     pub fn has_editor(&self) -> bool {
         unsafe { vst3_has_editor(self.handle) != 0 }
+    }
+
+    /// Whether the plugin has an auxiliary (sidechain) input bus.
+    pub fn has_sidechain(&self) -> bool {
+        unsafe { vst3_has_sidechain(self.handle) != 0 }
+    }
+
+    /// Writes a stereo sidechain signal into the plugin's sidechain input bus.
+    pub fn write_sidechain(&self, left: &[f32], right: &[f32], frames: usize) {
+        unsafe {
+            vst3_write_sidechain(
+                self.handle,
+                left.as_ptr(),
+                right.as_ptr(),
+                frames as c_int,
+            )
+        };
     }
 
     /// Creates and tears down the editor headlessly (crash canary).

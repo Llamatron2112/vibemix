@@ -516,6 +516,8 @@ fn build_plugins(
             "name": plugin.get("name").cloned().unwrap_or(serde_json::json!("")),
             "bypassed": plugin.get("bypassed").cloned().unwrap_or(serde_json::json!(false)),
             "has_ui": plugin.get("has_ui").cloned().unwrap_or(serde_json::json!(false)),
+            "has_sidechain": plugin.get("has_sidechain").cloned().unwrap_or(serde_json::json!(false)),
+            "sidechain_bus": plugin.get("sidechain_bus").cloned().unwrap_or(serde_json::Value::Null),
             "midi_channel": plugin.get("midi_channel").cloned().unwrap_or(serde_json::Value::Null),
             "controls": controls_structure,
         }));
@@ -824,6 +826,10 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setPluginBypass"]
         fn update_plugin_bypass(&self, location: i32, target: i32, slot: i32, bypassed: bool);
+
+        #[qinvokable]
+        #[cxx_name = "setPluginSidechain"]
+        fn update_plugin_sidechain(&self, location: i32, target: i32, slot: i32, bus: i32);
 
         #[qinvokable]
         #[cxx_name = "openPluginUi"]
@@ -1365,6 +1371,16 @@ impl qobject::Backend {
             target: target as u32,
             slot: slot as u32,
             bypassed,
+        });
+    }
+
+    pub fn update_plugin_sidechain(&self, location: i32, target: i32, slot: i32, bus: i32) {
+        note_action("plugin sidechain");
+        send(ControlMessage::SetPluginSidechain {
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+            bus,
         });
     }
 
