@@ -82,8 +82,10 @@ the strip has three meter taps — `in` (raw input), `gain` (post-trim, pre-plug
 and `out` (post-fader/pan) — and the GUI can select which one each strip's meter
 shows. The numeric readout and the meter's dB scale use `-60..+6 dBFS`.
 
-Each strip has one post-fader send per bus (`strip.sends`), exposed as a slider
-per bus in the GUI; each send also carries an alignment delay (`delay_ms`,
+Each strip has one send per bus (`strip.sends`), exposed as a slider per bus in
+the GUI and tapped post-fader by default; a send flagged `pre_fader` taps the
+signal after the pre-fader insert chain but before the fader and pan. Each send
+also carries an alignment delay (`delay_ms`,
 `0..500 ms`, smoothed and linearly interpolated) so a signal routed through
 several buses with different latencies (a dry path vs. a latency-inducing FX
 bus) can be phase-aligned per send. The GUI entry accepts `ms`, seconds (`s`) or
@@ -283,6 +285,19 @@ wired to the strip/bus signal, extra input buses (e.g. a sidechain) are fed
 silence, and extra output buses get throwaway scratch, so a plugin's bus
 topology is preserved even though vibemix only routes the main bus.
 
+**Sidechain routing.** A plugin slot may name a source bus
+(`PluginSlot.sidechain_bus`); the plugin's first non-CV aux input is then fed
+that bus's summed strip sends (`bus_accum`) instead of silence. Strips feed the
+bus with their ordinary send rows (per-strip gain and pre/post tap), so the
+master is not a valid source and no separate send UI is needed. To avoid the
+variable PipeWire quantum becoming an audible sidechain delay, the engine
+processes strips in a **topological order** (computed once per change) that
+runs a bus's contributing strips before the strips whose plugins consume it, so
+the sum is complete in the same block; strips left in a dependency cycle read
+the previous block's sum. The order is installed via an RT command and the old
+order is retired on the control thread. The VST3 editor's context menu offers
+"Sidechain input" for plugins that report an aux input.
+
 Not supported: Qt plugin UIs (and GTK4).
 
 This hosts all mono/stereo plugins, including meters/analysers with atom output
@@ -367,11 +382,13 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/bus/duplicate` | `int bus` (master cannot be duplicated) |
 | `/vibemix/send/gain` | `int strip, int bus, float gain` |
 | `/vibemix/send/delay` | `int strip, int bus, float ms` (0..500, alignment delay) |
+| `/vibemix/send/pre_fader` | `int strip, int bus, int pre` (tap before fader/pan) |
 | `/vibemix/plugin/add` | `int location, int target, string uri` |
 | `/vibemix/plugin/remove` | `int location, int target, int slot` |
 | `/vibemix/plugin/move` | `int location, int target, int from, int to` |
 | `/vibemix/plugin/param` | `int location, int target, int slot, int param, float value` |
 | `/vibemix/plugin/bypass` | `int location, int target, int slot, int bypassed` |
+| `/vibemix/plugin/sidechain` | `int location, int target, int slot, int bus` (-1 clears) |
 | `/vibemix/plugin/ui` | `int location, int target, int slot` (open native UI window) |
 | `/vibemix/plugin/ui/close` | `int location, int target, int slot` |
 | `/vibemix/plugin/copy` | `int location, int target, int slot` |
