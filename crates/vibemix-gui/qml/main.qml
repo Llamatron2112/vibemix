@@ -1339,6 +1339,36 @@ ApplicationWindow {
                                 pluginRow.pluginData.slot,
                                 !pluginRow.pluginData.bypassed)
                         }
+                        Menu {
+                            title: "Sidechain input"
+                            enabled: pluginRow.pluginData.has_sidechain === true
+                            visible: pluginRow.pluginData.has_sidechain === true
+                            MenuItem {
+                                text: "None"
+                                checkable: true
+                                checked: pluginRow.pluginData.sidechain_bus === null
+                                    || pluginRow.pluginData.sidechain_bus === undefined
+                                onTriggered: backend.setPluginSidechain(
+                                    pluginListRoot.location,
+                                    pluginListRoot.target,
+                                    pluginRow.pluginData.slot,
+                                    -1)
+                            }
+                            Repeater {
+                                model: mix.buses
+                                MenuItem {
+                                    visible: modelData.id !== 0
+                                    text: modelData.name
+                                    checkable: true
+                                    checked: pluginRow.pluginData.sidechain_bus === modelData.id
+                                    onTriggered: backend.setPluginSidechain(
+                                        pluginListRoot.location,
+                                        pluginListRoot.target,
+                                        pluginRow.pluginData.slot,
+                                        modelData.id)
+                                }
+                            }
+                        }
                         MenuSeparator { }
                         MenuItem {
                             text: "Move up"
