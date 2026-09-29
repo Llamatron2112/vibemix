@@ -315,6 +315,8 @@ impl Controller {
             pending_learn: None,
             last_param_echo: Instant::now() - PARAM_ECHO_INTERVAL,
         };
+        controller.ensure_model_vst3_controls();
+        save_catalog(&controller.plugins);
         controller.rebuild_shared_bindings();
         controller.start_health_scan();
         Ok(controller)
@@ -1826,6 +1828,32 @@ impl Controller {
             .map(ControlInfo::from)
             .collect();
         self.plugins[index].has_ui = instance.has_editor();
+    }
+
+    /// Fills VST3 parameter metadata (and editor availability) for plugins that
+    /// are present in a loaded session. Fresh discovery cannot know either
+    /// without instantiating, and `add_plugin` is not involved on restore.
+    fn ensure_model_vst3_controls(&mut self) {
+        let mut ids: Vec<String> = Vec::new();
+        for strip in &self.model.strips {
+            for plugin in strip.plugins.iter().chain(strip.plugins_post.iter()) {
+                if plugin.format == PluginFormat::Vst3 {
+                    ids.push(plugin.uri.clone());
+                }
+            }
+        }
+        for bus in &self.model.buses {
+            for plugin in &bus.plugins {
+                if plugin.format == PluginFormat::Vst3 {
+                    ids.push(plugin.uri.clone());
+                }
+            }
+        }
+        ids.sort();
+        ids.dedup();
+        for id in ids {
+            self.ensure_vst3_controls(&id);
+        }
     }
 
     /// Appends a fully-described plugin slot (uri, params, LV2 state, bypass) to
