@@ -3,10 +3,31 @@ use serde::{Deserialize, Serialize};
 use crate::ids::{BusId, PluginId, StripId};
 use crate::params::{Gain, Pan};
 
+/// Plugin formats the mixer can host.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum PluginFormat {
+    #[default]
+    Lv2,
+    Vst3,
+}
+
+impl PluginFormat {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PluginFormat::Lv2 => "lv2",
+            PluginFormat::Vst3 => "vst3",
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PluginSlot {
     pub id: PluginId,
+    /// Format-specific identifier: an LV2 URI or a VST3 class id.
     pub uri: String,
+    #[serde(default)]
+    pub format: PluginFormat,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -33,6 +54,7 @@ impl PluginSlot {
         Self {
             id,
             uri: uri.into(),
+            format: PluginFormat::Lv2,
             name: String::new(),
             params: Vec::new(),
             state: String::new(),
@@ -475,6 +497,22 @@ mod tests {
         let parsed: MixerModel = toml::from_str(&text).expect("deserialize");
         assert!(parsed.strips[0].connections.is_none());
         assert!(parsed.buses[0].connections.is_none());
+    }
+
+    #[test]
+    fn plugin_format_defaults_lv2_and_roundtrips() {
+        let mut slot = PluginSlot::new(PluginId(0), "http://example.com/x");
+        assert_eq!(slot.format, PluginFormat::Lv2);
+
+        slot.format = PluginFormat::Vst3;
+        let text = toml::to_string(&slot).expect("serialize");
+        let parsed: PluginSlot = toml::from_str(&text).expect("deserialize");
+        assert_eq!(parsed.format, PluginFormat::Vst3);
+
+        // Sessions written before formats existed default to LV2.
+        let legacy = "id = 0\nuri = \"http://example.com/y\"\nbypassed = false\n";
+        let parsed: PluginSlot = toml::from_str(legacy).expect("deserialize legacy");
+        assert_eq!(parsed.format, PluginFormat::Lv2);
     }
 
     #[test]

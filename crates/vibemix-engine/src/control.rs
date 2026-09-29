@@ -2576,6 +2576,7 @@ fn build_catalog(plugins: &[PluginInfo], health: &HealthStore) -> String {
             };
             serde_json::json!({
                 "uri": info.uri,
+                "format": "lv2",
                 "name": info.name,
                 "has_ui": info.has_ui,
                 "inputs": info.audio_inputs.len(),
