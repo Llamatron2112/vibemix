@@ -9,11 +9,20 @@ use serde::{Deserialize, Serialize};
 pub const MAX_FRAMES: usize = 8192;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ScalePoint {
+    pub value: f32,
+    pub label: String,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ControlPort {
     pub index: usize,
     pub name: String,
     pub default: f32,
     pub flags: i32,
+    /// 0 = continuous; 1 = toggle; >1 = discrete step count.
+    pub step_count: i32,
+    pub scale_points: Vec<ScalePoint>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -48,6 +57,14 @@ extern "C" {
         name_cap: c_int,
         def: *mut f32,
         flags: *mut c_int,
+        step_count: *mut c_int,
+    ) -> c_int;
+    fn vst3_param_value_string(
+        handle: *mut c_void,
+        index: c_int,
+        normalized: f32,
+        out: *mut c_char,
+        cap: c_int,
     ) -> c_int;
     fn vst3_set_param(handle: *mut c_void, index: c_int, normalized: f32);
     fn vst3_get_param(handle: *mut c_void, index: c_int) -> f32;
@@ -179,6 +196,7 @@ impl PluginInstance {
             let mut name = [0i8; 128];
             let mut default = 0.0f32;
             let mut flags = 0i32;
+            let mut step_count = 0i32;
             let ok = unsafe {
                 vst3_param_info(
                     self.handle,
@@ -187,6 +205,7 @@ impl PluginInstance {
                     name.len() as c_int,
                     &mut default,
                     &mut flags,
+                    &mut step_count,
                 )
             };
             if ok == 0 {
@@ -195,11 +214,37 @@ impl PluginInstance {
             let name = unsafe { CStr::from_ptr(name.as_ptr()) }
                 .to_string_lossy()
                 .into_owned();
+            let mut scale_points = Vec::new();
+            if (2..=32).contains(&step_count) {
+                for step in 0..=step_count {
+                    let value = step as f32 / step_count as f32;
+                    let mut text = [0i8; 128];
+                    let got = unsafe {
+                        vst3_param_value_string(
+                            self.handle,
+                            index,
+                            value,
+                            text.as_mut_ptr(),
+                            text.len() as c_int,
+                        )
+                    };
+                    let label = if got != 0 {
+                        unsafe { CStr::from_ptr(text.as_ptr()) }
+                            .to_string_lossy()
+                            .into_owned()
+                    } else {
+                        step.to_string()
+                    };
+                    scale_points.push(ScalePoint { value, label });
+                }
+            }
             self.controls.push(ControlPort {
                 index: index as usize,
                 name,
                 default,
                 flags,
+                step_count,
+                scale_points,
             });
         }
     }
@@ -261,29 +306,96 @@ impl PluginInstance {
 
     /// Component state as an opaque byte blob (empty when the plugin has none).
     pub fn save_state(&mut self) -> Vec<u8> {
-        let size = unsafe { vst3_save_state(self.handle, std::ptr::null_mut(), 0) };
-        if size <= 0 {
-            return Vec::new();
-        }
-        let mut bytes = vec![0u8; size as usize];
-        let written =
-            unsafe { vst3_save_state(self.handle, bytes.as_mut_ptr() as *mut c_char, size) };
-        bytes.truncate(written.max(0) as usize);
-        bytes
+        save_blob(self.handle)
     }
 
     pub fn load_state(&mut self, state: &[u8]) {
-        if state.is_empty() {
-            return;
-        }
-        unsafe {
-            vst3_load_state(
-                self.handle,
-                state.as_ptr() as *const c_char,
-                state.len() as c_int,
-            )
-        };
+        restore_blob(self.handle, state);
     }
+
+    /// A handle for saving/restoring state from another thread (the control
+    /// thread), mirroring the LV2 state proxy. Valid while the instance lives.
+    pub fn state_handle(&self) -> StateHandle {
+        StateHandle {
+            handle: self.handle,
+        }
+    }
+}
+
+/// Cross-thread handle to a live instance's state.
+pub struct StateHandle {
+    handle: *mut c_void,
+}
+
+unsafe impl Send for StateHandle {}
+
+impl Clone for StateHandle {
+    fn clone(&self) -> Self {
+        Self {
+            handle: self.handle,
+        }
+    }
+}
+
+impl StateHandle {
+    pub fn save(&self) -> Vec<u8> {
+        save_blob(self.handle)
+    }
+
+    pub fn restore(&self, state: &[u8]) {
+        restore_blob(self.handle, state);
+    }
+}
+
+fn save_blob(handle: *mut c_void) -> Vec<u8> {
+    let size = unsafe { vst3_save_state(handle, std::ptr::null_mut(), 0) };
+    if size <= 0 {
+        return Vec::new();
+    }
+    let mut bytes = vec![0u8; size as usize];
+    let written = unsafe { vst3_save_state(handle, bytes.as_mut_ptr() as *mut c_char, size) };
+    bytes.truncate(written.max(0) as usize);
+    bytes
+}
+
+fn restore_blob(handle: *mut c_void, state: &[u8]) {
+    if state.is_empty() {
+        return;
+    }
+    unsafe {
+        vst3_load_state(
+            handle,
+            state.as_ptr() as *const c_char,
+            state.len() as c_int,
+        )
+    };
+}
+
+/// Hex-encodes a state blob for storage in the session's string field.
+pub fn encode_blob(bytes: &[u8]) -> String {
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(char::from_digit((byte >> 4) as u32, 16).unwrap_or('0'));
+        out.push(char::from_digit((byte & 0x0f) as u32, 16).unwrap_or('0'));
+    }
+    out
+}
+
+pub fn decode_blob(text: &str) -> Vec<u8> {
+    let bytes = text.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len() / 2);
+    let mut i = 0;
+    while i + 1 < bytes.len() {
+        let (Some(hi), Some(lo)) = (
+            (bytes[i] as char).to_digit(16),
+            (bytes[i + 1] as char).to_digit(16),
+        ) else {
+            break;
+        };
+        out.push((hi * 16 + lo) as u8);
+        i += 2;
+    }
+    out
 }
 
 impl Drop for PluginInstance {

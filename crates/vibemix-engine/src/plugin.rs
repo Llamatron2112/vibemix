@@ -111,7 +111,7 @@ impl PluginNode for vibemix_vst3::PluginInstance {
     }
 
     fn load_state(&mut self, state: &str) {
-        // VST3 state is a binary blob; wired up in a later step.
-        let _ = state;
+        let bytes = vibemix_vst3::decode_blob(state);
+        vibemix_vst3::PluginInstance::load_state(self, &bytes);
     }
 }

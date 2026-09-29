@@ -6,4 +6,7 @@
 
 mod host;
 
-pub use host::{standard_dirs, ControlPort, Host, PluginInfo, PluginInstance, MAX_FRAMES};
+pub use host::{
+    decode_blob, encode_blob, standard_dirs, ControlPort, Host, PluginInfo, PluginInstance,
+    ScalePoint, StateHandle, MAX_FRAMES,
+};

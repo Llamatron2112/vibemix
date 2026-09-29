@@ -247,8 +247,9 @@ int vst3_param_count(void* handle) {
     return hosted->controller->getParameterCount();
 }
 
-/// Fills name/def/flags for `index`; returns 1 on success.
-int vst3_param_info(void* handle, int index, char* name, int name_cap, float* def, int* flags) {
+/// Fills name/def/flags/step-count for `index`; returns 1 on success.
+int vst3_param_info(void* handle, int index, char* name, int name_cap, float* def, int* flags,
+                    int* step_count) {
     auto* hosted = static_cast<Hosted*>(handle);
     if (!hosted || !hosted->controller) return 0;
     ParameterInfo info {};
@@ -261,6 +262,23 @@ int vst3_param_info(void* handle, int index, char* name, int name_cap, float* de
     }
     if (def) *def = static_cast<float>(info.defaultNormalizedValue);
     if (flags) *flags = info.flags;
+    if (step_count) *step_count = info.stepCount;
+    return 1;
+}
+
+/// Writes the display string for `normalized` on `index`; returns 1 on success.
+int vst3_param_value_string(void* handle, int index, float normalized, char* out, int cap) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted || !hosted->controller || !out || cap <= 0) return 0;
+    ParameterInfo info {};
+    if (hosted->controller->getParameterInfo(index, info) != kResultOk) return 0;
+    String128 text {};
+    if (hosted->controller->getParamStringByValue(info.id, normalized, text) != kResultOk)
+        return 0;
+    int i = 0;
+    for (; i < cap - 1 && text[i]; ++i)
+        out[i] = static_cast<char>(text[i]);
+    out[i] = 0;
     return 1;
 }
 

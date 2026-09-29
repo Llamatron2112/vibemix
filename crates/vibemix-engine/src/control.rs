@@ -18,8 +18,8 @@ use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_lv2::{find_ui, Host, SharedOutputs, UiCandidate, UiWindow};
 use vibemix_proto::ControlMessage;
 
-use crate::backend_jack::{encode_state, instantiate_slot, JackEngine};
-use crate::catalog::PluginEntry;
+use crate::backend_jack::{instantiate_slot, JackEngine};
+use crate::catalog::{ControlInfo, PluginEntry};
 use crate::dsp;
 use crate::health::{HealthStore, Scan, ScanEvent, Status};
 use crate::params::{SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS};
@@ -1218,9 +1218,9 @@ impl Controller {
                                 self.params.plugin_param(strip_index, chain, slot, param);
                         }
                     }
-                    if let Some(proxy) = self.engine.state_proxy(strip_index, chain, slot) {
-                        if proxy.supports_save() {
-                            plugin.state = encode_state(&self.host, &proxy.save());
+                    if let Some(state) = self.engine.state_proxy(strip_index, chain, slot) {
+                        if let Some(encoded) = state.encode(&self.host) {
+                            plugin.state = encoded;
                         }
                     }
                 }
@@ -1243,9 +1243,9 @@ impl Controller {
                         plugin.params[param] = self.params.bus_plugin_param(bus_index, slot, param);
                     }
                 }
-                if let Some(proxy) = self.engine.bus_state_proxy(bus_index, slot) {
-                    if proxy.supports_save() {
-                        plugin.state = encode_state(&self.host, &proxy.save());
+                if let Some(state) = self.engine.bus_state_proxy(bus_index, slot) {
+                    if let Some(encoded) = state.encode(&self.host) {
+                        plugin.state = encoded;
                     }
                 }
             }
@@ -1655,6 +1655,7 @@ impl Controller {
     }
 
     fn add_plugin(&mut self, location: u32, target: u32, uri: &str) -> bool {
+        self.ensure_vst3_controls(uri);
         let Some(info) = self.plugins.iter().find(|entry| entry.id == uri).cloned() else {
             tracing::warn!(%uri, "plugin not in catalog");
             return false;
@@ -1663,37 +1664,46 @@ impl Controller {
         plugin.format = info.format;
         plugin.bundle = info.bundle.clone();
         plugin.name = info.name;
-        plugin.params = match info.format {
-            PluginFormat::Lv2 => info
-                .controls
-                .iter()
-                .map(|control| control.default)
-                .collect(),
-            // VST3 parameter metadata isn't in the catalog yet; seed the
-            // defaults from a throwaway instance so the DSP starts neutral.
-            PluginFormat::Vst3 => {
-                let sample_rate = self.engine.sample_rate() as f64;
-                let buffer_size = self.engine.buffer_size() as usize;
-                info.bundle
-                    .as_deref()
-                    .and_then(|bundle| {
-                        self.vst3.instantiate(
-                            bundle,
-                            &info.id,
-                            sample_rate,
-                            buffer_size,
-                            vibemix_vst3::PluginInstance::max_frames(),
-                        )
-                    })
-                    .map(|instance| {
-                        (0..instance.control_count())
-                            .map(|param| instance.control_default(param))
-                            .collect()
-                    })
-                    .unwrap_or_default()
-            }
-        };
+        plugin.params = info
+            .controls
+            .iter()
+            .map(|control| control.default)
+            .collect();
         self.insert_plugin_slot(location, target, plugin)
+    }
+
+    /// Fills a catalog entry's VST3 control metadata by instantiating the plugin
+    /// once (on the control thread, so not RT). LV2 metadata is discovered up
+    /// front; VST3 parameter info is only available from an instance.
+    fn ensure_vst3_controls(&mut self, id: &str) {
+        let Some(index) = self.plugins.iter().position(|entry| entry.id == id) else {
+            return;
+        };
+        if self.plugins[index].format != PluginFormat::Vst3
+            || !self.plugins[index].controls.is_empty()
+        {
+            return;
+        }
+        let Some(bundle) = self.plugins[index].bundle.clone() else {
+            return;
+        };
+        let sample_rate = self.engine.sample_rate() as f64;
+        let buffer_size = self.engine.buffer_size() as usize;
+        let Some(instance) = self.vst3.instantiate(
+            &bundle,
+            id,
+            sample_rate,
+            buffer_size,
+            vibemix_vst3::PluginInstance::max_frames(),
+        ) else {
+            return;
+        };
+        self.plugins[index].controls = instance
+            .controls()
+            .iter()
+            .cloned()
+            .map(ControlInfo::from)
+            .collect();
     }
 
     /// Appends a fully-described plugin slot (uri, params, LV2 state, bypass) to
@@ -1720,6 +1730,17 @@ impl Controller {
                 None => return false,
             }
         };
+
+        self.ensure_vst3_controls(&plugin.uri);
+        if plugin.params.is_empty() {
+            if let Some(info) = self.plugins.iter().find(|entry| entry.id == plugin.uri) {
+                plugin.params = info
+                    .controls
+                    .iter()
+                    .map(|control| control.default)
+                    .collect();
+            }
+        }
 
         // Plugins are smoke-tested in a throwaway child before being loaded.
         match plugin.format {
@@ -1828,9 +1849,9 @@ impl Controller {
             plugin.bypassed = self
                 .params
                 .plugin_bypass(target as usize, chain, slot as usize);
-            if let Some(proxy) = self.engine.state_proxy(target as usize, chain, slot as usize) {
-                if proxy.supports_save() {
-                    plugin.state = encode_state(&self.host, &proxy.save());
+            if let Some(state) = self.engine.state_proxy(target as usize, chain, slot as usize) {
+                if let Some(encoded) = state.encode(&self.host) {
+                    plugin.state = encoded;
                 }
             }
         } else {
@@ -1839,9 +1860,9 @@ impl Controller {
                     self.params.bus_plugin_param(target as usize, slot as usize, param);
             }
             plugin.bypassed = self.params.bus_plugin_bypass(target as usize, slot as usize);
-            if let Some(proxy) = self.engine.bus_state_proxy(target as usize, slot as usize) {
-                if proxy.supports_save() {
-                    plugin.state = encode_state(&self.host, &proxy.save());
+            if let Some(state) = self.engine.bus_state_proxy(target as usize, slot as usize) {
+                if let Some(encoded) = state.encode(&self.host) {
+                    plugin.state = encoded;
                 }
             }
         }
@@ -2674,7 +2695,7 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
                 midi: !info.midi_inputs.is_empty(),
                 hostable: info.hostable,
                 unsupported,
-                controls: info.controls,
+                controls: info.controls.into_iter().map(ControlInfo::from).collect(),
             }
         })
         .collect();

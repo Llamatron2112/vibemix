@@ -22,8 +22,31 @@ use crate::params::{
 const SMOOTHING: f32 = 0.005;
 const COMMAND_CAPACITY: usize = 64;
 
+/// Serialized plugin state, backed by either host's cross-thread state handle.
+#[derive(Clone)]
+pub enum SlotState {
+    Lv2(StateProxy),
+    Vst3(vibemix_vst3::StateHandle),
+}
+
+impl SlotState {
+    /// Session form of the state, or `None` when there is nothing to save.
+    pub fn encode(&self, host: &Host) -> Option<String> {
+        match self {
+            SlotState::Lv2(proxy) if proxy.supports_save() => {
+                Some(encode_state(host, &proxy.save()))
+            }
+            SlotState::Lv2(_) => None,
+            SlotState::Vst3(handle) => {
+                let bytes = handle.save();
+                (!bytes.is_empty()).then(|| vibemix_vst3::encode_blob(&bytes))
+            }
+        }
+    }
+}
+
 type StripChains = [Vec<SlotPlugin>; PLUGIN_CHAINS];
-type StripProxies = [Vec<Option<StateProxy>>; PLUGIN_CHAINS];
+type StripProxies = [Vec<Option<SlotState>>; PLUGIN_CHAINS];
 type StripHandles = [Vec<Option<usize>>; PLUGIN_CHAINS];
 type StripOutputs = [Vec<Option<Arc<SharedOutputs>>>; PLUGIN_CHAINS];
 
@@ -33,7 +56,7 @@ struct Built {
     strip_handles: Vec<StripHandles>,
     strip_outputs: Vec<StripOutputs>,
     bus_chains: Vec<Vec<SlotPlugin>>,
-    bus_proxies: Vec<Vec<Option<StateProxy>>>,
+    bus_proxies: Vec<Vec<Option<SlotState>>>,
     bus_handles: Vec<Vec<Option<usize>>>,
     bus_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>>,
 }
@@ -889,7 +912,7 @@ pub struct JackEngine {
     state_proxies: Vec<StripProxies>,
     plugin_handles: Vec<StripHandles>,
     plugin_outputs: Vec<StripOutputs>,
-    bus_state_proxies: Vec<Vec<Option<StateProxy>>>,
+    bus_state_proxies: Vec<Vec<Option<SlotState>>>,
     bus_plugin_handles: Vec<Vec<Option<usize>>>,
     bus_plugin_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>>,
     strip_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
@@ -1142,7 +1165,7 @@ impl JackEngine {
         strip: usize,
         chain: usize,
         plugin: SlotPlugin,
-        proxy: Option<StateProxy>,
+        proxy: Option<SlotState>,
         handle: usize,
     ) -> Result<()> {
         let outputs = plugin.outputs();
@@ -1291,7 +1314,7 @@ impl JackEngine {
         &mut self,
         bus: usize,
         plugin: SlotPlugin,
-        proxy: Option<StateProxy>,
+        proxy: Option<SlotState>,
         handle: usize,
     ) -> Result<()> {
         let outputs = plugin.outputs();
@@ -1379,7 +1402,7 @@ impl JackEngine {
         Ok(())
     }
 
-    pub fn bus_state_proxy(&self, bus: usize, slot: usize) -> Option<StateProxy> {
+    pub fn bus_state_proxy(&self, bus: usize, slot: usize) -> Option<SlotState> {
         self.bus_state_proxies
             .get(bus)
             .and_then(|slots| slots.get(slot))
@@ -1771,7 +1794,7 @@ impl JackEngine {
         std::mem::take(&mut self.pending_missing)
     }
 
-    pub fn state_proxy(&self, strip: usize, chain: usize, slot: usize) -> Option<StateProxy> {
+    pub fn state_proxy(&self, strip: usize, chain: usize, slot: usize) -> Option<SlotState> {
         self.state_proxies
             .get(strip)
             .and_then(|chains| chains.get(chain))
@@ -1879,12 +1902,14 @@ pub fn instantiate_slot(
     plugin: &PluginSlot,
     sample_rate: f64,
     buffer_size: usize,
-) -> Option<(SlotPlugin, Option<StateProxy>, usize)> {
+) -> Option<(SlotPlugin, Option<SlotState>, usize)> {
     match plugin.format {
         PluginFormat::Lv2 => instantiate_lv2(lv2, plugin, sample_rate, buffer_size),
         PluginFormat::Vst3 => {
-            let slot_plugin = instantiate_vst3(vst3, plugin, sample_rate, buffer_size)?;
-            Some((slot_plugin, None, 0))
+            let (mut slot_plugin, handle) =
+                instantiate_vst3(vst3, plugin, sample_rate, buffer_size)?;
+            slot_plugin.load_state(&plugin.state);
+            Some((slot_plugin, Some(SlotState::Vst3(handle)), 0))
         }
     }
 }
@@ -1894,7 +1919,7 @@ fn instantiate_vst3(
     plugin: &PluginSlot,
     sample_rate: f64,
     buffer_size: usize,
-) -> Option<SlotPlugin> {
+) -> Option<(SlotPlugin, vibemix_vst3::StateHandle)> {
     let bundle = plugin.bundle.as_deref()?;
     let open = |vst3: &vibemix_vst3::Host| {
         vst3.instantiate(
@@ -1906,17 +1931,19 @@ fn instantiate_vst3(
         )
     };
     let first = open(vst3)?;
-    match (first.audio_input_count(), first.audio_output_count()) {
-        (2, 2) => Some(SlotPlugin::Stereo(Box::new(first) as Box<dyn PluginNode>)),
+    let handle = first.state_handle();
+    let slot_plugin = match (first.audio_input_count(), first.audio_output_count()) {
+        (2, 2) => SlotPlugin::Stereo(Box::new(first) as Box<dyn PluginNode>),
         (1, 1) => {
             let second = open(vst3)?;
-            Some(SlotPlugin::Mono(
+            SlotPlugin::Mono(
                 Box::new(first) as Box<dyn PluginNode>,
                 Box::new(second) as Box<dyn PluginNode>,
-            ))
+            )
         }
-        _ => None,
-    }
+        _ => return None,
+    };
+    Some((slot_plugin, handle))
 }
 
 fn instantiate_lv2(
@@ -1924,7 +1951,7 @@ fn instantiate_lv2(
     plugin: &PluginSlot,
     sample_rate: f64,
     buffer_size: usize,
-) -> Option<(SlotPlugin, Option<StateProxy>, usize)> {
+) -> Option<(SlotPlugin, Option<SlotState>, usize)> {
     let Some(instance) = host.instantiate(
         &plugin.uri,
         sample_rate,
@@ -1934,7 +1961,7 @@ fn instantiate_lv2(
         tracing::warn!(uri = %plugin.uri, "plugin not hostable, dropped from session");
         return None;
     };
-    let proxy = instance.state_proxy();
+    let proxy = instance.state_proxy().map(SlotState::Lv2);
     let handle = instance.handle() as usize;
     let Some(mut slot_plugin) = make_slot_plugin(
         host,
@@ -1979,7 +2006,7 @@ fn build_chains(
     let mut bus_chains: Vec<Vec<SlotPlugin>> = (0..bus_count)
         .map(|_| Vec::with_capacity(MAX_PLUGINS))
         .collect();
-    let mut bus_proxies: Vec<Vec<Option<StateProxy>>> = (0..bus_count).map(|_| Vec::new()).collect();
+    let mut bus_proxies: Vec<Vec<Option<SlotState>>> = (0..bus_count).map(|_| Vec::new()).collect();
     let mut bus_handles: Vec<Vec<Option<usize>>> = (0..bus_count).map(|_| Vec::new()).collect();
     let mut bus_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>> =
         (0..bus_count).map(|_| Vec::new()).collect();

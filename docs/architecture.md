@@ -469,10 +469,11 @@ CC; a matching `MidiOut` (feedback) is deferred.
 - **Out of scope:** instruments and MIDI-only plugins (would drift toward a DAW
   / sequencer); clock generation; MIDI output/feedback (future).
 
-Designations: LV2 plugins are still the only plugin format (Phase 7 is
-unscheduled; see `docs/backlog.md`). A format-agnostic host trait would be
-required before adding CLAP (clean licensing) or VST3 (GPLv3 SDK implications);
-VST2 is not planned.
+Designations: LV2 remains the primary format. VST3 hosting (Phase 7) is in
+progress behind a format-agnostic `PluginNode` trait: discovery, add, DSP,
+parameter editing, sandboxed loading and session state all work through the
+vendored SDK (MIT since 3.8). CLAP was considered and set aside (thin
+ecosystem); VST2 is not planned. See `docs/backlog.md`.
 
 ## Editing history and clipboard
 
