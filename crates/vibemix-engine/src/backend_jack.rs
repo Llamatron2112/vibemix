@@ -3,16 +3,18 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use jack::{
-    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, NotificationHandler, Port,
+    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, MidiIn, NotificationHandler, Port,
     ProcessHandler, ProcessScope, Unowned,
 };
 use rtrb::{Consumer, Producer};
 use vibemix_core::model::{BusConnections, MixerModel, PluginSlot, StripConnections};
-use vibemix_lv2::{Host, PluginInstance, SharedOutputs, StateEntry, StateProxy};
+use vibemix_lv2::{Host, MidiEvent, PluginInstance, SharedOutputs, StateEntry, StateProxy};
 
 use crate::dsp;
+use crate::midi::{Clock, MidiBlock};
+use crate::midi_map::SharedMidi;
 use crate::params::{
-    SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
+    SharedClock, SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
 };
 
 const SMOOTHING: f32 = 0.005;
@@ -243,6 +245,12 @@ struct MixerGraph {
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
     capacity: usize,
+    midi_in: Port<MidiIn>,
+    midi: MidiBlock,
+    clock: Clock,
+    shared_clock: Arc<SharedClock>,
+    position: vibemix_lv2::TimePosition,
+    midi_map: Arc<SharedMidi>,
 }
 
 impl MixerGraph {
@@ -400,6 +408,8 @@ impl MixerGraph {
         }
 
         let frames = frames.min(PluginInstance::max_frames());
+        let position = self.position;
+        let midi_sync = self.params.midi_sync();
         let plugins = &mut self.plugin_chains[index][chain];
 
         for (slot, plugin) in plugins.iter_mut().enumerate() {
@@ -423,6 +433,10 @@ impl MixerGraph {
                         .copy_from_slice(&self.strip_scratch[0][..frames]);
                     instance.input_buffer_mut(1)[..frames]
                         .copy_from_slice(&self.strip_scratch[1][..frames]);
+                    instance.write_midi(self.midi.as_slice());
+                    if midi_sync {
+                        instance.write_position(&position);
+                    }
                     instance.run(frames);
 
                     let out_l = instance.output_buffer(0);
@@ -435,6 +449,10 @@ impl MixerGraph {
                         set_controls(instance, &self.params, index, chain, slot);
                         instance.input_buffer_mut(0)[..frames]
                             .copy_from_slice(&self.strip_scratch[channel][..frames]);
+                        instance.write_midi(self.midi.as_slice());
+                        if midi_sync {
+                            instance.write_position(&position);
+                        }
                         instance.run(frames);
                         let out = instance.output_buffer(0);
                         self.strip_scratch[channel][..frames].copy_from_slice(&out[..frames]);
@@ -451,6 +469,8 @@ impl MixerGraph {
         }
 
         let frames = frames.min(PluginInstance::max_frames());
+        let position = self.position;
+        let midi_sync = self.params.midi_sync();
         let plugins = &mut self.bus_chains[bus];
 
         for (slot, plugin) in plugins.iter_mut().enumerate() {
@@ -474,6 +494,10 @@ impl MixerGraph {
                         .copy_from_slice(&self.bus_scratch[0][..frames]);
                     instance.input_buffer_mut(1)[..frames]
                         .copy_from_slice(&self.bus_scratch[1][..frames]);
+                    instance.write_midi(self.midi.as_slice());
+                    if midi_sync {
+                        instance.write_position(&position);
+                    }
                     instance.run(frames);
 
                     let out_l = instance.output_buffer(0);
@@ -486,6 +510,10 @@ impl MixerGraph {
                         set_bus_controls(instance, &self.params, bus, slot);
                         instance.input_buffer_mut(0)[..frames]
                             .copy_from_slice(&self.bus_scratch[channel][..frames]);
+                        instance.write_midi(self.midi.as_slice());
+                        if midi_sync {
+                            instance.write_position(&position);
+                        }
                         instance.run(frames);
                         let out = instance.output_buffer(0);
                         self.bus_scratch[channel][..frames].copy_from_slice(&out[..frames]);
@@ -754,6 +782,66 @@ impl ProcessHandler for MixerGraph {
         let raw_frames = scope.n_frames() as usize;
         let frames = raw_frames.min(self.capacity);
 
+        // MIDI: collect the block's events and advance clock/transport state.
+        // `raw.time` is the frame offset within the block.
+        self.midi.clear();
+        for raw in self.midi_in.iter(scope) {
+            self.midi.push(MidiEvent::new(raw.time as i64, raw.bytes));
+        }
+
+        // Clock/transport always tracks the input so the GUI can show position.
+        self.clock.set_beats_per_bar(self.params.beats_per_bar());
+        self.clock.set_sample_rate(self.sample_rate);
+        self.clock.process_block(self.midi.as_slice(), frames);
+        self.position = self.clock.position();
+        self.shared_clock.publish(
+            self.clock.locked,
+            self.clock.playing,
+            self.clock.bpm,
+            self.clock.beats,
+            self.clock.frames_since_start,
+        );
+
+        // When MIDI sync is off, drop system realtime/transport messages so
+        // plugins don't receive clock (notes/CC are still forwarded).
+        if !self.params.midi_sync() {
+            let mut kept = 0usize;
+            for index in 0..self.midi.len() {
+                let event = self.midi.get(index);
+                let status = event.as_slice().first().copied().unwrap_or(0);
+                let transport = status >= 0xF8 || status == 0xF2 || status == 0xF3;
+                if !transport {
+                    self.midi.set(kept, event);
+                    kept += 1;
+                }
+            }
+            self.midi.truncate(kept);
+        }
+
+        // Apply control-surface CCs; consumed ones are not forwarded to plugins.
+        {
+            let midi_map = &self.midi_map;
+            let params = &self.params;
+            let mut forwarded = 0usize;
+            for index in 0..self.midi.len() {
+                let event = self.midi.get(index);
+                let bytes = event.as_slice();
+                let is_cc = bytes.len() >= 3 && (bytes[0] & 0xF0) == 0xB0;
+                let consumed = is_cc
+                    && midi_map.handle_cc(
+                        (bytes[0] & 0x0F) as u32,
+                        bytes[1] as u32,
+                        bytes[2] as u32,
+                        params,
+                    );
+                if !consumed {
+                    self.midi.set(forwarded, event);
+                    forwarded += 1;
+                }
+            }
+            self.midi.truncate(forwarded);
+        }
+
         for accumulator in &mut self.bus_accum {
             accumulator[0][..frames].fill(0.0);
             accumulator[1][..frames].fill(0.0);
@@ -803,6 +891,13 @@ pub struct JackEngine {
     garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
     pending_rate: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
+    clock: Arc<SharedClock>,
+    midi_map: Arc<SharedMidi>,
+    midi_port: Port<Unowned>,
+    /// The sample rate the graph (delay lines, plugins) was actually built
+    /// with. JACK/PipeWire may report a different rate at client creation than
+    /// the graph settles on, so track this separately from the live rate.
+    graph_sample_rate: u32,
     state_proxies: Vec<StripProxies>,
     plugin_handles: Vec<StripHandles>,
     plugin_outputs: Vec<StripOutputs>,
@@ -888,6 +983,13 @@ impl JackEngine {
             bus_returns[index] = Some(BusReturnPorts { in_l, in_r });
         }
 
+        let midi_in: Port<MidiIn> = client
+            .register_port("midi_in", MidiIn::default())
+            .context("register midi input port")?;
+        let midi_port = midi_in.clone_unowned();
+        let shared_clock = Arc::new(SharedClock::new());
+        let midi_map = Arc::new(SharedMidi::new());
+
         let (commands, command_consumer) =
             rtrb::RingBuffer::<EngineCommand>::new(COMMAND_CAPACITY);
         // Garbage queues are sized so a full command queue's worth of retired
@@ -940,6 +1042,12 @@ impl JackEngine {
                 .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
                 .collect(),
             capacity,
+            midi_in,
+            midi: MidiBlock::default(),
+            clock: Clock::new(sample_rate as f32, 4.0),
+            shared_clock: Arc::clone(&shared_clock),
+            position: vibemix_lv2::TimePosition::default(),
+            midi_map: Arc::clone(&midi_map),
         };
 
         let pending_rate = Arc::new(AtomicU32::new(0));
@@ -967,6 +1075,10 @@ impl JackEngine {
             garbage_delays,
             pending_rate,
             xruns,
+            clock: shared_clock,
+            midi_map,
+            midi_port,
+            graph_sample_rate: sample_rate as u32,
             state_proxies,
             plugin_handles,
             plugin_outputs,
@@ -1005,6 +1117,14 @@ impl JackEngine {
         self.xruns.load(Ordering::Relaxed)
     }
 
+    pub fn clock(&self) -> &Arc<SharedClock> {
+        &self.clock
+    }
+
+    pub fn midi_map(&self) -> &Arc<SharedMidi> {
+        &self.midi_map
+    }
+
     /// Swaps in delay lines sized for a new sample rate and updates the graph's
     /// rate used for delay conversion.
     pub fn set_sample_rate(
@@ -1017,7 +1137,15 @@ impl JackEngine {
                 sample_rate,
                 delays,
             })
-            .map_err(|_| anyhow!("engine command queue full"))
+            .map_err(|_| anyhow!("engine command queue full"))?;
+        self.graph_sample_rate = sample_rate as u32;
+        Ok(())
+    }
+
+    /// The sample rate the graph was built with (may lag the live JACK rate
+    /// until a rate change is processed).
+    pub fn graph_sample_rate(&self) -> u32 {
+        self.graph_sample_rate
     }
 
     pub fn add_plugin(
@@ -1555,6 +1683,8 @@ impl JackEngine {
     /// Records the external JACK ports currently feeding each strip input and
     /// each bus output into the model, so a session save can restore them.
     pub fn capture_connections(&self, model: &mut MixerModel) {
+        model.midi_connections = Some(self.midi_port.get_connections());
+
         for strip in &mut model.strips {
             let index = strip.id.0 as usize;
             let Some((in_l, in_r)) = self.strip_ports.get(index).and_then(Option::as_ref) else {
@@ -1597,6 +1727,10 @@ impl JackEngine {
     pub fn restore_connections(&self, model: &MixerModel) -> Vec<MissingConnection> {
         let client = self.active.as_client();
         let mut missing = Vec::new();
+
+        if let Some(sources) = &model.midi_connections {
+            restore_input(client, &self.midi_port, "midi_in", "midi in", sources, &mut missing);
+        }
 
         for strip in &model.strips {
             let Some(connections) = &strip.connections else {

@@ -18,6 +18,10 @@ pub struct PluginSlot {
     /// instantiate). Kept in the session, bypassed in the graph, shown red.
     #[serde(default, skip_serializing_if = "is_false")]
     pub missing: bool,
+    /// MIDI channel (0-15) this plugin's parameter/bypass bindings listen on.
+    /// `None` means any channel (omni).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_channel: Option<u8>,
 }
 
 fn is_false(value: &bool) -> bool {
@@ -34,6 +38,7 @@ impl PluginSlot {
             state: String::new(),
             bypassed: false,
             missing: false,
+            midi_channel: None,
         }
     }
 }
@@ -102,6 +107,10 @@ pub struct Strip {
     pub sends: Vec<Send>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<StripConnections>,
+    /// MIDI channel (0-15) this strip's control bindings listen on. Several
+    /// strips/buses may share a channel. `None` means any channel (omni).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_channel: Option<u8>,
 }
 
 impl Strip {
@@ -118,6 +127,7 @@ impl Strip {
             plugins_post: Vec::new(),
             sends: Vec::new(),
             connections: None,
+            midi_channel: None,
         }
     }
 }
@@ -144,6 +154,10 @@ pub struct Bus {
     pub return_gain: Gain,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub connections: Option<BusConnections>,
+    /// MIDI channel (0-15) this bus's control bindings listen on. `None` means
+    /// any channel (omni).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_channel: Option<u8>,
 }
 
 impl Bus {
@@ -159,6 +173,7 @@ impl Bus {
             send_gain: Gain::UNITY,
             return_gain: Gain::UNITY,
             connections: None,
+            midi_channel: None,
         }
     }
 }
@@ -180,6 +195,105 @@ pub struct MixerModel {
     /// load. `None` for sessions that predate it (the GUI keeps its size).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub window: Option<WindowGeometry>,
+    /// Beats per bar used for bar counting (host tempo and loop display).
+    #[serde(default = "default_beats_per_bar")]
+    pub beats_per_bar: f32,
+    /// Learned MIDI control-surface bindings.
+    #[serde(default)]
+    pub midi_bindings: Vec<MidiBinding>,
+    /// Top-bar counter/loop display preferences.
+    #[serde(default)]
+    pub transport_ui: TransportUi,
+    /// When true, follow the incoming MIDI clock and pass host tempo/transport
+    /// to plugins.
+    #[serde(default = "default_true")]
+    pub midi_sync: bool,
+    /// External JACK ports feeding the engine's MIDI input. `None` means no
+    /// patch information was saved (connections are left alone).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_connections: Option<Vec<String>>,
+}
+
+fn default_beats_per_bar() -> f32 {
+    4.0
+}
+
+/// Top-bar counter/loop display preferences, saved with the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TransportUi {
+    #[serde(default = "default_true")]
+    pub beats: bool,
+    #[serde(default)]
+    pub time: bool,
+    #[serde(default)]
+    pub loop_indicator: bool,
+    /// Loop length unit: bars when true, beats when false.
+    #[serde(default)]
+    pub loop_bars: bool,
+    #[serde(default = "default_loop_length")]
+    pub loop_length: u32,
+}
+
+fn default_true() -> bool {
+    true
+}
+
+fn default_loop_length() -> u32 {
+    8
+}
+
+impl Default for TransportUi {
+    fn default() -> Self {
+        Self {
+            beats: true,
+            time: false,
+            loop_indicator: false,
+            loop_bars: false,
+            loop_length: 8,
+        }
+    }
+}
+
+/// What a MIDI control-surface CC drives.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MidiTarget {
+    StripGain,
+    StripPan,
+    StripMute,
+    StripSolo,
+    BusGain,
+    BusMute,
+    SendGain,
+    SendDelay,
+    PluginParam,
+    PluginBypass,
+}
+
+/// A learned MIDI CC → mixer target binding, saved with the session.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct MidiBinding {
+    /// 0..15, or 16 for omni.
+    pub channel: u8,
+    pub cc: u8,
+    #[serde(default)]
+    pub relative: bool,
+    pub target: MidiTarget,
+    /// `location` for plugin targets (0 strip pre, 1 strip post, 2 bus).
+    #[serde(default)]
+    pub location: u32,
+    /// Strip id, bus id, or send destination bus id.
+    #[serde(default)]
+    pub target_id: u32,
+    #[serde(default)]
+    pub slot: u32,
+    #[serde(default)]
+    pub param: u32,
+    /// Parameter range for `PluginParam` targets.
+    #[serde(default)]
+    pub min: f32,
+    #[serde(default)]
+    pub max: f32,
 }
 
 impl MixerModel {
@@ -189,6 +303,11 @@ impl MixerModel {
             strips: Vec::new(),
             buses: Vec::new(),
             window: None,
+            beats_per_bar: 4.0,
+            midi_bindings: Vec::new(),
+            transport_ui: TransportUi::default(),
+            midi_sync: true,
+            midi_connections: None,
         }
     }
 
@@ -284,6 +403,8 @@ mod tests {
         model.buses[0].send_gain = Gain(0.5);
         model.buses[0].return_gain = Gain(0.75);
         model.strips[0].input_gain_db = 12.0;
+        model.strips[0].midi_channel = Some(3);
+        model.buses[0].midi_channel = Some(5);
         model.strips[0]
             .plugins_post
             .push(PluginSlot::new(PluginId(0), "http://example.com/post"));
@@ -315,6 +436,8 @@ mod tests {
         assert!(parsed.buses[0].return_inputs);
         assert_eq!(parsed.buses[0].send_gain, Gain(0.5));
         assert_eq!(parsed.buses[0].return_gain, Gain(0.75));
+        assert_eq!(parsed.strips[0].midi_channel, Some(3));
+        assert_eq!(parsed.buses[0].midi_channel, Some(5));
         assert_eq!(parsed.strips[0].sends[0].delay_ms, 12.5);
         assert_eq!(
             parsed.buses[0]

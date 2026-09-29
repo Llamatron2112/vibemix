@@ -8,8 +8,10 @@ use std::time::{Duration, Instant};
 use vibemix_core::config::config_dir;
 use vibemix_core::ids::{BusId, StripId};
 use vibemix_core::model::{
-    Bus, MixerModel, PluginSlot, Send, Strip, WindowGeometry, MAX_SEND_DELAY_MS,
+    Bus, MidiBinding, MidiTarget, MixerModel, PluginSlot, Send, Strip, WindowGeometry,
+    MAX_SEND_DELAY_MS,
 };
+use crate::midi_map::target_from_code;
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_lv2::{find_ui, Host, PluginInfo, SharedOutputs, UiCandidate, UiWindow};
 use vibemix_proto::ControlMessage;
@@ -91,6 +93,7 @@ pub struct Controller {
     undo_bytes: usize,
     undo_coalesce: Option<(Instant, EditKey)>,
     edit_dirty: bool,
+    pending_learn: Option<MidiBinding>,
 }
 
 struct UiWriteCtx {
@@ -214,9 +217,11 @@ impl Controller {
 
         let mut engine = engine;
         let missing_report = missing_report_json(&engine.take_missing_connections());
-        let sample_rate = engine.sample_rate();
+        // Track the rate the graph was built with, so a startup rate correction
+        // from PipeWire (e.g. 48000 -> 44100) triggers a resync in the loop.
+        let sample_rate = engine.graph_sample_rate();
 
-        Ok(Self {
+        let mut controller = Self {
             socket,
             params,
             meters,
@@ -241,7 +246,10 @@ impl Controller {
             undo_bytes: 0,
             undo_coalesce: None,
             edit_dirty: false,
-        })
+            pending_learn: None,
+        };
+        controller.rebuild_shared_bindings();
+        Ok(controller)
     }
 
     pub fn run(&mut self) {
@@ -268,6 +276,36 @@ impl Controller {
 
             self.engine.drain_garbage();
             self.pump_uis();
+
+            if let Some(learned) = self.engine.midi_map().take_learned() {
+                if let Some(mut binding) = self.pending_learn.take() {
+                    binding.channel = self
+                        .target_channel(
+                            binding.target,
+                            binding.location,
+                            binding.target_id,
+                            binding.slot,
+                        )
+                        .unwrap_or(crate::midi_map::OMNI as u8);
+                    binding.cc = learned.cc;
+                    let target = binding.target;
+                    let location = binding.location;
+                    let target_id = binding.target_id;
+                    let slot = binding.slot;
+                    let param = binding.param;
+                    self.model.midi_bindings.retain(|existing| {
+                        !binding_targets(existing, target, location, target_id, slot, param)
+                    });
+                    self.model.midi_bindings.push(binding);
+                    self.rebuild_shared_bindings();
+                    actions.snapshot = true;
+                    tracing::info!(
+                        channel = learned.channel,
+                        cc = learned.cc,
+                        "learned MIDI control-surface binding"
+                    );
+                }
+            }
 
             if let Some(rate) = self.engine.take_pending_sample_rate() {
                 if rate != self.sample_rate {
@@ -317,6 +355,22 @@ impl Controller {
                 buses_ret_r: levels.buses_ret_r,
                 buses_l: levels.buses_l,
                 buses_r: levels.buses_r,
+            };
+            if let Ok(bytes) = message.encode() {
+                let _ = self.socket.send_to(&bytes, address);
+            }
+
+            let clock = self
+                .engine
+                .clock()
+                .snapshot(self.engine.sample_rate() as f32);
+            let message = ControlMessage::Clock {
+                locked: clock.locked,
+                playing: clock.playing,
+                bpm: clock.bpm,
+                beats: clock.beats as f32,
+                seconds: clock.seconds as f32,
+                beats_per_bar: self.params.beats_per_bar(),
             };
             if let Ok(bytes) = message.encode() {
                 let _ = self.socket.send_to(&bytes, address);
@@ -831,6 +885,7 @@ impl Controller {
                         self.uis.clear();
                         self.model = model;
                         self.engine.sync_port_names(&self.model);
+                        self.rebuild_shared_bindings();
                         self.clear_history();
                         self.pending_session = Some((true, String::new(), String::new()));
                         Actions {
@@ -867,6 +922,7 @@ impl Controller {
                             self.uis.clear();
                             self.model = loaded;
                             self.engine.sync_port_names(&self.model);
+                            self.rebuild_shared_bindings();
                             self.missing_report = missing_report_json(
                                 &self.engine.restore_connections(&self.model),
                             );
@@ -890,6 +946,176 @@ impl Controller {
                     Actions::default()
                 }
             },
+            ControlMessage::SetBeatsPerBar { value } => {
+                let value = value.clamp(1.0, 16.0);
+                self.params.set_beats_per_bar(value);
+                self.model.beats_per_bar = value;
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetTransportUi { json } => {
+                if let Ok(ui) = serde_json::from_str::<vibemix_core::model::TransportUi>(&json) {
+                    self.model.transport_ui = ui;
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::MidiLearn {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+                min,
+                max,
+            } => {
+                let target_kind = target_from_code(kind);
+                let expected = self.target_channel(target_kind, location, target, slot);
+                self.pending_learn = Some(MidiBinding {
+                    channel: expected.unwrap_or(crate::midi_map::OMNI as u8),
+                    cc: 0,
+                    relative: false,
+                    target: target_kind,
+                    location,
+                    target_id: target,
+                    slot,
+                    param,
+                    min,
+                    max,
+                });
+                self.engine.midi_map().start_learn(expected);
+                Actions::default()
+            }
+            ControlMessage::MidiLearnCancel => {
+                self.engine.midi_map().cancel_learn();
+                self.pending_learn = None;
+                Actions::default()
+            }
+            ControlMessage::MidiBindingsClear => {
+                self.model.midi_bindings.clear();
+                self.rebuild_shared_bindings();
+                self.pending_learn = None;
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetMidiSync { on } => {
+                self.params.set_midi_sync(on);
+                self.model.midi_sync = on;
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetStripMidiChannel { strip, channel } => {
+                if let Some(entry) = self.model.strip_mut(StripId(strip)) {
+                    entry.midi_channel = midi_channel_value(channel);
+                }
+                self.rebuild_shared_bindings();
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetBusMidiChannel { bus, channel } => {
+                if let Some(entry) = self.model.bus_mut(BusId(bus)) {
+                    entry.midi_channel = midi_channel_value(channel);
+                }
+                self.rebuild_shared_bindings();
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetPluginMidiChannel {
+                location,
+                target,
+                slot,
+                channel,
+            } => {
+                let value = midi_channel_value(channel);
+                if location <= 1 {
+                    if let Some(strip) = self.model.strip_mut(StripId(target)) {
+                        if let Some(plugin) =
+                            strip_plugin_list_mut(strip, location as usize).get_mut(slot as usize)
+                        {
+                            plugin.midi_channel = value;
+                        }
+                    }
+                } else if let Some(plugin) = self
+                    .model
+                    .bus_mut(BusId(target))
+                    .and_then(|bus| bus.plugins.get_mut(slot as usize))
+                {
+                    plugin.midi_channel = value;
+                }
+                self.rebuild_shared_bindings();
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::MidiBind {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+                min,
+                max,
+                channel: _,
+                cc,
+            } => {
+                let target_kind = target_from_code(kind);
+                // The channel is always owned by the strip/bus/plugin, never
+                // chosen per binding.
+                let channel = self
+                    .target_channel(target_kind, location, target, slot)
+                    .unwrap_or(crate::midi_map::OMNI as u8);
+                self.model.midi_bindings.retain(|binding| {
+                    !binding_targets(binding, target_kind, location, target, slot, param)
+                });
+                self.model.midi_bindings.push(MidiBinding {
+                    channel,
+                    cc: cc.min(127) as u8,
+                    relative: false,
+                    target: target_kind,
+                    location,
+                    target_id: target,
+                    slot,
+                    param,
+                    min,
+                    max,
+                });
+                self.rebuild_shared_bindings();
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::MidiUnbind {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+            } => {
+                let target_kind = target_from_code(kind);
+                self.model.midi_bindings.retain(|binding| {
+                    !binding_targets(binding, target_kind, location, target, slot, param)
+                });
+                self.rebuild_shared_bindings();
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::Clock { .. } => Actions::default(),
             ControlMessage::Meters { .. } => Actions::default(),
         }
     }
@@ -1673,6 +1899,7 @@ impl Controller {
         self.model = snapshot;
         self.model.window = window;
         self.model.normalize_buses();
+        self.rebuild_shared_bindings();
 
         apply_model(&self.params, &self.model);
 
@@ -1735,6 +1962,59 @@ impl Controller {
         self.undo_bytes = 0;
         self.undo_coalesce = None;
         self.edit_dirty = true;
+    }
+
+    /// The MIDI channel a target listens on: the owning strip/bus channel for
+    /// mixer targets, or the owning plugin's channel for plugin targets.
+    /// `None` means any channel (omni).
+    fn target_channel(
+        &self,
+        target: MidiTarget,
+        location: u32,
+        target_id: u32,
+        slot: u32,
+    ) -> Option<u8> {
+        match target {
+            MidiTarget::StripGain
+            | MidiTarget::StripPan
+            | MidiTarget::StripMute
+            | MidiTarget::StripSolo
+            | MidiTarget::SendGain
+            | MidiTarget::SendDelay => self
+                .model
+                .strip(StripId(target_id))
+                .and_then(|strip| strip.midi_channel),
+            MidiTarget::BusGain | MidiTarget::BusMute => {
+                self.model.bus(BusId(target_id)).and_then(|bus| bus.midi_channel)
+            }
+            MidiTarget::PluginParam | MidiTarget::PluginBypass => {
+                if location <= 1 {
+                    let strip = self.model.strip(StripId(target_id))?;
+                    strip_plugin_list(strip, location as usize)
+                        .get(slot as usize)?
+                        .midi_channel
+                } else {
+                    self.model.bus(BusId(target_id))?.plugins.get(slot as usize)?.midi_channel
+                }
+            }
+        }
+    }
+
+    /// Pushes the effective bindings to the audio-thread table, assigning each
+    /// binding the channel of its owning strip/bus/plugin (`OMNI` when unset).
+    fn rebuild_shared_bindings(&mut self) {
+        let mut effective = self.model.midi_bindings.clone();
+        for binding in &mut effective {
+            binding.channel = self
+                .target_channel(
+                    binding.target,
+                    binding.location,
+                    binding.target_id,
+                    binding.slot,
+                )
+                .unwrap_or(crate::midi_map::OMNI as u8);
+        }
+        self.engine.midi_map().set_bindings(&effective);
     }
 
     fn remove_plugin(&mut self, location: u32, target: u32, slot: u32) -> bool {
@@ -1997,8 +2277,35 @@ fn edit_label(message: &ControlMessage) -> Option<(&'static str, Option<EditKey>
         SetPluginBypass { .. } => ("Toggle plugin bypass", None),
         CutPlugin { .. } => ("Cut plugin", None),
         PastePlugin { .. } => ("Paste plugin", None),
+        SetBeatsPerBar { .. } => ("Set beats per bar", None),
         _ => return None,
     })
+}
+
+/// Whether `binding` drives the given mixer target.
+fn binding_targets(
+    binding: &MidiBinding,
+    kind: MidiTarget,
+    location: u32,
+    target_id: u32,
+    slot: u32,
+    param: u32,
+) -> bool {
+    binding.target == kind
+        && binding.location == location
+        && binding.target_id == target_id
+        && binding.slot == slot
+        && binding.param == param
+}
+
+/// Converts a raw control-protocol channel (`0..15`, or `>= OMNI` for "any")
+/// into the model's optional channel.
+fn midi_channel_value(channel: u32) -> Option<u8> {
+    if channel >= crate::midi_map::OMNI {
+        None
+    } else {
+        Some(channel.min(15) as u8)
+    }
 }
 
 /// Whether two models have the same engine-visible structure (ignoring order,
@@ -2111,7 +2418,16 @@ fn sanitize_name(name: String) -> Option<String> {
 fn build_catalog(plugins: &[PluginInfo]) -> String {
     let list: Vec<serde_json::Value> = plugins
         .iter()
-        .map(|info| serde_json::json!({ "uri": info.uri, "name": info.name, "has_ui": info.has_ui }))
+        .map(|info| {
+            serde_json::json!({
+                "uri": info.uri,
+                "name": info.name,
+                "has_ui": info.has_ui,
+                "inputs": info.audio_inputs.len(),
+                "outputs": info.audio_outputs.len(),
+                "midi": !info.midi_inputs.is_empty(),
+            })
+        })
         .collect();
     serde_json::Value::Array(list).to_string()
 }
@@ -2228,6 +2544,7 @@ fn plugin_list_json<F: Fn(usize, usize) -> f32>(
                 "bypassed": plugin.bypassed,
                 "missing": plugin.missing,
                 "has_ui": has_ui,
+                "midi_channel": plugin.midi_channel,
                 "controls": control_list,
             })
         })
@@ -2252,19 +2569,20 @@ fn build_state_json(
                 .map(|send| {
                     serde_json::json!({
                         "bus": send.bus.0,
-                        "gain": send.gain.0,
-                        "delay_ms": send.delay_ms,
+                        "gain": params.send_gain(strip_index, send.bus.0 as usize),
+                        "delay_ms": params.send_delay(strip_index, send.bus.0 as usize),
                     })
                 })
                 .collect();
             serde_json::json!({
                 "id": strip.id.0,
                 "name": strip.name,
-                "gain": strip.gain.0,
-                "pan": strip.pan.0,
+                "midi_channel": strip.midi_channel,
+                "gain": params.strip_gain(strip_index),
+                "pan": params.strip_pan(strip_index),
                 "input_gain_db": strip.input_gain_db,
-                "mute": strip.mute,
-                "solo": strip.solo,
+                "mute": params.strip_mute(strip_index),
+                "solo": params.strip_solo(strip_index),
                 "plugins": plugin_list_json(&strip.plugins, plugins, |slot, param| {
                     params.plugin_param(strip_index, 0, slot, param)
                 }),
@@ -2284,12 +2602,13 @@ fn build_state_json(
             serde_json::json!({
                 "id": bus.id.0,
                 "name": bus.name,
-                "gain": bus.gain.0,
-                "mute": bus.mute,
+                "midi_channel": bus.midi_channel,
+                "gain": params.bus_gain(bus_index),
+                "mute": params.bus_mute(bus_index),
                 "mix_to_master": bus.mix_to_master,
                 "return_inputs": bus.return_inputs,
-                "send_gain": bus.send_gain.0,
-                "return_gain": bus.return_gain.0,
+                "send_gain": params.bus_send_gain(bus_index),
+                "return_gain": params.bus_return_gain(bus_index),
                 "plugins": plugin_list_json(&bus.plugins, plugins, |slot, param| {
                     params.bus_plugin_param(bus_index, slot, param)
                 }),
@@ -2312,6 +2631,10 @@ fn build_state_json(
         "window": window,
         "sample_rate": sample_rate,
         "xruns": xruns,
+        "beats_per_bar": model.beats_per_bar,
+        "midi_bindings": model.midi_bindings,
+        "transport_ui": model.transport_ui,
+        "midi_sync": model.midi_sync,
     })
     .to_string()
 }
@@ -2325,6 +2648,8 @@ fn free_bus_slot(params: &SharedParams) -> Option<usize> {
 }
 
 pub fn apply_model(params: &SharedParams, model: &MixerModel) {
+    params.set_beats_per_bar(model.beats_per_bar);
+    params.set_midi_sync(model.midi_sync);
     for index in 0..params.strip_count() {
         params.set_strip_active(index, false);
     }

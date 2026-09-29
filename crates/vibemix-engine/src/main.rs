@@ -1,6 +1,8 @@
 mod backend_jack;
 mod control;
 mod dsp;
+mod midi;
+mod midi_map;
 mod params;
 mod rt_guard;
 

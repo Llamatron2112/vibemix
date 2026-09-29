@@ -180,6 +180,66 @@ pub enum ControlMessage {
         undo_label: String,
         redo_label: String,
     },
+    Clock {
+        locked: bool,
+        playing: bool,
+        bpm: f32,
+        beats: f32,
+        seconds: f32,
+        beats_per_bar: f32,
+    },
+    SetBeatsPerBar {
+        value: f32,
+    },
+    SetTransportUi {
+        json: String,
+    },
+    MidiLearn {
+        kind: u32,
+        location: u32,
+        target: u32,
+        slot: u32,
+        param: u32,
+        min: f32,
+        max: f32,
+    },
+    MidiLearnCancel,
+    MidiBindingsClear,
+    SetMidiSync {
+        on: bool,
+    },
+    SetStripMidiChannel {
+        strip: u32,
+        channel: u32,
+    },
+    SetBusMidiChannel {
+        bus: u32,
+        channel: u32,
+    },
+    SetPluginMidiChannel {
+        location: u32,
+        target: u32,
+        slot: u32,
+        channel: u32,
+    },
+    MidiBind {
+        kind: u32,
+        location: u32,
+        target: u32,
+        slot: u32,
+        param: u32,
+        min: f32,
+        max: f32,
+        channel: u32,
+        cc: u32,
+    },
+    MidiUnbind {
+        kind: u32,
+        location: u32,
+        target: u32,
+        slot: u32,
+        param: u32,
+    },
     MissingConnections {
         json: String,
     },
@@ -505,6 +565,129 @@ impl ControlMessage {
                     OscType::String(redo_label.clone()),
                 ],
             },
+            Clock {
+                locked,
+                playing,
+                bpm,
+                beats,
+                seconds,
+                beats_per_bar,
+            } => OscMessage {
+                addr: addr::CLOCK.to_string(),
+                args: vec![
+                    OscType::Int(*locked as i32),
+                    OscType::Int(*playing as i32),
+                    OscType::Float(*bpm),
+                    OscType::Float(*beats),
+                    OscType::Float(*seconds),
+                    OscType::Float(*beats_per_bar),
+                ],
+            },
+            SetBeatsPerBar { value } => OscMessage {
+                addr: addr::CLOCK_BEATS_PER_BAR.to_string(),
+                args: vec![OscType::Float(*value)],
+            },
+            SetTransportUi { json } => OscMessage {
+                addr: addr::TRANSPORT_UI.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
+            MidiLearn {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+                min,
+                max,
+            } => OscMessage {
+                addr: addr::MIDI_LEARN.to_string(),
+                args: vec![
+                    OscType::Int(*kind as i32),
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*param as i32),
+                    OscType::Float(*min),
+                    OscType::Float(*max),
+                ],
+            },
+            MidiLearnCancel => OscMessage {
+                addr: addr::MIDI_LEARN_CANCEL.to_string(),
+                args: Vec::new(),
+            },
+            MidiBindingsClear => OscMessage {
+                addr: addr::MIDI_BINDINGS_CLEAR.to_string(),
+                args: Vec::new(),
+            },
+            SetMidiSync { on } => OscMessage {
+                addr: addr::MIDI_SYNC.to_string(),
+                args: vec![OscType::Int(*on as i32)],
+            },
+            SetStripMidiChannel { strip, channel } => OscMessage {
+                addr: addr::STRIP_MIDI_CHANNEL.to_string(),
+                args: vec![
+                    OscType::Int(*strip as i32),
+                    OscType::Int(*channel as i32),
+                ],
+            },
+            SetBusMidiChannel { bus, channel } => OscMessage {
+                addr: addr::BUS_MIDI_CHANNEL.to_string(),
+                args: vec![OscType::Int(*bus as i32), OscType::Int(*channel as i32)],
+            },
+            SetPluginMidiChannel {
+                location,
+                target,
+                slot,
+                channel,
+            } => OscMessage {
+                addr: addr::PLUGIN_MIDI_CHANNEL.to_string(),
+                args: vec![
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*channel as i32),
+                ],
+            },
+            MidiBind {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+                min,
+                max,
+                channel,
+                cc,
+            } => OscMessage {
+                addr: addr::MIDI_BIND.to_string(),
+                args: vec![
+                    OscType::Int(*kind as i32),
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*param as i32),
+                    OscType::Float(*min),
+                    OscType::Float(*max),
+                    OscType::Int(*channel as i32),
+                    OscType::Int(*cc as i32),
+                ],
+            },
+            MidiUnbind {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+            } => OscMessage {
+                addr: addr::MIDI_UNBIND.to_string(),
+                args: vec![
+                    OscType::Int(*kind as i32),
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*param as i32),
+                ],
+            },
             MissingConnections { json } => OscMessage {
                 addr: addr::CONNECTIONS_MISSING.to_string(),
                 args: vec![OscType::String(json.clone())],
@@ -744,6 +927,66 @@ impl ControlMessage {
                 undo_label: string(args, 2)?,
                 redo_label: string(args, 3)?,
             }),
+            addr::CLOCK => Some(ControlMessage::Clock {
+                locked: int(args, 0)? != 0,
+                playing: int(args, 1)? != 0,
+                bpm: float(args, 2)?,
+                beats: float(args, 3)?,
+                seconds: float(args, 4)?,
+                beats_per_bar: float(args, 5)?,
+            }),
+            addr::CLOCK_BEATS_PER_BAR => Some(ControlMessage::SetBeatsPerBar {
+                value: float(args, 0)?,
+            }),
+            addr::TRANSPORT_UI => Some(ControlMessage::SetTransportUi {
+                json: string(args, 0)?,
+            }),
+            addr::MIDI_LEARN => Some(ControlMessage::MidiLearn {
+                kind: int(args, 0)? as u32,
+                location: int(args, 1)? as u32,
+                target: int(args, 2)? as u32,
+                slot: int(args, 3)? as u32,
+                param: int(args, 4)? as u32,
+                min: float(args, 5)?,
+                max: float(args, 6)?,
+            }),
+            addr::MIDI_LEARN_CANCEL => Some(ControlMessage::MidiLearnCancel),
+            addr::MIDI_BINDINGS_CLEAR => Some(ControlMessage::MidiBindingsClear),
+            addr::MIDI_SYNC => Some(ControlMessage::SetMidiSync {
+                on: int(args, 0)? != 0,
+            }),
+            addr::STRIP_MIDI_CHANNEL => Some(ControlMessage::SetStripMidiChannel {
+                strip: int(args, 0)? as u32,
+                channel: int(args, 1)? as u32,
+            }),
+            addr::BUS_MIDI_CHANNEL => Some(ControlMessage::SetBusMidiChannel {
+                bus: int(args, 0)? as u32,
+                channel: int(args, 1)? as u32,
+            }),
+            addr::PLUGIN_MIDI_CHANNEL => Some(ControlMessage::SetPluginMidiChannel {
+                location: int(args, 0)? as u32,
+                target: int(args, 1)? as u32,
+                slot: int(args, 2)? as u32,
+                channel: int(args, 3)? as u32,
+            }),
+            addr::MIDI_BIND => Some(ControlMessage::MidiBind {
+                kind: int(args, 0)? as u32,
+                location: int(args, 1)? as u32,
+                target: int(args, 2)? as u32,
+                slot: int(args, 3)? as u32,
+                param: int(args, 4)? as u32,
+                min: float(args, 5)?,
+                max: float(args, 6)?,
+                channel: int(args, 7)? as u32,
+                cc: int(args, 8)? as u32,
+            }),
+            addr::MIDI_UNBIND => Some(ControlMessage::MidiUnbind {
+                kind: int(args, 0)? as u32,
+                location: int(args, 1)? as u32,
+                target: int(args, 2)? as u32,
+                slot: int(args, 3)? as u32,
+                param: int(args, 4)? as u32,
+            }),
             addr::CONNECTIONS_MISSING => Some(ControlMessage::MissingConnections {
                 json: string(args, 0)?,
             }),
@@ -865,6 +1108,20 @@ mod tests {
         });
         roundtrip(ControlMessage::SetBusGain { bus: 0, gain: 1.5 });
         roundtrip(ControlMessage::SetBusMute { bus: 1, mute: true });
+        roundtrip(ControlMessage::SetStripMidiChannel {
+            strip: 4,
+            channel: 2,
+        });
+        roundtrip(ControlMessage::SetBusMidiChannel {
+            bus: 1,
+            channel: 9,
+        });
+        roundtrip(ControlMessage::SetPluginMidiChannel {
+            location: 0,
+            target: 2,
+            slot: 1,
+            channel: 5,
+        });
         roundtrip(ControlMessage::SetStripName {
             strip: 2,
             name: "drums".to_string(),

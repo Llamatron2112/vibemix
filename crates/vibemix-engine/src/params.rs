@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 
 use vibemix_core::params::{clamp_trim_db, db_to_linear};
 
@@ -30,6 +30,8 @@ pub struct SharedParams {
     bus_plugin_bypass: Vec<Vec<AtomicBool>>,
     state_pause: AtomicBool,
     state_ack: AtomicBool,
+    beats_per_bar: AtomicU32,
+    midi_sync: AtomicBool,
 }
 
 impl SharedParams {
@@ -76,6 +78,26 @@ impl SharedParams {
                 .collect(),
             state_pause: AtomicBool::new(false),
             state_ack: AtomicBool::new(false),
+            beats_per_bar: AtomicU32::new(4.0f32.to_bits()),
+            midi_sync: AtomicBool::new(true),
+        }
+    }
+
+    pub fn midi_sync(&self) -> bool {
+        self.midi_sync.load(Ordering::Relaxed)
+    }
+
+    pub fn set_midi_sync(&self, value: bool) {
+        self.midi_sync.store(value, Ordering::Relaxed);
+    }
+
+    pub fn beats_per_bar(&self) -> f32 {
+        f32::from_bits(self.beats_per_bar.load(Ordering::Relaxed))
+    }
+
+    pub fn set_beats_per_bar(&self, value: f32) {
+        if value > 0.0 {
+            self.beats_per_bar.store(value.to_bits(), Ordering::Relaxed);
         }
     }
 
@@ -671,5 +693,65 @@ mod tests {
         assert!(params.bus_return(1));
         assert_eq!(params.bus_send_gain(1), 0.5);
         assert_eq!(params.bus_send_gain(0), 1.0);
+    }
+}
+
+/// Transport state derived from the incoming MIDI clock and published to the
+/// control thread (and thus the GUI).
+pub struct SharedClock {
+    locked: AtomicBool,
+    playing: AtomicBool,
+    bpm: AtomicU32,
+    beats: AtomicU64,
+    frames: AtomicU64,
+}
+
+#[derive(Clone, Copy, Default)]
+pub struct ClockSnapshot {
+    pub locked: bool,
+    pub playing: bool,
+    pub bpm: f32,
+    pub beats: f64,
+    pub seconds: f64,
+}
+
+impl SharedClock {
+    pub fn new() -> Self {
+        Self {
+            locked: AtomicBool::new(false),
+            playing: AtomicBool::new(false),
+            bpm: AtomicU32::new(120.0f32.to_bits()),
+            beats: AtomicU64::new(0f64.to_bits()),
+            frames: AtomicU64::new(0),
+        }
+    }
+
+    pub fn publish(&self, locked: bool, playing: bool, bpm: f32, beats: f64, frames: u64) {
+        self.locked.store(locked, Ordering::Relaxed);
+        self.playing.store(playing, Ordering::Relaxed);
+        self.bpm.store(bpm.to_bits(), Ordering::Relaxed);
+        self.beats.store(beats.to_bits(), Ordering::Relaxed);
+        self.frames.store(frames, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self, sample_rate: f32) -> ClockSnapshot {
+        let frames = self.frames.load(Ordering::Relaxed);
+        ClockSnapshot {
+            locked: self.locked.load(Ordering::Relaxed),
+            playing: self.playing.load(Ordering::Relaxed),
+            bpm: f32::from_bits(self.bpm.load(Ordering::Relaxed)),
+            beats: f64::from_bits(self.beats.load(Ordering::Relaxed)),
+            seconds: if sample_rate > 0.0 {
+                frames as f64 / sample_rate as f64
+            } else {
+                0.0
+            },
+        }
+    }
+}
+
+impl Default for SharedClock {
+    fn default() -> Self {
+        Self::new()
     }
 }
