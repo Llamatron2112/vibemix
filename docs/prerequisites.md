@@ -79,8 +79,12 @@ Environment variables:
 
 - `VIBEMIX_OSC_PORT` — control port for the engine and GUI (default `9000`).
 - `VIBEMIX_CONFIG_DIR` — config directory (default `$XDG_CONFIG_HOME/vibemix`,
-  i.e. `~/.config/vibemix`); holds `recent.json`, `catalog.json` and `sessions/`.
-- `VIBEMIX_LV2_BLACKLIST` — comma-separated plugin URIs to refuse to load.
+  i.e. `~/.config/vibemix`); holds `recent.json`, `catalog.json`,
+  `plugin_health.json` and `sessions/`.
+- `VIBEMIX_LV2_BLACKLIST` — optional, comma-separated plugin URIs to keep out of
+  the catalog entirely (operator escape hatch; there is no built-in list).
+- `VIBEMIX_DEBUG=1` (or `vibemix-engine --debug`) — verbose plugin diagnostics:
+  log the smoke child's crash signal and keep its stderr.
 - `VIBEMIX_GTK` — force the GTK major version used to host plugin UIs:
   `gtk2`, `gtk3`, or unset/`auto` (pick the version that has hostable UIs). GTK2
   and GTK3 cannot coexist in one process, so only one is ever used.

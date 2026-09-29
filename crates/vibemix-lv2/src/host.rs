@@ -2,8 +2,9 @@ use std::os::raw::c_char;
 use std::ptr;
 
 use libc::c_void;
-use lilv::instance::ActiveInstance;
+use lilv::instance::{ActiveInstance, Instance};
 use lilv::World;
+use lv2_raw::core::LV2Descriptor;
 use lv2_raw::LV2Feature;
 
 use crate::atom::{AtomUrids, MidiEvent, SequenceWriter, TimePosition};
@@ -58,16 +59,21 @@ const OUTPUT_PORT: &str = "http://lv2plug.in/ns/lv2core#OutputPort";
 const ATOM_PORT: &str = "http://lv2plug.in/ns/ext/atom#AtomPort";
 const ATOM_SEQUENCE: &str = "http://lv2plug.in/ns/ext/atom#Sequence";
 const ATOM_BUFFER_BYTES: usize = 8192;
+/// Capacity (in bytes) advertised for output `atom:Sequence` ports. Must be
+/// written to `atom.size` before every `run()`: plugins leave it at the used
+/// size after writing, and atom-output plugins (e.g. meters.lv2) read it back
+/// as the buffer capacity on the next block.
+const OUTPUT_SEQUENCE_CAPACITY: u32 = (ATOM_BUFFER_BYTES - crate::atom::SEQUENCE_BODY) as u32;
 const LV2_TOGGLED: &str = "http://lv2plug.in/ns/lv2core#toggled";
 const LV2_INTEGER: &str = "http://lv2plug.in/ns/lv2core#integer";
 const LV2_PORT_PROPERTY: &str = "http://lv2plug.in/ns/lv2core#portProperty";
 const LV2_SCALE_POINT: &str = "http://lv2plug.in/ns/lv2core#scalePoint";
 const RDF_VALUE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#value";
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
-const BLACKLIST: &[&str] = &[
-    "http://calf.sourceforge.net/plugins/ReverseDelay",
-    "http://gareus.org/oss/lv2/meters#EBUr128",
-];
+/// Optional operator escape hatch: comma-separated URIs to keep out of the
+/// catalog entirely. There is no built-in list; crashing plugins are surfaced
+/// with a red name instead (see the plugin health sweep).
+const BLACKLIST: &[&str] = &[];
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct ControlPort {
@@ -489,7 +495,7 @@ impl Host {
         let mut keep_worker = false;
         if let Some(worker_ref) = worker.as_mut() {
             if let Some(interface) =
-                unsafe { instance.extension_data::<WorkerInterface>(WORKER_INTERFACE_URI) }
+                unsafe { instance_extension_data::<WorkerInterface>(&instance, WORKER_INTERFACE_URI) }
             {
                 worker_ref.attach(interface.as_ptr(), instance.handle());
                 keep_worker = true;
@@ -499,7 +505,7 @@ impl Host {
             worker = None;
         }
 
-        let state = unsafe { instance.extension_data::<StateInterface>(STATE_INTERFACE_URI) }
+        let state = unsafe { instance_extension_data::<StateInterface>(&instance, STATE_INTERFACE_URI) }
             .map(|interface| StateProxy::new(interface.as_ptr(), instance.handle()));
 
         let mut input_buffers: Vec<Box<[f32]>> = (0..audio_inputs.len())
@@ -521,10 +527,7 @@ impl Host {
             ));
         }
         for _ in &atom_outputs {
-            atom_buffers.push(sequence_buffer(
-                sequence_urid,
-                (ATOM_BUFFER_BYTES - crate::atom::SEQUENCE_BODY) as u32,
-            ));
+            atom_buffers.push(sequence_buffer(sequence_urid, OUTPUT_SEQUENCE_CAPACITY));
         }
 
         for (buffer, index) in input_buffers.iter_mut().zip(&audio_inputs) {
@@ -628,6 +631,33 @@ fn is_blacklisted(uri: &str) -> bool {
     std::env::var("VIBEMIX_LV2_BLACKLIST")
         .map(|value| value.split(',').any(|entry| entry.trim() == uri))
         .unwrap_or(false)
+}
+
+/// Reads the (optional) `LV2_Descriptor::extension_data` callback and calls it
+/// only when present. `lv2_raw` types the field as a non-optional function
+/// pointer, but the LV2 spec allows it to be NULL; the `lilv` crate's
+/// `Instance::extension_data` calls it unconditionally and jumps to 0x0 for
+/// plugins that ship no extensions (e.g. EQ10Q).
+unsafe fn descriptor_extension_data<T>(
+    descriptor: *const LV2Descriptor,
+    uri: &str,
+) -> Option<std::ptr::NonNull<T>> {
+    let slot = std::ptr::addr_of!((*descriptor).extension_data) as *const *const c_void;
+    if (*slot).is_null() {
+        return None;
+    }
+    // SAFETY: checked non-null above; `LV2_Descriptor::extension_data` has this
+    // exact signature and is shared by the plugin descriptor.
+    let function: extern "C" fn(*const u8) -> *const c_void = std::mem::transmute(*slot);
+    let uri = std::ffi::CString::new(uri).ok()?;
+    std::ptr::NonNull::new(function(uri.as_ptr().cast()) as *mut T)
+}
+
+unsafe fn instance_extension_data<T>(
+    instance: &Instance,
+    uri: &str,
+) -> Option<std::ptr::NonNull<T>> {
+    descriptor_extension_data(instance.descriptor()?, uri)
 }
 
 pub struct PluginInstance {
@@ -785,6 +815,14 @@ impl PluginInstance {
 
     pub fn run(&mut self, frames: usize) {
         let frames = frames.min(MAX_FRAMES);
+        // Re-arm output atom sequences: the plugin leaves `atom.size` at the
+        // number of bytes it wrote, but LV2 requires the host to restore the
+        // buffer capacity before each run.
+        for buffer in self.atom_buffers.iter_mut().skip(self.atom_inputs.len()) {
+            let words = buffer.as_mut_ptr() as *mut u32;
+            // SAFETY: every output atom buffer starts with an `LV2_Atom` header.
+            unsafe { *words = OUTPUT_SEQUENCE_CAPACITY };
+        }
         unsafe { self.active.run(frames) };
         self.publish_outputs();
     }
@@ -832,5 +870,39 @@ impl PluginInstance {
         if let Some(state) = &self.state {
             state.restore(entries);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    extern "C" fn present_extension(_uri: *const u8) -> *const c_void {
+        0x1234usize as *const c_void
+    }
+
+    #[test]
+    fn null_extension_data_is_not_called() {
+        // A zeroed descriptor is exactly what a plugin with no extensions looks
+        // like: `extension_data` is NULL.
+        let descriptor = std::mem::MaybeUninit::<LV2Descriptor>::zeroed();
+        let data = unsafe {
+            descriptor_extension_data::<u8>(descriptor.as_ptr(), "http://example.com/x")
+        };
+        assert!(data.is_none());
+    }
+
+    #[test]
+    fn present_extension_data_is_called() {
+        let mut descriptor = std::mem::MaybeUninit::<LV2Descriptor>::zeroed();
+        let slot = unsafe {
+            std::ptr::addr_of_mut!((*descriptor.as_mut_ptr()).extension_data)
+                .cast::<*const c_void>()
+        };
+        unsafe { slot.write(present_extension as *const c_void) };
+        let data = unsafe {
+            descriptor_extension_data::<u8>(descriptor.as_ptr(), "http://example.com/x")
+        };
+        assert_eq!(data.map(|ptr| ptr.as_ptr() as usize), Some(0x1234));
     }
 }

@@ -48,6 +48,10 @@ static LAST_METERS_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_CLOCK: Mutex<Option<ClockState>> = Mutex::new(None);
 static LAST_SESSION_PATH: Mutex<String> = Mutex::new(String::new());
 static LAST_RECENT: Mutex<String> = Mutex::new(String::new());
+/// Whether the engine has sent its plugin catalog yet.
+static CATALOG_READY: AtomicBool = AtomicBool::new(false);
+/// Plugin health sweep progress: `(running, done, total)`.
+static SCAN: Mutex<(bool, u32, u32)> = Mutex::new((false, 0, 0));
 
 struct View {
     structure_json: String,
@@ -262,7 +266,17 @@ fn receive_loop(socket: UdpSocket) {
                     guard.catalog_json = json;
                     guard.connected = true;
                     drop(guard);
+                    CATALOG_READY.store(true, Ordering::Release);
                     CATALOG_REV.fetch_add(1, Ordering::Release);
+                }
+                Some(ControlMessage::PluginScan {
+                    running,
+                    done,
+                    total,
+                }) => {
+                    if let Ok(mut guard) = SCAN.lock() {
+                        *guard = (running, done, total);
+                    }
                 }
                 Some(ControlMessage::MissingConnections { json }) => {
                     if let Ok(mut guard) = PENDING_REPORT.lock() {
@@ -669,6 +683,10 @@ pub mod qobject {
         #[qproperty(QString, undo_label)]
         #[qproperty(QString, redo_label)]
         #[qproperty(QString, clock)]
+        #[qproperty(bool, catalog_ready)]
+        #[qproperty(bool, scan_running)]
+        #[qproperty(i32, scan_done)]
+        #[qproperty(i32, scan_total)]
         #[namespace = "vibemix"]
         type Backend = super::BackendRust;
 
@@ -683,6 +701,14 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "rescanPlugins"]
         fn rescan_plugins(&self);
+
+        #[qinvokable]
+        #[cxx_name = "retestPlugins"]
+        fn retest_plugins(&self);
+
+        #[qinvokable]
+        #[cxx_name = "cancelPluginScan"]
+        fn cancel_plugin_scan(&self);
 
         #[qinvokable]
         #[cxx_name = "setStripGain"]
@@ -907,6 +933,10 @@ pub struct BackendRust {
     undo_label: QString,
     redo_label: QString,
     clock: QString,
+    catalog_ready: bool,
+    scan_running: bool,
+    scan_done: i32,
+    scan_total: i32,
 }
 
 impl Default for BackendRust {
@@ -941,6 +971,10 @@ impl Default for BackendRust {
             undo_label: QString::from(""),
             redo_label: QString::from(""),
             clock: QString::from("{\"locked\":false,\"playing\":false,\"bpm\":120,\"beats\":0,\"seconds\":0,\"beats_per_bar\":4}"),
+            catalog_ready: false,
+            scan_running: false,
+            scan_done: 0,
+            scan_total: 0,
         }
     }
 }
@@ -1076,6 +1110,14 @@ impl qobject::Backend {
                 }
             }
         }
+
+        self.as_mut()
+            .set_catalog_ready(CATALOG_READY.load(Ordering::Relaxed));
+        if let Ok(scan) = SCAN.lock() {
+            self.as_mut().set_scan_running(scan.0);
+            self.as_mut().set_scan_done(scan.1 as i32);
+            self.as_mut().set_scan_total(scan.2 as i32);
+        }
     }
 
     pub fn refresh(&self) {
@@ -1085,6 +1127,16 @@ impl qobject::Backend {
     pub fn rescan_plugins(&self) {
         note_action("scanning plugins");
         send(ControlMessage::RescanPlugins);
+    }
+
+    pub fn retest_plugins(&self) {
+        note_action("testing plugins");
+        send(ControlMessage::RetestPlugins);
+    }
+
+    pub fn cancel_plugin_scan(&self) {
+        note_action("cancelling plugin test");
+        send(ControlMessage::CancelPluginScan);
     }
 
     pub fn update_strip_gain(&self, strip: i32, gain: f32) {

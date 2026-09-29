@@ -211,9 +211,19 @@ ApplicationWindow {
         var delay = entry.send_delays[busId]
         return delay === undefined ? 0 : delay
     }
-    function filteredCatalog(query, channel) {
+    function pluginFailed(entry) {
+        return entry.status === "failed" || entry.status === "unsupported"
+    }
+    function pluginStatusText(entry) {
+        var reason = entry.reason ? entry.reason : ""
+        if (entry.status === "failed") return reason.length > 0 ? reason : "crashed"
+        if (entry.status === "unsupported") return reason.length > 0 ? reason : "unsupported"
+        return ""
+    }
+    function filteredCatalog(query, channel, hideFailed) {
         var needle = query ? query.toLowerCase() : ""
         return catalog.filter(function(entry) {
+            if (hideFailed && root.pluginFailed(entry)) return false
             if (channel === "mono" && entry.inputs !== 1) return false
             if (channel === "stereo" && entry.inputs !== 2) return false
             if (!needle) return true
@@ -859,6 +869,76 @@ ApplicationWindow {
 
     Timer { interval: 33; running: true; repeat: true; onTriggered: backend.poll() }
     Timer { interval: 1000; running: true; repeat: true; triggeredOnStart: true; onTriggered: backend.refresh() }
+
+    // Escape hatch: abort a running (or hung) plugin sweep.
+    Shortcut {
+        sequence: "Escape"
+        enabled: backend.scan_running
+        onActivated: backend.cancelPluginScan()
+    }
+
+    // Waiting-for-host overlay: shown until the engine is connected and has sent
+    // its plugin catalog, and while the startup plugin sweep is running.
+    Rectangle {
+        id: hostOverlay
+        anchors.fill: parent
+        color: Qt.rgba(0, 0, 0, 0.55)
+        visible: !backend.connected || !backend.catalog_ready
+        z: 1000
+
+        ColumnLayout {
+            anchors.centerIn: parent
+            spacing: 10
+
+            BusyIndicator {
+                Layout.alignment: Qt.AlignHCenter
+                running: hostOverlay.visible
+                implicitWidth: 48
+                implicitHeight: 48
+            }
+
+            Label {
+                Layout.alignment: Qt.AlignHCenter
+                text: backend.connected ? "loading session…" : "waiting for the engine…"
+                color: "white"
+                font.pixelSize: 13
+            }
+        }
+    }
+
+    // Thin sweep progress strip at the top while plugins are being tested.
+    Rectangle {
+        id: scanBar
+        anchors.top: parent.top
+        anchors.left: parent.left
+        anchors.right: parent.right
+        height: 3
+        visible: backend.scan_running
+        color: root.panelColor
+        z: 1001
+
+        Rectangle {
+            height: parent.height
+            color: root.accentColor
+            width: backend.scan_total > 0
+                ? parent.width * backend.scan_done / backend.scan_total
+                : 0
+        }
+    }
+
+    Label {
+        anchors.top: scanBar.bottom
+        anchors.right: parent.right
+        anchors.topMargin: 2
+        anchors.rightMargin: 8
+        visible: backend.scan_running
+        text: backend.scan_total > 0
+            ? "testing plugins " + backend.scan_done + "/" + backend.scan_total + " (esc to cancel)"
+            : "testing plugins… (esc to cancel)"
+        color: root.textColor
+        font.pixelSize: 9
+        z: 1001
+    }
 
     component FlatButton: Button {
         id: button
@@ -2409,6 +2489,7 @@ ApplicationWindow {
         property int location: 0
         property int target: -1
         property bool scanning: false
+        property bool hideFailed: false
         property string channelFilter: ""
 
         modality: Qt.ApplicationModal
@@ -2458,6 +2539,20 @@ ApplicationWindow {
                 }
 
                 FlatButton {
+                    text: backend.scan_running
+                        ? "testing " + backend.scan_done + "/" + backend.scan_total
+                        : "test all"
+                    enabled: backend.connected && !backend.scan_running
+                    onClicked: backend.retestPlugins()
+                }
+
+                FlatButton {
+                    visible: backend.scan_running
+                    text: "cancel"
+                    onClicked: backend.cancelPluginScan()
+                }
+
+                FlatButton {
                     text: "close"
                     onClicked: pickerWindow.close()
                 }
@@ -2489,11 +2584,15 @@ ApplicationWindow {
                     enabled: pickerWindow.channelFilter !== "stereo"
                     onClicked: pickerWindow.channelFilter = "stereo"
                 }
+                FlatButton {
+                    text: pickerWindow.hideFailed ? "hide failed" : "show failed"
+                    onClicked: pickerWindow.hideFailed = !pickerWindow.hideFailed
+                }
             }
 
             Label {
                 Layout.fillWidth: true
-                text: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter).length
+                text: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter, pickerWindow.hideFailed).length
                     + " / " + catalog.length + " plugins"
                 color: root.mutedText
                 font.pixelSize: 9
@@ -2504,7 +2603,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                model: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter)
+                model: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter, pickerWindow.hideFailed)
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
@@ -2516,14 +2615,25 @@ ApplicationWindow {
 
                     Label {
                         anchors.left: parent.left
-                        anchors.right: parent.right
                         anchors.verticalCenter: parent.verticalCenter
                         anchors.leftMargin: 4
+                        anchors.right: statusLabel.left
                         anchors.rightMargin: 8
                         text: modelData.name
                         elide: Text.ElideRight
-                        color: root.textColor
+                        color: root.pluginFailed(modelData) ? "#e53935" : root.textColor
                         font.pixelSize: 11
+                    }
+
+                    Label {
+                        id: statusLabel
+                        anchors.right: parent.right
+                        anchors.verticalCenter: parent.verticalCenter
+                        anchors.rightMargin: 8
+                        text: root.pluginStatusText(modelData)
+                        color: "#e53935"
+                        font.pixelSize: 9
+                        visible: text.length > 0
                     }
 
                     MouseArea {

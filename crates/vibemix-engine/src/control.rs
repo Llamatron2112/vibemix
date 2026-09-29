@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
+use std::os::unix::process::{CommandExt, ExitStatusExt};
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,12 +19,15 @@ use vibemix_proto::ControlMessage;
 
 use crate::backend_jack::{encode_state, instantiate_slot, JackEngine};
 use crate::dsp;
+use crate::health::{HealthStore, Scan, ScanEvent, Status};
 use crate::params::{SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS};
 
 const PLUGIN_LOC_STRIP_PRE: u32 = 0;
 const PLUGIN_LOC_STRIP_POST: u32 = 1;
 
 const METER_INTERVAL: Duration = Duration::from_millis(20);
+/// Minimum gap between catalog rebuilds while the plugin sweep streams results.
+const CATALOG_THROTTLE: Duration = Duration::from_millis(250);
 
 #[derive(Default)]
 struct Actions {
@@ -78,6 +82,11 @@ pub struct Controller {
     retired_hosts: Vec<Host>,
     plugins: Vec<PluginInfo>,
     catalog_json: String,
+    health: HealthStore,
+    health_dirty: bool,
+    /// Force the next catalog rebuild immediately (manual verdicts, sweep done).
+    health_immediate: bool,
+    scan: Scan,
     smoke_ok: HashSet<String>,
     smoke_bad: HashSet<String>,
     uis: HashMap<(u32, u32, u32), (UiWindow, Box<UiWriteCtx>)>,
@@ -212,7 +221,8 @@ impl Controller {
                 discovered
             }
         };
-        let catalog_json = build_catalog(&plugins);
+        let health = HealthStore::load();
+        let catalog_json = build_catalog(&plugins, &health);
         save_catalog(&plugins);
 
         let mut engine = engine;
@@ -231,6 +241,10 @@ impl Controller {
             retired_hosts: Vec::new(),
             plugins,
             catalog_json,
+            health,
+            health_dirty: false,
+            health_immediate: false,
+            scan: Scan::new(),
             smoke_ok: HashSet::new(),
             smoke_bad: HashSet::new(),
             uis: HashMap::new(),
@@ -249,12 +263,15 @@ impl Controller {
             pending_learn: None,
         };
         controller.rebuild_shared_bindings();
+        controller.start_health_scan();
         Ok(controller)
     }
 
     pub fn run(&mut self) {
         let mut buffer = [0u8; 65536];
         let mut target: Option<SocketAddr> = None;
+        let mut scan_was_running = false;
+        let mut last_catalog = Instant::now() - CATALOG_THROTTLE;
 
         loop {
             let mut actions = Actions::default();
@@ -272,6 +289,35 @@ impl Controller {
                         tracing::warn!(%error, "control socket error");
                     }
                 }
+            }
+
+            // Merge plugin-sweep results; the catalog is rebuilt at most every
+            // CATALOG_THROTTLE (and immediately on manual verdicts / sweep end)
+            // so a large sweep doesn't spam the control thread or the GUI.
+            for event in self.scan.poll() {
+                match event {
+                    ScanEvent::Start { .. } => {}
+                    ScanEvent::Verdict { uri, status, reason } => {
+                        self.health.set(&uri, status, reason);
+                        self.health_dirty = true;
+                    }
+                    ScanEvent::Done { .. } => {
+                        self.health_dirty = true;
+                        self.health_immediate = true;
+                        tracing::info!("plugin health sweep finished");
+                    }
+                }
+            }
+
+            if self.health_dirty
+                && (self.health_immediate || last_catalog.elapsed() >= CATALOG_THROTTLE)
+            {
+                self.health_dirty = false;
+                self.health_immediate = false;
+                last_catalog = Instant::now();
+                self.health.save();
+                self.catalog_json = build_catalog(&self.plugins, &self.health);
+                actions.catalog = true;
             }
 
             self.engine.drain_garbage();
@@ -323,6 +369,11 @@ impl Controller {
             let Some(address) = target else {
                 continue;
             };
+
+            if self.scan.running || scan_was_running {
+                self.send_plugin_scan(address);
+                scan_was_running = self.scan.running;
+            }
 
             if let Some(json) = self.missing_report.take() {
                 self.send_missing(address, &json);
@@ -831,7 +882,7 @@ impl Controller {
                 if self.plugins.is_empty() {
                     self.plugins = load_catalog();
                 }
-                self.catalog_json = build_catalog(&self.plugins);
+                self.catalog_json = build_catalog(&self.plugins, &self.health);
                 save_catalog(&self.plugins);
                 let sample_rate = self.engine.sample_rate() as f64;
                 if let Err(error) =
@@ -841,13 +892,24 @@ impl Controller {
                     tracing::warn!(%error, "failed to rebuild plugins after rescan");
                 }
                 tracing::info!(count = self.plugins.len(), "plugins rescanned");
+                // Health-check any plugins discovered by the rescan.
+                self.start_health_scan();
                 Actions {
                     snapshot: true,
                     catalog: true,
                 }
             }
+            ControlMessage::RetestPlugins => {
+                self.scan.start(None);
+                Actions::default()
+            }
+            ControlMessage::CancelPluginScan => {
+                self.scan.stop();
+                Actions::default()
+            }
             ControlMessage::Catalog { .. }
             | ControlMessage::State { .. }
+            | ControlMessage::PluginScan { .. }
             | ControlMessage::SessionResult { .. }
             | ControlMessage::MissingConnections { .. } => Actions::default(),
             ControlMessage::SaveSession {
@@ -1198,6 +1260,33 @@ impl Controller {
         self.params.set_state_pause(false);
     }
 
+    /// Starts a plugin health sweep: a full one when the cache is stale/empty,
+    /// otherwise a targeted one for newly installed plugins (if any).
+    fn start_health_scan(&mut self) {
+        if self.health.sweepable(&self.plugins).is_empty() {
+            return;
+        }
+        if self.health.is_stale() {
+            self.scan.start(None);
+            return;
+        }
+        let untested: Vec<String> = self
+            .health
+            .untested(&self.plugins)
+            .into_iter()
+            .map(str::to_string)
+            .collect();
+        if !untested.is_empty() {
+            self.scan.start(Some(&untested));
+        }
+    }
+
+    fn record_health(&mut self, uri: &str, status: Status, reason: String) {
+        self.health.set(uri, status, reason);
+        self.health_dirty = true;
+        self.health_immediate = true;
+    }
+
     fn plugin_is_safe(&mut self, uri: &str) -> bool {
         if self.smoke_ok.contains(uri) {
             return true;
@@ -1209,13 +1298,21 @@ impl Controller {
         let Ok(executable) = std::env::current_exe() else {
             return true;
         };
-        let Ok(mut child) = Command::new(executable)
-            .arg("--smoke")
-            .arg(uri)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-        else {
+        let mut command = Command::new(executable);
+        command.arg("--smoke").arg(uri);
+        if crate::smoke::debug_enabled() {
+            // Leave stdio inherited so a plugin's own diagnostics stay visible.
+        } else {
+            command.stdout(Stdio::null()).stderr(Stdio::null());
+        }
+        // Safety: only adjusts the child's resource limits.
+        unsafe {
+            command.pre_exec(|| {
+                crate::smoke::disable_core_dumps();
+                Ok(())
+            });
+        }
+        let Ok(mut child) = command.spawn() else {
             return true;
         };
 
@@ -1224,11 +1321,21 @@ impl Controller {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => {
                     self.smoke_ok.insert(uri.to_string());
+                    self.record_health(uri, Status::Ok, String::new());
                     return true;
                 }
-                Ok(Some(_)) => {
+                Ok(Some(status)) => {
                     self.smoke_bad.insert(uri.to_string());
-                    tracing::warn!(%uri, "plugin failed smoke test, refusing to load");
+                    let reason = if let Some(signal) = status.signal() {
+                        let name = crate::smoke::signal_name(signal);
+                        tracing::warn!(%uri, signal, "plugin crashed during smoke test, refusing to load");
+                        name.to_string()
+                    } else {
+                        let code = status.code().unwrap_or(-1);
+                        tracing::warn!(%uri, code, "plugin failed smoke test, refusing to load");
+                        format!("exit {code}")
+                    };
+                    self.record_health(uri, Status::Failed, reason);
                     return false;
                 }
                 Ok(None) => {
@@ -1237,6 +1344,7 @@ impl Controller {
                         let _ = child.wait();
                         self.smoke_bad.insert(uri.to_string());
                         tracing::warn!(%uri, "plugin smoke test timed out, refusing to load");
+                        self.record_health(uri, Status::Failed, "timeout".to_string());
                         return false;
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -2166,6 +2274,17 @@ impl Controller {
         }
     }
 
+    fn send_plugin_scan(&self, address: SocketAddr) {
+        let message = ControlMessage::PluginScan {
+            running: self.scan.running,
+            done: self.scan.done as u32,
+            total: self.scan.total as u32,
+        };
+        if let Ok(bytes) = message.encode() {
+            let _ = self.socket.send_to(&bytes, address);
+        }
+    }
+
     fn send_state(&self, address: SocketAddr) {
         let message = ControlMessage::State {
             json: build_state_json(
@@ -2421,10 +2540,40 @@ fn sanitize_name(name: String) -> Option<String> {
     Some(trimmed.chars().take(MAX_NAME_LEN).collect())
 }
 
-fn build_catalog(plugins: &[PluginInfo]) -> String {
+/// Required features the host implements. A plugin requiring anything else is
+/// reported as unsupported rather than attempted.
+const SUPPORTED_REQUIRED_FEATURES: &[&str] = &[
+    "http://lv2plug.in/ns/ext/urid#map",
+    "http://lv2plug.in/ns/ext/urid#unmap",
+    "http://lv2plug.in/ns/ext/worker#schedule",
+    "http://lv2plug.in/ns/ext/buf-size#boundedBlockLength",
+    "http://lv2plug.in/ns/ext/options#options",
+];
+
+fn unsupported_required_feature(info: &PluginInfo) -> Option<&str> {
+    info.required_features
+        .iter()
+        .map(String::as_str)
+        .find(|feature| !SUPPORTED_REQUIRED_FEATURES.contains(feature))
+}
+
+fn short_feature(uri: &str) -> &str {
+    uri.rsplit(['#', '/']).next().unwrap_or(uri)
+}
+
+fn build_catalog(plugins: &[PluginInfo], health: &HealthStore) -> String {
     let list: Vec<serde_json::Value> = plugins
         .iter()
         .map(|info| {
+            let (status, reason) = if let Some(feature) = unsupported_required_feature(info) {
+                (Some("unsupported"), format!("requires {}", short_feature(feature)))
+            } else if !info.hostable {
+                (Some("unsupported"), "unsupported port layout".to_string())
+            } else if let Some(verdict) = health.get(&info.uri) {
+                (Some(verdict.status.as_str()), verdict.reason.clone())
+            } else {
+                (None, String::new())
+            };
             serde_json::json!({
                 "uri": info.uri,
                 "name": info.name,
@@ -2432,20 +2581,22 @@ fn build_catalog(plugins: &[PluginInfo]) -> String {
                 "inputs": info.audio_inputs.len(),
                 "outputs": info.audio_outputs.len(),
                 "midi": !info.midi_inputs.is_empty(),
+                "status": status,
+                "reason": reason,
             })
         })
         .collect();
     serde_json::Value::Array(list).to_string()
 }
 
-/// Hostable mono/stereo plugins, in catalog order.
+/// Mono/stereo audio plugins, in catalog order. Non-hostable entries are kept
+/// so they can be shown as unsupported in the picker.
 fn discover_catalog(host: &Host) -> Vec<PluginInfo> {
     host.discover()
         .into_iter()
         .filter(|info| {
-            info.hostable
-                && ((info.audio_inputs.len() == 2 && info.audio_outputs.len() == 2)
-                    || (info.audio_inputs.len() == 1 && info.audio_outputs.len() == 1))
+            (info.audio_inputs.len() == 2 && info.audio_outputs.len() == 2)
+                || (info.audio_inputs.len() == 1 && info.audio_outputs.len() == 1)
         })
         .collect()
 }

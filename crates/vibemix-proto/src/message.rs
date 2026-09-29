@@ -153,6 +153,13 @@ pub enum ControlMessage {
         json: String,
     },
     RescanPlugins,
+    RetestPlugins,
+    CancelPluginScan,
+    PluginScan {
+        running: bool,
+        done: u32,
+        total: u32,
+    },
     QueryState,
     State {
         json: String,
@@ -427,6 +434,26 @@ impl ControlMessage {
             RescanPlugins => OscMessage {
                 addr: addr::PLUGINS_RESCAN.to_string(),
                 args: Vec::new(),
+            },
+            RetestPlugins => OscMessage {
+                addr: addr::PLUGINS_RETEST.to_string(),
+                args: Vec::new(),
+            },
+            CancelPluginScan => OscMessage {
+                addr: addr::PLUGIN_SCAN_CANCEL.to_string(),
+                args: Vec::new(),
+            },
+            PluginScan {
+                running,
+                done,
+                total,
+            } => OscMessage {
+                addr: addr::PLUGIN_SCAN.to_string(),
+                args: vec![
+                    OscType::Int(*running as i32),
+                    OscType::Int(*done as i32),
+                    OscType::Int(*total as i32),
+                ],
             },
             SetPluginBypass {
                 location,
@@ -865,6 +892,13 @@ impl ControlMessage {
                 json: string(args, 0)?,
             }),
             addr::PLUGINS_RESCAN => Some(ControlMessage::RescanPlugins),
+            addr::PLUGINS_RETEST => Some(ControlMessage::RetestPlugins),
+            addr::PLUGIN_SCAN_CANCEL => Some(ControlMessage::CancelPluginScan),
+            addr::PLUGIN_SCAN => Some(ControlMessage::PluginScan {
+                running: int(args, 0)? != 0,
+                done: int(args, 1)? as u32,
+                total: int(args, 2)? as u32,
+            }),
             addr::PLUGIN_BYPASS => Some(ControlMessage::SetPluginBypass {
                 location: int(args, 0)? as u32,
                 target: int(args, 1)? as u32,
@@ -1188,6 +1222,13 @@ mod tests {
             json: "[{\"uri\":\"x\"}]".to_string(),
         });
         roundtrip(ControlMessage::RescanPlugins);
+        roundtrip(ControlMessage::RetestPlugins);
+        roundtrip(ControlMessage::CancelPluginScan);
+        roundtrip(ControlMessage::PluginScan {
+            running: true,
+            done: 12,
+            total: 226,
+        });
         roundtrip(ControlMessage::SetPluginBypass {
             location: 2,
             target: 1,

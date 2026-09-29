@@ -6,6 +6,11 @@ mod ui_outputs;
 pub mod urid;
 mod worker;
 
+/// Bump when host-side behavior changes (bug fixes, feature coverage) so that
+/// persisted plugin-health verdicts in the engine are invalidated and plugins
+/// are retested. Increment whenever a host fix could unblock a plugin.
+pub const HOST_ABI_VERSION: u32 = 2;
+
 pub use atom::{MidiEvent, TimePosition};
 pub use host::{ControlPort, Host, PluginInfo, PluginInstance};
 pub use state::{StateEntry, StateProxy};

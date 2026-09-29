@@ -136,8 +136,9 @@ the GUI over `/vibemix/connections/missing`, which shows a popup listing them.
 
 `vibemix-lv2` wraps `lilv` and supplies the host features that `lilv` 0.2.4
 omits. The engine hosts per-strip insert chains (pre- and post-fader) and a
-per-bus insert chain from the session and at runtime. Confirmed working against
-the installed plugin set (77 of 210 stereo plugins instantiate and run).
+per-bus insert chain from the session and at runtime. On the development box the
+whole installed mono/stereo set (226 plugins: LSP, Calf, x42, meters.lv2, …)
+passes the isolated smoke sweep; see "Plugin health" below.
 
 Plugins are discovered by scanning the standard LV2 directories (`lilv`'s
 `World::load_all`), keeping the hostable mono/stereo ones; the list is persisted
@@ -146,7 +147,8 @@ after each scan. The GUI's plugin picker (a modal window with a name filter) can
 trigger a rescan (`/vibemix/plugins/rescan`), which builds a fresh `lilv` world —
 the previous worlds are kept alive so instances/UI windows created from them stay
 valid — re-discovers, rewrites the catalog, and rebuilds the chains. A plugin
-that cannot be instantiated (uninstalled or blacklisted) is kept in the session,
+that cannot be instantiated (uninstalled or refused by the smoke test) is kept
+in the session,
 bypassed (its DSP slot is a pass-through so slot indices stay aligned), and its
 name is shown red in the plugin list; it is re-instantiated when it becomes
 available again.
@@ -263,21 +265,56 @@ rather than taking the engine down. The smoke test runs headless (the window is
 never mapped) and also exercises the output-forwarding path, so it produces no
 visible flash.
 
-Not supported: Qt plugin UIs (and GTK4). meters.lv2 EBU R128 stays blacklisted
-(it aborts on its own internal buffer).
+Not supported: Qt plugin UIs (and GTK4).
 
-This hosts ~209 mono/stereo plugins (LSP, Calf, x42 convolvers, meters.lv2, …).
+This hosts all mono/stereo plugins, including meters/analysers with atom output
+ports.
 
 Safety: arbitrary third-party plugins can crash the process, so before a plugin
 is added the engine re-execs itself with `--smoke <uri>`, which instantiates it
 offline and runs a few blocks; if the child crashes or times out the add is
-refused (result cached per URI). Discovery also refuses port shapes we cannot
-fully connect, and a small blacklist (overridable with
-`VIBEMIX_LV2_BLACKLIST=uri1,uri2`) short-circuits known crashers (Calf Reverse
-Delay, meters.lv2 EBU R128). `cargo run -p vibemix-lv2 --example probe`
-smoke-tests discovery/instantiate; `--example scan_silence` checks every
-hostable plugin passes audio with its defaults; `--example run_plugin <uri>`
-runs one plugin offline.
+refused. Discovery also refuses port shapes we cannot fully connect.
+`cargo run -p vibemix-lv2 --example probe` smoke-tests discovery/instantiate;
+`--example scan_silence` checks every hostable plugin passes audio with its
+defaults; `--example run_plugin <uri>` runs one plugin offline.
+
+### Plugin health
+
+The engine sweeps every hostable mono/stereo plugin in an isolated child process
+and records the verdict, rather than hiding suspected crashers behind a
+blacklist. `vibemix-engine --scan-plugins` loads the `lilv` world once, `fork()`s
+per plugin (the child is single-threaded, so this is safe), runs the same
+offline block test, and prints one JSON verdict per line (`ok` /
+`crash SIGSEGV` / `timeout` / `instantiate failed`). At startup the engine runs
+a full sweep when the cache is missing or its host ABI version changed, and
+otherwise a **targeted** sweep for just the newly installed plugins that have no
+verdict yet (`--scan-plugins --only <uri>…`). A plugin rescan also health-checks
+anything it newly discovers, and the picker's "test all"
+(`/vibemix/plugins/retest`) forces a full sweep. The
+supervisor runs in its own process group at low priority (`setpgid` +
+`setpriority`), so the audio thread and UI always win; a sweep can be aborted
+wholesale (`/vibemix/plugins/scan/cancel`, Esc in the GUI), which is useful if a
+collection is huge or a third-party plugin makes the sweep hang. The sweep is a
+separate process, so it never touches the RT graph; the top status bar shows a
+thin progress strip with a `testing plugins done/total` counter while it runs.
+
+Verdicts are cached in `$XDG_CONFIG_HOME/vibemix/plugin_health.json`, tagged with
+`HOST_ABI_VERSION` (`vibemix-lv2`); bump it when host behavior changes so fixed
+plugins are retried. The catalog carries `status` (`ok`/`failed`/`unsupported`)
+and a human `reason`; the picker paints failed/unsupported entries red (with the
+reason) and has a "hide failed" toggle. Entries stay clickable — the smoke guard
+still refuses anything that crashes. A plugin requiring a feature the host does
+not implement is listed as `unsupported` with that feature's name. The only
+remaining blacklist is the optional operator escape hatch
+`VIBEMIX_LV2_BLACKLIST=uri1,uri2`.
+
+Two host bugs surfaced by the sweep and fixed here: `lv2_raw` types
+`LV2_Descriptor::extension_data` as required, so a plugin that (legally) leaves
+it NULL made `lilv`'s shim call a null pointer (EQ10Q); and output
+`atom:Sequence` ports were not re-armed with their capacity between blocks, so
+atom-output meters (bitscope, signal-distribution histogram) asserted on the
+second block. `--debug` (or `VIBEMIX_DEBUG=1`) logs the child's signal and keeps
+its stderr; smoke children always run with core dumps disabled.
 
 ## Control protocol
 
@@ -323,6 +360,9 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/state` | `string json` (engine to GUI: strips/buses with plugins + control metadata) |
 | `/vibemix/catalog` | `string json` (engine to GUI: hostable plugins) |
 | `/vibemix/plugins/rescan` | none (re-scan LV2 dirs, refresh catalog, rebuild chains) |
+| `/vibemix/plugins/retest` | none (start/refresh the isolated plugin health sweep) |
+| `/vibemix/plugins/scan/cancel` | none (abort a running/hung sweep; kills the whole process group) |
+| `/vibemix/plugins/scan` | `int running, int done, int total` (engine to GUI: sweep progress) |
 | `/vibemix/session/save` | `string path, int width, int height, int maximized` (window geometry saved with the session) |
 | `/vibemix/session/load` | `string path` |
 | `/vibemix/session/new` | none (reset to a minimal default session) |

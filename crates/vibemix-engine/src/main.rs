@@ -1,10 +1,12 @@
 mod backend_jack;
 mod control;
 mod dsp;
+mod health;
 mod midi;
 mod midi_map;
 mod params;
 mod rt_guard;
+mod smoke;
 
 use std::sync::Arc;
 
@@ -45,10 +47,26 @@ struct Args {
 
     #[arg(long, hide = true)]
     smoke_ui: Option<String>,
+
+    /// Verbose plugin diagnostics (also via VIBEMIX_DEBUG=1).
+    #[arg(long)]
+    debug: bool,
+
+    /// Test every plugin in isolation and print JSON verdicts, then exit.
+    #[arg(long, hide = true)]
+    scan_plugins: bool,
+
+    /// Restrict `--scan-plugins` to this URI (repeatable).
+    #[arg(long, hide = true)]
+    only: Vec<String>,
 }
 
 fn main() -> Result<()> {
     let args = Args::parse();
+
+    if args.debug {
+        std::env::set_var("VIBEMIX_DEBUG", "1");
+    }
 
     vibemix_lv2::ui::init();
 
@@ -62,9 +80,14 @@ fn main() -> Result<()> {
     if let Some(uri) = args.smoke_ui.as_deref() {
         run_smoke_ui(uri);
     }
+    if args.scan_plugins {
+        let only = (!args.only.is_empty()).then_some(args.only);
+        smoke::scan_plugins(only);
+    }
 
+    let default_level = if smoke::debug_enabled() { "debug" } else { "info" };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     if args.strips == 0 || args.buses == 0 {
@@ -116,23 +139,8 @@ fn main() -> Result<()> {
 }
 
 fn run_smoke(uri: &str) -> ! {
-    let host = Host::new();
-    let sample_rate = 48000.0;
-    let frames = 512usize;
-    let Some(mut instance) = host.instantiate(uri, sample_rate, frames, 8192) else {
-        std::process::exit(2);
-    };
-
-    for _ in 0..64 {
-        for channel in 0..instance.audio_input_count() {
-            for sample in instance.input_buffer_mut(channel)[..frames].iter_mut() {
-                *sample = 0.1;
-            }
-        }
-        instance.run(frames);
-        instance.deliver_responses();
-    }
-    std::process::exit(0);
+    smoke::disable_core_dumps();
+    std::process::exit(smoke::smoke_plugin(&Host::new(), uri));
 }
 
 fn run_smoke_ui(uri: &str) -> ! {

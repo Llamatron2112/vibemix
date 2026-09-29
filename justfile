@@ -26,6 +26,10 @@ run-engine:
 run-gui:
     cargo run -p vibemix-gui
 
+# Smoke-test every hostable plugin in isolation and print JSON verdicts.
+scan-plugins:
+    cargo run -p vibemix-engine -- --scan-plugins
+
 release:
     cargo build --release --workspace
 
