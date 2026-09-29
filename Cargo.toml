@@ -4,6 +4,7 @@ members = [
     "crates/vibemix-core",
     "crates/vibemix-proto",
     "crates/vibemix-lv2",
+    "crates/vibemix-vst3",
     "crates/vibemix-engine",
     "crates/vibemix-gui",
 ]

@@ -133,3 +133,16 @@ pw-metadata -n settings 0 clock.force-quantum 0   # reset to auto
 | `lld` | `lld` |
 
 Arch's `pipewire-jack` ships JACK headers, `libjack.so` and `jack.pc` in one package. Do not also install `jack2`.
+
+## Submodules
+
+`vendor/vst3sdk` provides the Steinberg VST3 SDK used by `vibemix-vst3`. It is
+**GPLv3**, so that crate (and any build linking it) is GPLv3. Fetch it and its
+nested submodules with:
+
+```
+git submodule update --init --recursive vendor/vst3sdk
+```
+
+The crate's `build.rs` compiles only the hosting subset it needs (no CMake) and
+builds a small test effect for its tests.

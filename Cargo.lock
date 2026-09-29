@@ -1070,6 +1070,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "vibemix-vst3"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "which"
 version = "8.0.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
