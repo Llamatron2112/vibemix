@@ -2296,10 +2296,26 @@ ApplicationWindow {
         property int paramTarget
         property int paramSlot
         property var bindingHost: null
+        property real liveValue: 0
+        property bool interacting: false
         spacing: 6
 
-        readonly property real currentValue: root.paramValue(paramLocation, paramTarget, paramSlot, paramIndex)
+        readonly property real currentValue: interacting
+            ? liveValue
+            : root.paramValue(paramLocation, paramTarget, paramSlot, paramIndex)
         readonly property bool isEnum: root.isEnumControl(controlData)
+
+        function beginInteraction(value) {
+            liveValue = value
+            interacting = true
+            interactTimer.restart()
+        }
+
+        Timer {
+            id: interactTimer
+            interval: 600
+            onTriggered: parameterRow.interacting = false
+        }
 
         Label {
             width: 150
@@ -2316,12 +2332,15 @@ ApplicationWindow {
             checked: parameterRow.currentValue >= 0.5
             font.pixelSize: 11
             anchors.verticalCenter: parent.verticalCenter
-            onClicked: backend.setPluginParam(
-                parameterRow.paramLocation,
-                parameterRow.paramTarget,
-                parameterRow.paramSlot,
-                parameterRow.paramIndex,
-                checked ? 1 : 0)
+            onClicked: {
+                parameterRow.beginInteraction(checked ? 1 : 0)
+                backend.setPluginParam(
+                    parameterRow.paramLocation,
+                    parameterRow.paramTarget,
+                    parameterRow.paramSlot,
+                    parameterRow.paramIndex,
+                    checked ? 1 : 0)
+            }
         }
 
         ComboBox {
@@ -2335,12 +2354,16 @@ ApplicationWindow {
                 ? root.enumIndex(parameterRow.controlData, parameterRow.currentValue)
                 : -1
             anchors.verticalCenter: parent.verticalCenter
-            onActivated: backend.setPluginParam(
-                parameterRow.paramLocation,
-                parameterRow.paramTarget,
-                parameterRow.paramSlot,
-                parameterRow.paramIndex,
-                parameterRow.controlData.scale_points[currentIndex].value)
+            onActivated: {
+                var chosen = parameterRow.controlData.scale_points[currentIndex].value
+                parameterRow.beginInteraction(chosen)
+                backend.setPluginParam(
+                    parameterRow.paramLocation,
+                    parameterRow.paramTarget,
+                    parameterRow.paramSlot,
+                    parameterRow.paramIndex,
+                    chosen)
+            }
         }
 
         Slider {
@@ -2353,12 +2376,15 @@ ApplicationWindow {
             snapMode: parameterRow.controlData.integer === true ? Slider.SnapAlways : Slider.NoSnap
             value: parameterRow.currentValue
             anchors.verticalCenter: parent.verticalCenter
-            onMoved: backend.setPluginParam(
-                parameterRow.paramLocation,
-                parameterRow.paramTarget,
-                parameterRow.paramSlot,
-                parameterRow.paramIndex,
-                value)
+            onMoved: {
+                parameterRow.beginInteraction(value)
+                backend.setPluginParam(
+                    parameterRow.paramLocation,
+                    parameterRow.paramTarget,
+                    parameterRow.paramSlot,
+                    parameterRow.paramIndex,
+                    value)
+            }
         }
 
         Item {

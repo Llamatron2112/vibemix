@@ -85,6 +85,10 @@ Environment variables:
   the catalog entirely (operator escape hatch; there is no built-in list).
 - `VIBEMIX_DEBUG=1` (or `vibemix-engine --debug`) — verbose plugin diagnostics:
   log the smoke child's crash signal and keep its stderr.
+- `vibemix-engine --probe-vst3 <bundle.vst3> <class-id>` — feed a sine through a
+  VST3 plugin and print its buses, parameters, setup/process results and output
+  peak, to diagnose a silent plugin without a running JACK session.
+  `VIBEMIX_PROBE_PARAMS=1` also pushes every parameter to its default each block.
 - `VIBEMIX_GTK` — force the GTK major version used to host plugin UIs:
   `gtk2`, `gtk3`, or unset/`auto` (pick the version that has hostable UIs). GTK2
   and GTK3 cannot coexist in one process, so only one is ever used.

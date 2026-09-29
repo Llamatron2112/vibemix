@@ -30,6 +30,9 @@ const PLUGIN_LOC_STRIP_POST: u32 = 1;
 const METER_INTERVAL: Duration = Duration::from_millis(20);
 /// Minimum gap between catalog rebuilds while the plugin sweep streams results.
 const CATALOG_THROTTLE: Duration = Duration::from_millis(250);
+/// Minimum gap between state echoes while a plugin parameter is edited, so the
+/// editor's value display tracks a drag without flooding the control socket.
+const PARAM_ECHO_INTERVAL: Duration = Duration::from_millis(50);
 
 #[derive(Default)]
 struct Actions {
@@ -107,6 +110,8 @@ pub struct Controller {
     undo_coalesce: Option<(Instant, EditKey)>,
     edit_dirty: bool,
     pending_learn: Option<MidiBinding>,
+    /// Last time a plugin-parameter edit echoed state to the UI.
+    last_param_echo: Instant,
 }
 
 struct UiWriteCtx {
@@ -267,6 +272,7 @@ impl Controller {
             undo_coalesce: None,
             edit_dirty: false,
             pending_learn: None,
+            last_param_echo: Instant::now() - PARAM_ECHO_INTERVAL,
         };
         controller.rebuild_shared_bindings();
         controller.start_health_scan();
@@ -798,7 +804,16 @@ impl Controller {
                     }
                 }
                 self.reflect_param_to_ui(location, target, slot, param, value);
-                Actions::default()
+                // Echo state back so the editor's value display follows the
+                // drag promptly, but throttle it to avoid a message per pixel.
+                let echo = self.last_param_echo.elapsed() >= PARAM_ECHO_INTERVAL;
+                if echo {
+                    self.last_param_echo = Instant::now();
+                }
+                Actions {
+                    snapshot: echo,
+                    catalog: false,
+                }
             }
             ControlMessage::SetPluginBypass {
                 location,
