@@ -120,6 +120,9 @@ pub struct Controller {
     pending_learn: Option<MidiBinding>,
     /// Last time a plugin-parameter edit echoed state to the UI.
     last_param_echo: Instant,
+    /// Last installed sidechain strip order (recomputed each poll, pushed on change).
+    last_strip_order: Vec<usize>,
+    last_strip_delayed: Vec<Vec<Vec<bool>>>,
 }
 
 /// An open plugin editor: an LV2 toolkit UI or a VST3 `IPlugView`.
@@ -314,6 +317,8 @@ impl Controller {
             edit_dirty: false,
             pending_learn: None,
             last_param_echo: Instant::now() - PARAM_ECHO_INTERVAL,
+            last_strip_order: Vec::new(),
+            last_strip_delayed: Vec::new(),
         };
         controller.ensure_model_vst3_controls();
         save_catalog(&controller.plugins);
@@ -378,6 +383,18 @@ impl Controller {
             self.engine.drain_garbage();
             self.pump_uis();
             let param_edits = self.drain_vst3_param_edits();
+
+            // Keep the sidechain-aware strip order up to date; push only on change.
+            let (order, delayed) = compute_strip_order(&self.model, self.params.strip_count());
+            if order != self.last_strip_order || delayed != self.last_strip_delayed {
+                match self.engine.set_strip_order(order.clone(), delayed.clone()) {
+                    Ok(()) => {
+                        self.last_strip_order = order;
+                        self.last_strip_delayed = delayed;
+                    }
+                    Err(error) => tracing::warn!(%error, "failed to install strip order"),
+                }
+            }
 
             if let Some(learned) = self.engine.midi_map().take_learned() {
                 if let Some(mut binding) = self.pending_learn.take() {
@@ -3214,6 +3231,104 @@ fn free_bus_slot(params: &SharedParams) -> Option<usize> {
     (0..params.bus_count()).find(|index| !params.bus_active(*index))
 }
 
+/// Strip processing order that places sidechain contributors before the strips
+/// that consume their bus, so the bus's summed sends are complete when a
+/// consumer plugin runs (`strip_count` is the mixing capacity). Consumers left
+/// in a dependency cycle are flagged to read the previous block's bus sum.
+fn compute_strip_order(model: &MixerModel, strip_count: usize) -> (Vec<usize>, Vec<Vec<Vec<bool>>>) {
+    let mut delayed = vec![vec![vec![false; MAX_PLUGINS]; PLUGIN_CHAINS]; strip_count];
+    let bus_count = model.buses.len();
+    let mut contributors: Vec<HashSet<usize>> = vec![HashSet::new(); bus_count];
+    let mut consumers: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); bus_count];
+
+    for strip in &model.strips {
+        let sid = strip.id.0 as usize;
+        if sid >= strip_count {
+            continue;
+        }
+        for send in &strip.sends {
+            let bus = send.bus.0 as usize;
+            if bus < bus_count {
+                contributors[bus].insert(sid);
+            }
+        }
+        for (plugins, chain) in [(&strip.plugins, 0usize), (&strip.plugins_post, 1usize)] {
+            for (slot, plugin) in plugins.iter().enumerate() {
+                if let Some(bus) = plugin.sidechain_bus {
+                    let bus = bus.0 as usize;
+                    if bus < bus_count && slot < MAX_PLUGINS {
+                        consumers[bus].push((sid, chain, slot));
+                    }
+                }
+            }
+        }
+    }
+
+    let mut edges: HashSet<(usize, usize)> = HashSet::new();
+    for bus in 0..bus_count {
+        for &source in &contributors[bus] {
+            for &(destination, _, _) in &consumers[bus] {
+                if source != destination {
+                    edges.insert((source, destination));
+                }
+            }
+        }
+    }
+    let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); strip_count];
+    let mut indegree = vec![0usize; strip_count];
+    for &(source, destination) in &edges {
+        adjacency[source].push(destination);
+        indegree[destination] += 1;
+    }
+
+    // Kahn's algorithm (min-heap keeps the order deterministic).
+    let mut heap = std::collections::BinaryHeap::new();
+    for (node, &degree) in indegree.iter().enumerate() {
+        if degree == 0 {
+            heap.push(std::cmp::Reverse(node));
+        }
+    }
+    let mut order = Vec::with_capacity(strip_count);
+    while let Some(std::cmp::Reverse(node)) = heap.pop() {
+        order.push(node);
+        for &next in &adjacency[node] {
+            indegree[next] -= 1;
+            if indegree[next] == 0 {
+                heap.push(std::cmp::Reverse(next));
+            }
+        }
+    }
+    if order.len() < strip_count {
+        let placed: HashSet<usize> = order.iter().copied().collect();
+        for node in 0..strip_count {
+            if !placed.contains(&node) {
+                order.push(node);
+            }
+        }
+    }
+
+    let mut position = vec![0usize; strip_count];
+    for (pos, &sid) in order.iter().enumerate() {
+        if sid < strip_count {
+            position[sid] = pos;
+        }
+    }
+    for bus in 0..bus_count {
+        for &(destination, chain, slot) in &consumers[bus] {
+            if destination >= strip_count {
+                continue;
+            }
+            let needs_delay = contributors[bus]
+                .iter()
+                .any(|&source| position[source] >= position[destination]);
+            if needs_delay {
+                delayed[destination][chain][slot] = true;
+            }
+        }
+    }
+    (order, delayed)
+}
+
 pub fn apply_model(params: &SharedParams, model: &MixerModel) {
     params.set_beats_per_bar(model.beats_per_bar);
     params.set_midi_sync(model.midi_sync);
@@ -3334,4 +3449,45 @@ fn load_session(path: &str) -> Result<MixerModel, String> {
         tracing::warn!(%error, %path, "session parse failed");
         error.to_string()
     })
+}
+
+#[cfg(test)]
+mod sidechain_order_tests {
+    use super::*;
+    use vibemix_core::ids::{BusId, PluginId, StripId};
+    use vibemix_core::model::{Bus, PluginSlot, Send, Strip};
+
+    fn model_with_sidechain(self_cycle: bool) -> MixerModel {
+        let mut model = MixerModel::default_minimal();
+        model.buses.push(Bus::new(BusId(1), "sc"));
+        let mut strip_b = Strip::new(StripId(1), "b");
+        // Strip 1 feeds the sidechain bus.
+        strip_b.sends.push(Send::new(BusId(1)));
+        model.strips.push(strip_b);
+
+        // Strip 0's plugin consumes the sidechain bus.
+        let mut plugin = PluginSlot::new(PluginId(0), "x");
+        plugin.sidechain_bus = Some(BusId(1));
+        model.strips[0].plugins.push(plugin);
+        if self_cycle {
+            // Strip 0 also feeds the bus -> its own send isn't available yet.
+            model.strips[0].sends.push(Send::new(BusId(1)));
+        }
+        model
+    }
+
+    #[test]
+    fn contributors_run_before_consumers() {
+        let model = model_with_sidechain(false);
+        let (order, delayed) = compute_strip_order(&model, 2);
+        assert_eq!(order, vec![1, 0], "contributor strip 1 must precede consumer strip 0");
+        assert!(delayed.iter().all(|c| c.iter().all(|s| s.iter().all(|d| !d))));
+    }
+
+    #[test]
+    fn self_cycle_is_delayed() {
+        let model = model_with_sidechain(true);
+        let (_, delayed) = compute_strip_order(&model, 2);
+        assert!(delayed[0][0][0], "self-sidechain consumer must be delayed");
+    }
 }

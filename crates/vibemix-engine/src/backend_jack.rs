@@ -219,6 +219,18 @@ pub enum EngineCommand {
         sample_rate: f32,
         delays: Vec<Vec<dsp::DelayLine>>,
     },
+    /// Sidechain-aware strip processing order and per-slot cycle flags.
+    SetStripOrder {
+        order: Vec<usize>,
+        delayed: Vec<Vec<Vec<bool>>>,
+    },
+}
+
+/// Old strip order, retired on the control thread to keep the RT thread clean
+/// (the fields are only held so their memory is freed off the audio thread).
+pub struct RetiredOrder {
+    _order: Vec<usize>,
+    _delayed: Vec<Vec<Vec<bool>>>,
 }
 
 struct StripPorts {
@@ -266,6 +278,13 @@ struct MixerGraph {
     send_scratch: [Vec<f32>; 2],
     /// Silence fed to a plugin's sidechain input when nothing is routed.
     sidechain_silence: [Vec<f32>; 2],
+    /// Order strips are processed in (sidechain contributors before consumers).
+    strip_order: Vec<usize>,
+    /// Per-slot cycle flags: delayed slots read last block's bus sum.
+    strip_delayed: Vec<Vec<Vec<bool>>>,
+    /// Last block's bus sums, for delayed (cyclic) sidechain feeds.
+    sidechain_snapshot: Vec<[Vec<f32>; 2]>,
+    garbage_order: Producer<RetiredOrder>,
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
     capacity: usize,
@@ -422,6 +441,16 @@ impl MixerGraph {
                     }
                     self.sample_rate = sample_rate;
                 }
+                EngineCommand::SetStripOrder { order, delayed } => {
+                    let old_order = std::mem::replace(&mut self.strip_order, order);
+                    let old_delayed = std::mem::replace(&mut self.strip_delayed, delayed);
+                    if let Err(old) = self.garbage_order.push(RetiredOrder {
+                        _order: old_order,
+                        _delayed: old_delayed,
+                    }) {
+                        std::mem::forget(old);
+                    }
+                }
             }
         }
     }
@@ -464,7 +493,9 @@ impl MixerGraph {
                     feed_sidechain(
                         &mut **instance,
                         self.params.plugin_sidechain(index, chain, slot),
+                        self.strip_delayed[index][chain][slot],
                         &self.bus_accum,
+                        &self.sidechain_snapshot,
                         &self.sidechain_silence,
                         frames,
                     );
@@ -487,7 +518,9 @@ impl MixerGraph {
                         feed_sidechain(
                             &mut **instance,
                             self.params.plugin_sidechain(index, chain, slot),
+                            self.strip_delayed[index][chain][slot],
                             &self.bus_accum,
+                            &self.sidechain_snapshot,
                             &self.sidechain_silence,
                             frames,
                         );
@@ -539,7 +572,9 @@ impl MixerGraph {
                     feed_sidechain(
                         &mut **instance,
                         self.params.bus_plugin_sidechain(bus, slot),
+                        false,
                         &self.bus_accum,
+                        &self.sidechain_snapshot,
                         &self.sidechain_silence,
                         frames,
                     );
@@ -562,7 +597,9 @@ impl MixerGraph {
                         feed_sidechain(
                             &mut **instance,
                             self.params.bus_plugin_sidechain(bus, slot),
+                            false,
                             &self.bus_accum,
+                            &self.sidechain_snapshot,
                             &self.sidechain_silence,
                             frames,
                         );
@@ -583,7 +620,8 @@ impl MixerGraph {
         let any_solo = (0..strip_count)
             .any(|index| self.params.strip_active(index) && self.params.strip_solo(index));
 
-        for index in 0..strip_count {
+        for position in 0..strip_count {
+            let index = self.strip_order.get(position).copied().unwrap_or(position);
             if !self.params.strip_active(index) {
                 self.meters.store_strip_in(index, 0.0, 0.0);
                 self.meters.store_strip_gain(index, 0.0, 0.0);
@@ -707,6 +745,15 @@ impl MixerGraph {
                     gain,
                 );
             }
+        }
+
+        // Snapshot the bus sums for delayed (cyclic) sidechain feeds next block.
+        for bus in 0..bus_count.min(self.sidechain_snapshot.len()) {
+            let len = frames.min(self.sidechain_snapshot[bus][0].len());
+            self.sidechain_snapshot[bus][0][..len]
+                .copy_from_slice(&self.bus_accum[bus][0][..len]);
+            self.sidechain_snapshot[bus][1][..len]
+                .copy_from_slice(&self.bus_accum[bus][1][..len]);
         }
     }
 
@@ -956,6 +1003,7 @@ pub struct JackEngine {
     garbage_chains: Consumer<Vec<SlotPlugin>>,
     garbage_nested: Consumer<Vec<StripChains>>,
     garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
+    garbage_order: Consumer<RetiredOrder>,
     pending_rate: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
     clock: Arc<SharedClock>,
@@ -1073,6 +1121,7 @@ impl JackEngine {
             rtrb::RingBuffer::<Vec<StripChains>>::new(garbage_nested_capacity);
         let (garbage_delays_producer, garbage_delays) =
             rtrb::RingBuffer::<Vec<Vec<dsp::DelayLine>>>::new(4);
+        let (garbage_order_producer, garbage_order) = rtrb::RingBuffer::<RetiredOrder>::new(4);
 
         let graph = MixerGraph {
             params: Arc::clone(&params),
@@ -1109,6 +1158,18 @@ impl JackEngine {
                 .collect(),
             send_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             sidechain_silence: [vec![0.0; capacity], vec![0.0; capacity]],
+            strip_order: (0..strip_count).collect(),
+            strip_delayed: (0..strip_count)
+                .map(|_| {
+                    (0..PLUGIN_CHAINS)
+                        .map(|_| (0..MAX_PLUGINS).map(|_| false).collect())
+                        .collect()
+                })
+                .collect(),
+            sidechain_snapshot: (0..bus_count)
+                .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
+                .collect(),
+            garbage_order: garbage_order_producer,
             bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             bus_accum: (0..bus_count)
                 .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
@@ -1145,6 +1206,7 @@ impl JackEngine {
             garbage_chains,
             garbage_nested,
             garbage_delays,
+            garbage_order,
             pending_rate,
             xruns,
             clock: shared_clock,
@@ -1218,6 +1280,18 @@ impl JackEngine {
     /// until a rate change is processed).
     pub fn graph_sample_rate(&self) -> u32 {
         self.graph_sample_rate
+    }
+
+    /// Installs a sidechain-aware strip processing order (and cycle flags).
+    pub fn set_strip_order(
+        &mut self,
+        order: Vec<usize>,
+        delayed: Vec<Vec<Vec<bool>>>,
+    ) -> Result<()> {
+        self.commands
+            .push(EngineCommand::SetStripOrder { order, delayed })
+            .map_err(|_| anyhow!("engine command queue full"))?;
+        Ok(())
     }
 
     pub fn add_plugin(
@@ -1928,6 +2002,7 @@ impl JackEngine {
         while self.garbage_chains.pop().is_ok() {}
         while self.garbage_nested.pop().is_ok() {}
         while self.garbage_delays.pop().is_ok() {}
+        while self.garbage_order.pop().is_ok() {}
     }
 }
 
@@ -1957,18 +2032,23 @@ fn set_bus_controls(
 }
 
 /// Feeds a plugin's sidechain input from the given source bus (or silence).
+/// Delayed (cyclic) slots read the previous block's bus sum.
+#[allow(clippy::too_many_arguments)]
 fn feed_sidechain(
     instance: &mut dyn PluginNode,
     source: Option<usize>,
+    delayed: bool,
     bus_accum: &[[Vec<f32>; 2]],
+    snapshot: &[[Vec<f32>; 2]],
     silence: &[Vec<f32>; 2],
     frames: usize,
 ) {
     if !instance.has_sidechain() {
         return;
     }
+    let accum = if delayed { snapshot } else { bus_accum };
     let (left, right) = match source {
-        Some(bus) if bus < bus_accum.len() => (&bus_accum[bus][0], &bus_accum[bus][1]),
+        Some(bus) if bus < accum.len() => (&accum[bus][0], &accum[bus][1]),
         _ => (&silence[0], &silence[1]),
     };
     instance.write_sidechain(&left[..frames], &right[..frames]);
