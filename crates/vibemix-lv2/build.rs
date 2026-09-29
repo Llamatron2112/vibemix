@@ -6,6 +6,7 @@ fn main() {
 
     let mut build = cc::Build::new();
     build.file("src/ui_host.c");
+    build.file("src/atom_check.c");
     build.warnings(false);
     for path in lilv
         .include_paths

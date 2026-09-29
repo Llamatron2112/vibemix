@@ -2158,6 +2158,8 @@ fn load_catalog() -> Vec<PluginInfo> {
             controls: Vec::new(),
             atom_inputs: Vec::new(),
             atom_outputs: Vec::new(),
+            midi_inputs: Vec::new(),
+            time_inputs: Vec::new(),
             required_features: Vec::new(),
             optional_features: Vec::new(),
             hostable: true,

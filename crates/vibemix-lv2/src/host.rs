@@ -6,6 +6,7 @@ use lilv::instance::ActiveInstance;
 use lilv::World;
 use lv2_raw::LV2Feature;
 
+use crate::atom::{AtomUrids, MidiEvent, SequenceWriter, TimePosition};
 use crate::urid::UridMap;
 use crate::worker::{Worker, WorkerInterface, WORKER_INTERFACE_URI, WORKER_SCHEDULE_URI};
 use crate::state::{StateEntry, StateInterface, StateProxy, STATE_INTERFACE_URI};
@@ -13,6 +14,20 @@ use crate::ui::{self, UiCandidate, UiWindow};
 use crate::ui_outputs::SharedOutputs;
 
 use std::sync::Arc;
+
+const MIDI_EVENT: &str = "http://lv2plug.in/ns/ext/midi#MidiEvent";
+const TIME_POSITION: &str = "http://lv2plug.in/ns/ext/time#Position";
+const ATOM_OBJECT: &str = "http://lv2plug.in/ns/ext/atom#Object";
+const ATOM_LONG: &str = "http://lv2plug.in/ns/ext/atom#Long";
+const ATOM_DOUBLE: &str = "http://lv2plug.in/ns/ext/atom#Double";
+const ATOM_FLOAT: &str = "http://lv2plug.in/ns/ext/atom#Float";
+const TIME_FRAME: &str = "http://lv2plug.in/ns/ext/time#frame";
+const TIME_BEAT: &str = "http://lv2plug.in/ns/ext/time#beat";
+const TIME_BAR: &str = "http://lv2plug.in/ns/ext/time#bar";
+const TIME_BAR_BEAT: &str = "http://lv2plug.in/ns/ext/time#barBeat";
+const TIME_BPM: &str = "http://lv2plug.in/ns/ext/time#beatsPerMinute";
+const TIME_BEATS_PER_BAR: &str = "http://lv2plug.in/ns/ext/time#beatsPerBar";
+const TIME_SPEED: &str = "http://lv2plug.in/ns/ext/time#speed";
 
 const OPTIONS_URI: &[u8] = b"http://lv2plug.in/ns/ext/options#options\0";
 const BOUNDED_BLOCK_URI: &[u8] = b"http://lv2plug.in/ns/ext/buf-size#boundedBlockLength\0";
@@ -81,6 +96,10 @@ pub struct PluginInfo {
     pub controls: Vec<ControlPort>,
     pub atom_inputs: Vec<usize>,
     pub atom_outputs: Vec<usize>,
+    #[serde(default)]
+    pub midi_inputs: Vec<usize>,
+    #[serde(default)]
+    pub time_inputs: Vec<usize>,
     pub required_features: Vec<String>,
     pub optional_features: Vec<String>,
     pub hostable: bool,
@@ -190,6 +209,8 @@ impl Host {
         let atom = self.world.new_uri(ATOM_PORT);
         let input = self.world.new_uri(INPUT_PORT);
         let output = self.world.new_uri(OUTPUT_PORT);
+        let midi_event = self.world.new_uri(MIDI_EVENT);
+        let time_position = self.world.new_uri(TIME_POSITION);
 
         let mut classified = Classified {
             hostable: true,
@@ -218,6 +239,12 @@ impl Host {
                     classified.atom_outputs.push(index);
                 } else if port.is_a(&input) {
                     classified.atom_inputs.push(index);
+                    if port.supports_event(&midi_event) {
+                        classified.midi_inputs.push(index);
+                    }
+                    if port.supports_event(&time_position) {
+                        classified.time_inputs.push(index);
+                    }
                 } else {
                     classified.hostable = false;
                 }
@@ -250,6 +277,8 @@ impl Host {
                 controls: classified.controls,
                 atom_inputs: classified.atom_inputs,
                 atom_outputs: classified.atom_outputs,
+                midi_inputs: classified.midi_inputs,
+                time_inputs: classified.time_inputs,
                 required_features: feature_uris(&plugin.required_features()),
                 optional_features: feature_uris(&plugin.optional_features()),
                 hostable: classified.hostable,
@@ -404,7 +433,33 @@ impl Host {
         let control_outputs = classified.control_outputs;
         let atom_inputs = classified.atom_inputs;
         let atom_outputs = classified.atom_outputs;
+        let midi_inputs = classified.midi_inputs;
+        let time_inputs = classified.time_inputs;
         let sequence_urid = self.urid.map(ATOM_SEQUENCE);
+        let urids = AtomUrids {
+            object: self.urid.map(ATOM_OBJECT),
+            midi_event: self.urid.map(MIDI_EVENT),
+            time_position: self.urid.map(TIME_POSITION),
+            time_frame: self.urid.map(TIME_FRAME),
+            time_beat: self.urid.map(TIME_BEAT),
+            time_bar: self.urid.map(TIME_BAR),
+            time_bar_beat: self.urid.map(TIME_BAR_BEAT),
+            time_beats_per_minute: self.urid.map(TIME_BPM),
+            time_beats_per_bar: self.urid.map(TIME_BEATS_PER_BAR),
+            time_speed: self.urid.map(TIME_SPEED),
+            atom_long: self.urid.map(ATOM_LONG),
+            atom_double: self.urid.map(ATOM_DOUBLE),
+            atom_float: self.urid.map(ATOM_FLOAT),
+        };
+        // Atom buffer indices (inputs come first in `atom_buffers`).
+        let midi_buffers: Vec<usize> = midi_inputs
+            .iter()
+            .filter_map(|port| atom_inputs.iter().position(|p| p == port))
+            .collect();
+        let time_buffers: Vec<usize> = time_inputs
+            .iter()
+            .filter_map(|port| atom_inputs.iter().position(|p| p == port))
+            .collect();
 
         let option_features = self.build_option_features(
             sample_rate as f32,
@@ -460,12 +515,15 @@ impl Host {
         let mut control_output_buffers: Vec<f32> = vec![0.0f32; control_outputs.len()];
         let mut atom_buffers: Vec<Box<[u64]>> = Vec::new();
         for _ in &atom_inputs {
-            atom_buffers.push(sequence_buffer(sequence_urid, 0));
+            atom_buffers.push(sequence_buffer(
+                sequence_urid,
+                crate::atom::SEQUENCE_BODY as u32,
+            ));
         }
         for _ in &atom_outputs {
             atom_buffers.push(sequence_buffer(
                 sequence_urid,
-                (ATOM_BUFFER_BYTES - 12) as u32,
+                (ATOM_BUFFER_BYTES - crate::atom::SEQUENCE_BODY) as u32,
             ));
         }
 
@@ -504,6 +562,9 @@ impl Host {
             control_outputs,
             atom_inputs,
             atom_outputs,
+            midi_buffers,
+            time_buffers,
+            urids,
             input_buffers,
             output_buffers,
             control_buffers,
@@ -525,6 +586,8 @@ struct Classified {
     control_outputs: Vec<usize>,
     atom_inputs: Vec<usize>,
     atom_outputs: Vec<usize>,
+    midi_inputs: Vec<usize>,
+    time_inputs: Vec<usize>,
     hostable: bool,
 }
 
@@ -575,6 +638,9 @@ pub struct PluginInstance {
     control_outputs: Vec<usize>,
     atom_inputs: Vec<usize>,
     atom_outputs: Vec<usize>,
+    midi_buffers: Vec<usize>,
+    time_buffers: Vec<usize>,
+    urids: AtomUrids,
     input_buffers: Vec<Box<[f32]>>,
     output_buffers: Vec<Box<[f32]>>,
     control_buffers: Vec<f32>,
@@ -671,6 +737,49 @@ impl PluginInstance {
     pub fn set_control(&mut self, param: usize, value: f32) {
         if let Some(buffer) = self.control_buffers.get_mut(param) {
             *buffer = value;
+        }
+    }
+
+    pub fn has_midi_input(&self) -> bool {
+        !self.midi_buffers.is_empty()
+    }
+
+    pub fn has_time_input(&self) -> bool {
+        !self.time_buffers.is_empty()
+    }
+
+    /// Replaces the MIDI events delivered to this instance's atom inputs for
+    /// the upcoming block.
+    pub fn write_midi(&mut self, events: &[MidiEvent]) {
+        if self.midi_buffers.is_empty() {
+            return;
+        }
+        let urids = self.urids;
+        for &index in &self.midi_buffers {
+            let buffer = &mut self.atom_buffers[index];
+            crate::atom::clear_sequence(buffer);
+            let mut writer = SequenceWriter::new(buffer);
+            for event in events {
+                if !writer.append_midi(event.time, event.as_slice(), &urids) {
+                    break;
+                }
+            }
+            writer.finish();
+        }
+    }
+
+    /// Replaces the host `time:Position` delivered to this instance.
+    pub fn write_position(&mut self, position: &TimePosition) {
+        if self.time_buffers.is_empty() {
+            return;
+        }
+        let urids = self.urids;
+        for &index in &self.time_buffers {
+            let buffer = &mut self.atom_buffers[index];
+            crate::atom::clear_sequence(buffer);
+            let mut writer = SequenceWriter::new(buffer);
+            writer.append_position(0, position, &urids);
+            writer.finish();
         }
     }
 
