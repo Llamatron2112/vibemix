@@ -31,15 +31,13 @@ Deferred ideas and follow-ups that are not part of the current roadmap
 
 ## Plugins / hosting
 
-- **VST3 host** (next milestone): VST3, not CLAP (CLAP's ecosystem is thin and
-  mostly overlaps LV2; VST2 is discontinued). A feasibility spike succeeded —
-  the SDK (v3.8.1) builds with the distro toolchain (g++/C++17) without CMake by
-  compiling the required sources, and `.vst3` bundle loading, `PlugProvider`
-  component/controller creation, parameters, state and audio processing all
-  work. The spike is deliberately kept out of the repository (see `.gitignore`).
-  Remaining work: a format-agnostic plugin trait + model/proto generalisation,
-  the VST3 host in the engine (scan, run, params, state), `IPlugView` GUI
-  hosting, and licensing (VST3 SDK is GPLv3 → an optional `vst3` cargo feature).
+- **VST3 host** (in progress): VST3, not CLAP (CLAP's ecosystem is thin and
+  mostly overlaps LV2; VST2 is discontinued). The SDK (v3.8.1, **MIT-licensed
+  since 3.8** — no copyleft implications) is vendored as a submodule and built
+  without CMake. The node trait, format-tagged model and `vibemix-vst3` host
+  crate are in place; the engine discovers/adds/processes VST3 plugins.
+  Remaining: VST3 parameter metadata + editing, `IPlugView` GUI hosting, and a
+  sandboxed VST3 smoke test before loading untrusted plugins.
 - Qt plugin UIs (and GTK4).
 
 ## Audio backend

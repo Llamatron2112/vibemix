@@ -13,6 +13,7 @@ path = "src/main.rs"
 vibemix-core = { workspace = true }
 vibemix-proto = { workspace = true }
 vibemix-lv2 = { workspace = true }
+vibemix-vst3 = { workspace = true }
 anyhow = { workspace = true }
 clap = { workspace = true }
 serde = { workspace = true }

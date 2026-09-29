@@ -1,8 +1,8 @@
 //! VST3 plugin hosting for vibemix.
 //!
 //! Wraps the Steinberg VST3 SDK hosting helpers behind a small Rust API
-//! (`Host`/`PluginInstance`) that mirrors `vibemix-lv2`. The SDK is GPLv3; this
-//! crate and any build that enables it are therefore GPLv3.
+//! (`Host`/`PluginInstance`) that mirrors `vibemix-lv2`. The SDK is MIT-licensed
+//! (since 3.8; we vendor 3.8.1), so this crate stays under the project license.
 
 mod host;
 

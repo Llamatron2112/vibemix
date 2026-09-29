@@ -24,6 +24,7 @@ rust-version = "1.85"
 vibemix-core = { path = "crates/vibemix-core" }
 vibemix-proto = { path = "crates/vibemix-proto" }
 vibemix-lv2 = { path = "crates/vibemix-lv2" }
+vibemix-vst3 = { path = "crates/vibemix-vst3" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }

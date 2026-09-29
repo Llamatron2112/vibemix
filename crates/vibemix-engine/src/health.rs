@@ -15,7 +15,10 @@ use std::sync::mpsc::{Receiver, TryRecvError};
 
 use serde::{Deserialize, Serialize};
 use vibemix_core::config::config_dir;
-use vibemix_lv2::{PluginInfo, HOST_ABI_VERSION};
+use vibemix_core::model::PluginFormat;
+use vibemix_lv2::HOST_ABI_VERSION;
+
+use crate::catalog::PluginEntry;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "lowercase")]
@@ -86,21 +89,21 @@ impl HealthStore {
         self.loaded_version != HOST_ABI_VERSION || self.entries.is_empty()
     }
 
-    /// URIs the sweep would test (`hostable` mono/stereo plugins).
-    pub fn sweepable<'a>(&self, plugins: &'a [PluginInfo]) -> Vec<&'a str> {
+    /// Ids the sweep would test (`hostable` mono/stereo LV2 plugins).
+    pub fn sweepable<'a>(&self, plugins: &'a [PluginEntry]) -> Vec<&'a str> {
         plugins
             .iter()
-            .filter(|info| sweepable(info))
-            .map(|info| info.uri.as_str())
+            .filter(|entry| sweepable(entry))
+            .map(|entry| entry.id.as_str())
             .collect()
     }
 
     /// Sweepable plugins that have no verdict yet, e.g. newly installed ones.
-    pub fn untested<'a>(&self, plugins: &'a [PluginInfo]) -> Vec<&'a str> {
+    pub fn untested<'a>(&self, plugins: &'a [PluginEntry]) -> Vec<&'a str> {
         plugins
             .iter()
-            .filter(|info| sweepable(info) && !self.entries.contains_key(&info.uri))
-            .map(|info| info.uri.as_str())
+            .filter(|entry| sweepable(entry) && !self.entries.contains_key(&entry.id))
+            .map(|entry| entry.id.as_str())
             .collect()
     }
 
@@ -137,11 +140,11 @@ impl HealthStore {
     }
 }
 
-/// Whether the sweep tests this plugin (hostable mono/stereo audio).
-fn sweepable(info: &PluginInfo) -> bool {
-    info.hostable
-        && ((info.audio_inputs.len() == 2 && info.audio_outputs.len() == 2)
-            || (info.audio_inputs.len() == 1 && info.audio_outputs.len() == 1))
+/// Whether the LV2 sweep tests this plugin (hostable mono/stereo audio).
+fn sweepable(entry: &PluginEntry) -> bool {
+    entry.format == PluginFormat::Lv2
+        && entry.hostable
+        && ((entry.inputs == 2 && entry.outputs == 2) || (entry.inputs == 1 && entry.outputs == 1))
 }
 
 /// One line of the `--scan-plugins` stdout protocol.
@@ -374,22 +377,19 @@ mod tests {
         assert!(store(HOST_ABI_VERSION - 1, stale).is_stale());
     }
 
-    #[allow(clippy::too_many_arguments)]
-    fn plugin(uri: &str, hostable: bool, inputs: usize, outputs: usize) -> PluginInfo {
-        PluginInfo {
-            uri: uri.to_string(),
-            name: uri.to_string(),
-            audio_inputs: (0..inputs).collect(),
-            audio_outputs: (0..outputs).collect(),
-            controls: Vec::new(),
-            atom_inputs: Vec::new(),
-            atom_outputs: Vec::new(),
-            midi_inputs: Vec::new(),
-            time_inputs: Vec::new(),
-            required_features: Vec::new(),
-            optional_features: Vec::new(),
-            hostable,
+    fn plugin(id: &str, hostable: bool, inputs: usize, outputs: usize) -> PluginEntry {
+        PluginEntry {
+            format: PluginFormat::Lv2,
+            id: id.to_string(),
+            name: id.to_string(),
+            bundle: None,
             has_ui: false,
+            inputs,
+            outputs,
+            midi: false,
+            hostable,
+            unsupported: None,
+            controls: Vec::new(),
         }
     }
 

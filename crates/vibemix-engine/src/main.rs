@@ -1,4 +1,5 @@
 mod backend_jack;
+mod catalog;
 mod control;
 mod dsp;
 mod health;
@@ -111,12 +112,14 @@ fn main() -> Result<()> {
     );
 
     let host = Host::new();
+    let vst3 = vibemix_vst3::Host::new();
     let engine = JackEngine::start(
         &args.client_name,
         Arc::clone(&params),
         Arc::clone(&meters),
         args.auto_connect,
         &host,
+        &vst3,
         &mut model,
     )
     .context("start jack engine")?;
@@ -127,8 +130,9 @@ fn main() -> Result<()> {
         "engine running"
     );
 
-    let mut controller = control::Controller::new(args.osc_port, params, meters, model, engine, host)
-        .with_context(|| format!("bind OSC port {}", args.osc_port))?;
+    let mut controller =
+        control::Controller::new(args.osc_port, params, meters, model, engine, host, vst3)
+            .with_context(|| format!("bind OSC port {}", args.osc_port))?;
 
     tracing::info!(
         session = %args.session.as_deref().unwrap_or("default"),

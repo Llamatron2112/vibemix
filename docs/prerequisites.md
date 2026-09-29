@@ -137,8 +137,8 @@ Arch's `pipewire-jack` ships JACK headers, `libjack.so` and `jack.pc` in one pac
 ## Submodules
 
 `vendor/vst3sdk` provides the Steinberg VST3 SDK used by `vibemix-vst3`. It is
-**GPLv3**, so that crate (and any build linking it) is GPLv3. Fetch it and its
-nested submodules with:
+**MIT-licensed** (since SDK 3.8; we vendor 3.8.1), so it does not change the
+project license. Fetch it and its nested submodules with:
 
 ```
 git submodule update --init --recursive vendor/vst3sdk

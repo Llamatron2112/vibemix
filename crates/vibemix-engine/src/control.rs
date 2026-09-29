@@ -13,11 +13,13 @@ use vibemix_core::model::{
     MAX_SEND_DELAY_MS,
 };
 use crate::midi_map::target_from_code;
+use vibemix_core::model::PluginFormat;
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
-use vibemix_lv2::{find_ui, Host, PluginInfo, SharedOutputs, UiCandidate, UiWindow};
+use vibemix_lv2::{find_ui, Host, SharedOutputs, UiCandidate, UiWindow};
 use vibemix_proto::ControlMessage;
 
 use crate::backend_jack::{encode_state, instantiate_slot, JackEngine};
+use crate::catalog::PluginEntry;
 use crate::dsp;
 use crate::health::{HealthStore, Scan, ScanEvent, Status};
 use crate::params::{SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS};
@@ -77,10 +79,12 @@ pub struct Controller {
     model: MixerModel,
     engine: JackEngine,
     host: Host,
+    /// VST3 host (discovery + instantiation).
+    vst3: vibemix_vst3::Host,
     /// Previous lilv worlds, kept alive so plugin instances (and UIs) created
     /// from them stay valid after a rescan swaps in a fresh `host`.
     retired_hosts: Vec<Host>,
-    plugins: Vec<PluginInfo>,
+    plugins: Vec<PluginEntry>,
     catalog_json: String,
     health: HealthStore,
     health_dirty: bool,
@@ -209,12 +213,13 @@ impl Controller {
         model: MixerModel,
         engine: JackEngine,
         host: Host,
+        vst3: vibemix_vst3::Host,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(("127.0.0.1", port))?;
         socket.set_read_timeout(Some(METER_INTERVAL))?;
 
-        let plugins: Vec<PluginInfo> = {
-            let discovered = discover_catalog(&host);
+        let plugins: Vec<PluginEntry> = {
+            let discovered = discover_catalog(&host, &vst3);
             if discovered.is_empty() {
                 load_catalog()
             } else {
@@ -238,6 +243,7 @@ impl Controller {
             model,
             engine,
             host,
+            vst3,
             retired_hosts: Vec::new(),
             plugins,
             catalog_json,
@@ -457,7 +463,7 @@ impl Controller {
 
         if let Err(error) =
             self.engine
-                .rebuild_plugins(&self.host, &mut self.model, &self.params, rate as f64)
+                .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, rate as f64)
         {
             tracing::warn!(%error, "failed to rebuild plugins after sample-rate change");
         }
@@ -878,7 +884,7 @@ impl Controller {
                 self.capture_plugin_states();
                 let old = std::mem::replace(&mut self.host, Host::new());
                 self.retired_hosts.push(old);
-                self.plugins = discover_catalog(&self.host);
+                self.plugins = discover_catalog(&self.host, &self.vst3);
                 if self.plugins.is_empty() {
                     self.plugins = load_catalog();
                 }
@@ -887,7 +893,7 @@ impl Controller {
                 let sample_rate = self.engine.sample_rate() as f64;
                 if let Err(error) =
                     self.engine
-                        .rebuild_plugins(&self.host, &mut self.model, &self.params, sample_rate)
+                        .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, sample_rate)
                 {
                     tracing::warn!(%error, "failed to rebuild plugins after rescan");
                 }
@@ -947,7 +953,7 @@ impl Controller {
                 let sample_rate = self.engine.sample_rate() as f64;
                 match self
                     .engine
-                    .rebuild_plugins(&self.host, &mut model, &self.params, sample_rate)
+                    .rebuild_plugins(&self.host, &self.vst3, &mut model, &self.params, sample_rate)
                 {
                     Ok(()) => {
                         self.uis.clear();
@@ -984,7 +990,7 @@ impl Controller {
                     let sample_rate = self.engine.sample_rate() as f64;
                     match self
                         .engine
-                        .rebuild_plugins(&self.host, &mut loaded, &self.params, sample_rate)
+                        .rebuild_plugins(&self.host, &self.vst3, &mut loaded, &self.params, sample_rate)
                     {
                         Ok(()) => {
                             self.uis.clear();
@@ -1201,7 +1207,7 @@ impl Controller {
                     if let Some(controls) = self
                         .plugins
                         .iter()
-                        .find(|info| info.uri == plugin.uri)
+                        .find(|info| info.id == plugin.uri)
                         .map(|info| info.controls.len().min(MAX_PARAMS))
                     {
                         if plugin.params.len() < controls {
@@ -1227,7 +1233,7 @@ impl Controller {
                 if let Some(controls) = self
                     .plugins
                     .iter()
-                    .find(|info| info.uri == plugin.uri)
+                    .find(|info| info.id == plugin.uri)
                     .map(|info| info.controls.len().min(MAX_PARAMS))
                 {
                     if plugin.params.len() < controls {
@@ -1444,7 +1450,7 @@ impl Controller {
             .or_else(|| {
                 self.plugins
                     .iter()
-                    .find(|info| info.uri == uri)
+                    .find(|info| info.id == uri)
                     .map(|info| info.name.clone())
             })
             .unwrap_or_else(|| uri.clone());
@@ -1462,7 +1468,7 @@ impl Controller {
         let ports: Vec<(u32, usize)> = self
             .plugins
             .iter()
-            .find(|info| info.uri == uri)
+            .find(|info| info.id == uri)
             .map(|info| {
                 info.controls
                     .iter()
@@ -1572,7 +1578,7 @@ impl Controller {
         let Some(control) = self
             .plugins
             .iter()
-            .find(|info| info.uri == uri)
+            .find(|info| info.id == uri)
             .and_then(|info| info.controls.get(param as usize))
         else {
             return value;
@@ -1639,13 +1645,44 @@ impl Controller {
     }
 
     fn add_plugin(&mut self, location: u32, target: u32, uri: &str) -> bool {
-        let Some(info) = self.plugins.iter().find(|info| info.uri == uri).cloned() else {
+        let Some(info) = self.plugins.iter().find(|entry| entry.id == uri).cloned() else {
             tracing::warn!(%uri, "plugin not in catalog");
             return false;
         };
         let mut plugin = PluginSlot::new(plugin_id(0), uri);
+        plugin.format = info.format;
+        plugin.bundle = info.bundle.clone();
         plugin.name = info.name;
-        plugin.params = info.controls.iter().map(|control| control.default).collect();
+        plugin.params = match info.format {
+            PluginFormat::Lv2 => info
+                .controls
+                .iter()
+                .map(|control| control.default)
+                .collect(),
+            // VST3 parameter metadata isn't in the catalog yet; seed the
+            // defaults from a throwaway instance so the DSP starts neutral.
+            PluginFormat::Vst3 => {
+                let sample_rate = self.engine.sample_rate() as f64;
+                let buffer_size = self.engine.buffer_size() as usize;
+                info.bundle
+                    .as_deref()
+                    .and_then(|bundle| {
+                        self.vst3.instantiate(
+                            bundle,
+                            &info.id,
+                            sample_rate,
+                            buffer_size,
+                            vibemix_vst3::PluginInstance::max_frames(),
+                        )
+                    })
+                    .map(|instance| {
+                        (0..instance.control_count())
+                            .map(|param| instance.control_default(param))
+                            .collect()
+                    })
+                    .unwrap_or_default()
+            }
+        };
         self.insert_plugin_slot(location, target, plugin)
     }
 
@@ -1674,14 +1711,16 @@ impl Controller {
             }
         };
 
-        if !self.plugin_is_safe(&plugin.uri) {
+        // LV2 plugins are smoke-tested in a throwaway child. VST3 has no
+        // sandboxed smoke test yet, so adding one instantiates it in-process.
+        if plugin.format == PluginFormat::Lv2 && !self.plugin_is_safe(&plugin.uri) {
             return false;
         }
 
         let sample_rate = self.engine.sample_rate() as f64;
         let buffer_size = self.engine.buffer_size() as usize;
         let Some((slot_plugin, proxy, handle)) =
-            instantiate_slot(&self.host, &plugin, sample_rate, buffer_size)
+            instantiate_slot(&self.host, &self.vst3, &plugin, sample_rate, buffer_size)
         else {
             tracing::warn!(uri = %plugin.uri, "plugin instantiate failed");
             return false;
@@ -1752,7 +1791,7 @@ impl Controller {
         let controls = self
             .plugins
             .iter()
-            .find(|info| info.uri == plugin.uri)
+            .find(|info| info.id == plugin.uri)
             .map(|info| info.controls.len().min(MAX_PARAMS))
             .unwrap_or_else(|| plugin.params.len().min(MAX_PARAMS));
         if plugin.params.len() < controls {
@@ -2031,7 +2070,7 @@ impl Controller {
             let sample_rate = self.engine.sample_rate() as f64;
             if let Err(error) =
                 self.engine
-                    .rebuild_plugins(&self.host, &mut self.model, &self.params, sample_rate)
+                    .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, sample_rate)
             {
                 tracing::warn!(%error, "failed to rebuild plugins on undo");
             }
@@ -2550,38 +2589,39 @@ const SUPPORTED_REQUIRED_FEATURES: &[&str] = &[
     "http://lv2plug.in/ns/ext/options#options",
 ];
 
-fn unsupported_required_feature(info: &PluginInfo) -> Option<&str> {
+fn unsupported_required_feature(info: &vibemix_lv2::PluginInfo) -> Option<String> {
     info.required_features
         .iter()
         .map(String::as_str)
         .find(|feature| !SUPPORTED_REQUIRED_FEATURES.contains(feature))
+        .map(|feature| format!("requires {}", short_feature(feature)))
 }
 
 fn short_feature(uri: &str) -> &str {
     uri.rsplit(['#', '/']).next().unwrap_or(uri)
 }
 
-fn build_catalog(plugins: &[PluginInfo], health: &HealthStore) -> String {
+fn build_catalog(plugins: &[PluginEntry], health: &HealthStore) -> String {
     let list: Vec<serde_json::Value> = plugins
         .iter()
-        .map(|info| {
-            let (status, reason) = if let Some(feature) = unsupported_required_feature(info) {
-                (Some("unsupported"), format!("requires {}", short_feature(feature)))
-            } else if !info.hostable {
+        .map(|entry| {
+            let (status, reason) = if let Some(reason) = &entry.unsupported {
+                (Some("unsupported"), reason.clone())
+            } else if !entry.hostable {
                 (Some("unsupported"), "unsupported port layout".to_string())
-            } else if let Some(verdict) = health.get(&info.uri) {
+            } else if let Some(verdict) = health.get(&entry.id) {
                 (Some(verdict.status.as_str()), verdict.reason.clone())
             } else {
                 (None, String::new())
             };
             serde_json::json!({
-                "uri": info.uri,
-                "format": "lv2",
-                "name": info.name,
-                "has_ui": info.has_ui,
-                "inputs": info.audio_inputs.len(),
-                "outputs": info.audio_outputs.len(),
-                "midi": !info.midi_inputs.is_empty(),
+                "uri": entry.id,
+                "format": entry.format.as_str(),
+                "name": entry.name,
+                "has_ui": entry.has_ui,
+                "inputs": entry.inputs,
+                "outputs": entry.outputs,
+                "midi": entry.midi,
                 "status": status,
                 "reason": reason,
             })
@@ -2590,16 +2630,48 @@ fn build_catalog(plugins: &[PluginInfo], health: &HealthStore) -> String {
     serde_json::Value::Array(list).to_string()
 }
 
-/// Mono/stereo audio plugins, in catalog order. Non-hostable entries are kept
-/// so they can be shown as unsupported in the picker.
-fn discover_catalog(host: &Host) -> Vec<PluginInfo> {
-    host.discover()
+/// Mono/stereo LV2 plugins plus every VST3 effect, in catalog order.
+fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> {
+    let mut entries: Vec<PluginEntry> = host
+        .discover()
         .into_iter()
         .filter(|info| {
             (info.audio_inputs.len() == 2 && info.audio_outputs.len() == 2)
                 || (info.audio_inputs.len() == 1 && info.audio_outputs.len() == 1)
         })
-        .collect()
+        .map(|info| {
+            let unsupported = unsupported_required_feature(&info);
+            PluginEntry {
+                format: PluginFormat::Lv2,
+                id: info.uri,
+                name: info.name,
+                bundle: None,
+                has_ui: info.has_ui,
+                inputs: info.audio_inputs.len(),
+                outputs: info.audio_outputs.len(),
+                midi: !info.midi_inputs.is_empty(),
+                hostable: info.hostable,
+                unsupported,
+                controls: info.controls,
+            }
+        })
+        .collect();
+    for info in vst3.discover() {
+        entries.push(PluginEntry {
+            format: PluginFormat::Vst3,
+            id: info.class_id,
+            name: info.name,
+            bundle: Some(info.bundle),
+            has_ui: false,
+            inputs: 0,
+            outputs: 0,
+            midi: false,
+            hostable: true,
+            unsupported: None,
+            controls: Vec::new(),
+        });
+    }
+    entries
 }
 
 fn catalog_path() -> std::path::PathBuf {
@@ -2608,13 +2680,24 @@ fn catalog_path() -> std::path::PathBuf {
 
 #[derive(serde::Serialize, serde::Deserialize)]
 struct CatalogEntry {
-    uri: String,
+    #[serde(alias = "uri")]
+    id: String,
     name: String,
     #[serde(default)]
+    format: PluginFormat,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    bundle: Option<String>,
+    #[serde(default)]
     has_ui: bool,
+    #[serde(default)]
+    inputs: usize,
+    #[serde(default)]
+    outputs: usize,
+    #[serde(default)]
+    midi: bool,
 }
 
-fn load_catalog() -> Vec<PluginInfo> {
+fn load_catalog() -> Vec<PluginEntry> {
     let Ok(text) = fs::read_to_string(catalog_path()) else {
         return Vec::new();
     };
@@ -2623,31 +2706,34 @@ fn load_catalog() -> Vec<PluginInfo> {
     };
     entries
         .into_iter()
-        .map(|entry| PluginInfo {
-            uri: entry.uri,
+        .map(|entry| PluginEntry {
+            format: entry.format,
+            id: entry.id,
             name: entry.name,
+            bundle: entry.bundle,
             has_ui: entry.has_ui,
-            audio_inputs: Vec::new(),
-            audio_outputs: Vec::new(),
-            controls: Vec::new(),
-            atom_inputs: Vec::new(),
-            atom_outputs: Vec::new(),
-            midi_inputs: Vec::new(),
-            time_inputs: Vec::new(),
-            required_features: Vec::new(),
-            optional_features: Vec::new(),
+            inputs: entry.inputs,
+            outputs: entry.outputs,
+            midi: entry.midi,
             hostable: true,
+            unsupported: None,
+            controls: Vec::new(),
         })
         .collect()
 }
 
-fn save_catalog(plugins: &[PluginInfo]) {
+fn save_catalog(plugins: &[PluginEntry]) {
     let entries: Vec<CatalogEntry> = plugins
         .iter()
-        .map(|info| CatalogEntry {
-            uri: info.uri.clone(),
-            name: info.name.clone(),
-            has_ui: info.has_ui,
+        .map(|entry| CatalogEntry {
+            id: entry.id.clone(),
+            name: entry.name.clone(),
+            format: entry.format,
+            bundle: entry.bundle.clone(),
+            has_ui: entry.has_ui,
+            inputs: entry.inputs,
+            outputs: entry.outputs,
+            midi: entry.midi,
         })
         .collect();
     let Ok(text) = serde_json::to_string_pretty(&entries) else {
@@ -2662,16 +2748,16 @@ fn save_catalog(plugins: &[PluginInfo]) {
 
 fn plugin_list_json<F: Fn(usize, usize) -> f32>(
     plugins: &[PluginSlot],
-    catalog: &[PluginInfo],
+    catalog: &[PluginEntry],
     param_value: F,
 ) -> Vec<serde_json::Value> {
     plugins
         .iter()
         .enumerate()
         .map(|(slot, plugin)| {
-            let info = catalog.iter().find(|info| info.uri == plugin.uri);
-            let controls = info.map(|info| info.controls.as_slice()).unwrap_or(&[]);
-            let has_ui = info.map(|info| info.has_ui).unwrap_or(false);
+            let info = catalog.iter().find(|entry| entry.id == plugin.uri);
+            let controls = info.map(|entry| entry.controls.as_slice()).unwrap_or(&[]);
+            let has_ui = info.map(|entry| entry.has_ui).unwrap_or(false);
             let control_list: Vec<serde_json::Value> = controls
                 .iter()
                 .enumerate()
@@ -2712,7 +2798,7 @@ fn plugin_list_json<F: Fn(usize, usize) -> f32>(
 fn build_state_json(
     model: &MixerModel,
     params: &SharedParams,
-    plugins: &[PluginInfo],
+    plugins: &[PluginEntry],
     sample_rate: u32,
     xruns: u64,
 ) -> String {

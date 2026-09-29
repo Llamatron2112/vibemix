@@ -7,7 +7,7 @@ use jack::{
     ProcessHandler, ProcessScope, Unowned,
 };
 use rtrb::{Consumer, Producer};
-use vibemix_core::model::{BusConnections, MixerModel, PluginSlot, StripConnections};
+use vibemix_core::model::{BusConnections, MixerModel, PluginFormat, PluginSlot, StripConnections};
 use vibemix_lv2::{Host, MidiEvent, PluginInstance, SharedOutputs, StateEntry, StateProxy};
 
 use crate::plugin::PluginNode;
@@ -62,8 +62,8 @@ impl SlotPlugin {
     /// For mono plugins hosted as stereo the first instance is used.
     fn outputs(&self) -> Option<Arc<SharedOutputs>> {
         match self {
-            SlotPlugin::Stereo(instance) => Some(instance.outputs()),
-            SlotPlugin::Mono(left, _) => Some(left.outputs()),
+            SlotPlugin::Stereo(instance) => instance.outputs(),
+            SlotPlugin::Mono(left, _) => left.outputs(),
             SlotPlugin::Missing => None,
         }
     }
@@ -908,7 +908,8 @@ impl JackEngine {
         params: Arc<SharedParams>,
         meters: Arc<SharedMeters>,
         auto_connect: bool,
-        host: &Host,
+        lv2: &Host,
+        vst3: &vibemix_vst3::Host,
         model: &mut MixerModel,
     ) -> Result<Self> {
         let (client, _status) = Client::new(client_name, ClientOptions::NO_START_SERVER)?;
@@ -923,7 +924,7 @@ impl JackEngine {
         let max_delay_samples =
             (vibemix_core::model::MAX_SEND_DELAY_MS as f64 / 1000.0 * sample_rate).ceil() as usize + 1;
 
-        let built = build_chains(host, model, strip_count, bus_count, sample_rate, buffer_size, &params);
+        let built = build_chains(lv2, vst3, model, strip_count, bus_count, sample_rate, buffer_size, &params);
         let Built {
             strip_chains: plugin_chains,
             strip_proxies: state_proxies,
@@ -1807,14 +1808,16 @@ impl JackEngine {
 
     pub fn rebuild_plugins(
         &mut self,
-        host: &Host,
+        lv2: &Host,
+        vst3: &vibemix_vst3::Host,
         model: &mut MixerModel,
         params: &SharedParams,
         sample_rate: f64,
     ) -> Result<()> {
         let buffer_size = self.buffer_size() as usize;
         let built = build_chains(
-            host,
+            lv2,
+            vst3,
             model,
             self.strip_count,
             self.bus_count,
@@ -1871,6 +1874,52 @@ fn set_bus_controls(
 }
 
 pub fn instantiate_slot(
+    lv2: &Host,
+    vst3: &vibemix_vst3::Host,
+    plugin: &PluginSlot,
+    sample_rate: f64,
+    buffer_size: usize,
+) -> Option<(SlotPlugin, Option<StateProxy>, usize)> {
+    match plugin.format {
+        PluginFormat::Lv2 => instantiate_lv2(lv2, plugin, sample_rate, buffer_size),
+        PluginFormat::Vst3 => {
+            let slot_plugin = instantiate_vst3(vst3, plugin, sample_rate, buffer_size)?;
+            Some((slot_plugin, None, 0))
+        }
+    }
+}
+
+fn instantiate_vst3(
+    vst3: &vibemix_vst3::Host,
+    plugin: &PluginSlot,
+    sample_rate: f64,
+    buffer_size: usize,
+) -> Option<SlotPlugin> {
+    let bundle = plugin.bundle.as_deref()?;
+    let open = |vst3: &vibemix_vst3::Host| {
+        vst3.instantiate(
+            bundle,
+            &plugin.uri,
+            sample_rate,
+            buffer_size,
+            vibemix_vst3::PluginInstance::max_frames(),
+        )
+    };
+    let first = open(vst3)?;
+    match (first.audio_input_count(), first.audio_output_count()) {
+        (2, 2) => Some(SlotPlugin::Stereo(Box::new(first) as Box<dyn PluginNode>)),
+        (1, 1) => {
+            let second = open(vst3)?;
+            Some(SlotPlugin::Mono(
+                Box::new(first) as Box<dyn PluginNode>,
+                Box::new(second) as Box<dyn PluginNode>,
+            ))
+        }
+        _ => None,
+    }
+}
+
+fn instantiate_lv2(
     host: &Host,
     plugin: &PluginSlot,
     sample_rate: f64,
@@ -1904,8 +1953,10 @@ pub fn instantiate_slot(
     Some((slot_plugin, proxy, handle))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn build_chains(
-    host: &Host,
+    lv2: &Host,
+    vst3: &vibemix_vst3::Host,
     model: &mut MixerModel,
     strip_count: usize,
     bus_count: usize,
@@ -1946,7 +1997,7 @@ fn build_chains(
             let mut kept = Vec::new();
             for mut plugin in list.drain(..).take(MAX_PLUGINS) {
                 let slot = strip_chains[index][chain].len();
-                match instantiate_slot(host, &plugin, sample_rate, buffer_size) {
+                match instantiate_slot(lv2, vst3, &plugin, sample_rate, buffer_size) {
                     Some((slot_plugin, proxy, handle)) => {
                         plugin.missing = false;
                         let controls = controls_of(&slot_plugin);
@@ -1988,7 +2039,7 @@ fn build_chains(
         let mut kept = Vec::new();
         for mut plugin in bus.plugins.drain(..).take(MAX_PLUGINS) {
             let slot = bus_chains[index].len();
-            match instantiate_slot(host, &plugin, sample_rate, buffer_size) {
+            match instantiate_slot(lv2, vst3, &plugin, sample_rate, buffer_size) {
                 Some((slot_plugin, proxy, handle)) => {
                     plugin.missing = false;
                     let controls = controls_of(&slot_plugin);

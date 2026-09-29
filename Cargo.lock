@@ -1029,6 +1029,7 @@ dependencies = [
  "vibemix-core",
  "vibemix-lv2",
  "vibemix-proto",
+ "vibemix-vst3",
 ]
 
 [[package]]

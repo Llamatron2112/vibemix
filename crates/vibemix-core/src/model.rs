@@ -28,6 +28,9 @@ pub struct PluginSlot {
     pub uri: String,
     #[serde(default)]
     pub format: PluginFormat,
+    /// `.vst3` bundle path (VST3 only; unused by LV2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<String>,
     #[serde(default)]
     pub name: String,
     #[serde(default)]
@@ -55,6 +58,7 @@ impl PluginSlot {
             id,
             uri: uri.into(),
             format: PluginFormat::Lv2,
+            bundle: None,
             name: String::new(),
             params: Vec::new(),
             state: String::new(),
