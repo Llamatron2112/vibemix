@@ -31,8 +31,15 @@ Deferred ideas and follow-ups that are not part of the current roadmap
 
 ## Plugins / hosting
 
-- Phase 7: additional plugin formats behind a format-agnostic host trait (CLAP
-  first; VST3 has GPLv3 SDK implications; VST2 not planned).
+- **VST3 host** (next milestone): VST3, not CLAP (CLAP's ecosystem is thin and
+  mostly overlaps LV2; VST2 is discontinued). A feasibility spike succeeded —
+  the SDK (v3.8.1) builds with the distro toolchain (g++/C++17) without CMake by
+  compiling the required sources, and `.vst3` bundle loading, `PlugProvider`
+  component/controller creation, parameters, state and audio processing all
+  work. The spike is deliberately kept out of the repository (see `.gitignore`).
+  Remaining work: a format-agnostic plugin trait + model/proto generalisation,
+  the VST3 host in the engine (scan, run, params, state), `IPlugView` GUI
+  hosting, and licensing (VST3 SDK is GPLv3 → an optional `vst3` cargo feature).
 - Qt plugin UIs (and GTK4).
 
 ## Audio backend

@@ -15,3 +15,7 @@ packaging/arch/
 *.iml
 .DS_Store
 *~
+
+# Local VST3 feasibility spike (vendors the Steinberg SDK); kept out of the
+# repository on purpose.
+spikes/0d-vst3-host/
