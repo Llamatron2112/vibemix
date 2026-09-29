@@ -69,6 +69,14 @@ extern "C" {
     fn vst3_set_param(handle: *mut c_void, index: c_int, normalized: f32);
     fn vst3_get_param(handle: *mut c_void, index: c_int) -> f32;
     fn vst3_run(handle: *mut c_void, frames: c_int);
+    fn vst3_status(
+        handle: *mut c_void,
+        setup: *mut c_int,
+        active: *mut c_int,
+        processing: *mut c_int,
+        last: *mut c_int,
+    ) -> c_int;
+    fn vst3_bus_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_save_state(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_load_state(handle: *mut c_void, data: *const c_char, len: c_int);
 }
@@ -311,6 +319,33 @@ impl PluginInstance {
 
     pub fn load_state(&mut self, state: &[u8]) {
         restore_blob(self.handle, state);
+    }
+
+    /// Setup/`process` tresults: `(setup, active, processing, last_process)`.
+    pub fn status(&self) -> (i32, i32, i32, i32) {
+        let (mut setup, mut active, mut processing, mut last) = (0, 0, 0, 0);
+        unsafe {
+            vst3_status(
+                self.handle,
+                &mut setup,
+                &mut active,
+                &mut processing,
+                &mut last,
+            )
+        };
+        (setup, active, processing, last)
+    }
+
+    /// Short description of the component's audio buses (for diagnostics).
+    pub fn bus_info(&self) -> String {
+        let mut buf = [0i8; 256];
+        let ok = unsafe { vst3_bus_info(self.handle, buf.as_mut_ptr(), buf.len() as c_int) };
+        if ok == 0 {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
     }
 
     /// A handle for saving/restoring state from another thread (the control

@@ -54,6 +54,10 @@ struct Args {
     #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "CLASS"])]
     smoke_vst3: Vec<String>,
 
+    /// Probe a VST3 plugin's audio path: `--probe-vst3 <bundle> <class-id>`.
+    #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "CLASS"])]
+    probe_vst3: Vec<String>,
+
     /// Verbose plugin diagnostics (also via VIBEMIX_DEBUG=1).
     #[arg(long)]
     debug: bool,
@@ -88,6 +92,9 @@ fn main() -> Result<()> {
     }
     if args.smoke_vst3.len() == 2 {
         run_smoke_vst3(&args.smoke_vst3[0], &args.smoke_vst3[1]);
+    }
+    if args.probe_vst3.len() == 2 {
+        run_probe_vst3(&args.probe_vst3[0], &args.probe_vst3[1]);
     }
     if args.scan_plugins {
         let only = (!args.only.is_empty()).then_some(args.only);
@@ -158,6 +165,79 @@ fn run_smoke(uri: &str) -> ! {
 fn run_smoke_vst3(bundle: &str, class_id: &str) -> ! {
     smoke::disable_core_dumps();
     std::process::exit(smoke::smoke_plugin_vst3(bundle, class_id));
+}
+
+/// Feeds a sine through a VST3 plugin and reports the output peak per block, so
+/// we can tell whether a plugin is silent or the graph drops its audio.
+fn run_probe_vst3(bundle: &str, class_id: &str) -> ! {
+    let host = vibemix_vst3::Host::new();
+    let sample_rate = 48_000.0f64;
+    let block = 512usize;
+    let Some(mut instance) = host.instantiate(
+        bundle,
+        class_id,
+        sample_rate,
+        block,
+        vibemix_vst3::PluginInstance::max_frames(),
+    ) else {
+        eprintln!("probe: instantiate failed");
+        std::process::exit(1);
+    };
+    let in_ch = instance.audio_input_count();
+    let out_ch = instance.audio_output_count();
+    let params = instance.control_count();
+    let set_all = std::env::var_os("VIBEMIX_PROBE_PARAMS").is_some();
+    let (setup, active, processing, _) = instance.status();
+    eprintln!(
+        "probe: in={in_ch} out={out_ch} params={params} set_all={set_all} \
+         setup={setup} active={active} processing={processing} buses={}",
+        instance.bus_info()
+    );
+
+    for param in 0..params {
+        eprintln!(
+            "probe:   [{param}] {:?} default={} stage={} flags={}",
+            instance.control_name(param),
+            instance.control_default(param),
+            instance.controls()[param].step_count,
+            instance.controls()[param].flags,
+        );
+    }
+
+    let defaults: Vec<f32> = (0..params).map(|p| instance.control_default(p)).collect();
+    let mut phase = 0.0f32;
+    let step = 2.0 * std::f32::consts::PI * 440.0 / sample_rate as f32;
+    let mut last_peak = 0.0f32;
+    for block_index in 0..64 {
+        if set_all {
+            for (param, value) in defaults.iter().enumerate() {
+                instance.set_control(param, *value);
+            }
+        }
+        for channel in 0..in_ch {
+            for sample in instance.input_buffer_mut(channel)[..block].iter_mut() {
+                *sample = phase.sin() * 0.5;
+                phase += step;
+                if phase > std::f32::consts::TAU {
+                    phase -= std::f32::consts::TAU;
+                }
+            }
+        }
+        instance.run(block);
+        let mut peak = 0.0f32;
+        for channel in 0..out_ch {
+            for sample in instance.output_buffer(channel)[..block].iter() {
+                peak = peak.max(sample.abs());
+            }
+        }
+        last_peak = peak;
+        if block_index < 4 || block_index % 16 == 0 {
+            eprintln!("probe: block {block_index} out_peak={peak}");
+        }
+    }
+    let (_, _, _, last) = instance.status();
+    eprintln!("probe: final out_peak={last_peak} last_process={last}");
+    std::process::exit(0);
 }
 
 fn run_smoke_ui(uri: &str) -> ! {

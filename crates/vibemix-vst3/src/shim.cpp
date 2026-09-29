@@ -82,6 +82,22 @@ bool parse_uid(const char* hex, VST3::UID& uid) {
     return true;
 }
 
+/// Minimal IComponentHandler: many plugins expect the host to provide one.
+class ComponentHandler : public IComponentHandler {
+public:
+    ComponentHandler() { FUNKNOWN_CTOR }
+    ~ComponentHandler() noexcept { FUNKNOWN_DTOR }
+
+    tresult PLUGIN_API beginEdit(ParamID) SMTG_OVERRIDE { return kResultOk; }
+    tresult PLUGIN_API performEdit(ParamID, ParamValue) SMTG_OVERRIDE { return kResultOk; }
+    tresult PLUGIN_API endEdit(ParamID) SMTG_OVERRIDE { return kResultOk; }
+    tresult PLUGIN_API restartComponent(int32) SMTG_OVERRIDE { return kResultOk; }
+
+    DECLARE_FUNKNOWN_METHODS
+};
+
+IMPLEMENT_FUNKNOWN_METHODS(ComponentHandler, IComponentHandler, IComponentHandler::iid)
+
 struct Hosted {
     Hosted(Hosting::Module::Ptr m, Hosting::PluginFactory f)
         : module(std::move(m)), factory(std::move(f)) {}
@@ -93,6 +109,7 @@ struct Hosted {
     IPtr<IComponent> component;
     IPtr<IEditController> controller;
     IPtr<IAudioProcessor> processor;
+    IPtr<ComponentHandler> component_handler;
     int32 in_channels = 0;
     int32 out_channels = 0;
     std::vector<float*> in_ptrs;
@@ -102,6 +119,10 @@ struct Hosted {
     EventList events;
     ProcessContext context {};
     bool active = false;
+    tresult setup_result = kResultOk;
+    tresult active_result = kResultOk;
+    tresult processing_result = kResultOk;
+    tresult last_result = kResultOk;
 };
 
 } // namespace
@@ -182,6 +203,10 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     }
     hosted->component = hosted->provider->getComponentPtr();
     hosted->controller = hosted->provider->getControllerPtr();
+    if (hosted->controller) {
+        hosted->component_handler = new ComponentHandler();
+        hosted->controller->setComponentHandler(hosted->component_handler);
+    }
     if (!hosted->component) {
         delete hosted;
         return nullptr;
@@ -194,19 +219,40 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     }
 
     BusInfo bus {};
+    const int32 in_buses = hosted->component->getBusCount(kAudio, kInput);
+    const int32 out_buses = hosted->component->getBusCount(kAudio, kOutput);
     hosted->in_channels =
         (hosted->component->getBusInfo(kAudio, kInput, 0, bus) == kResultOk) ? bus.channelCount : 0;
     hosted->out_channels =
         (hosted->component->getBusInfo(kAudio, kOutput, 0, bus) == kResultOk) ? bus.channelCount : 0;
+
+    // Ask for the layout we will actually deliver (mono/stereo on bus 0), so
+    // plugins that require an explicit arrangement configure correctly.
+    const int32 num_arr_in = in_buses > 0 ? in_buses : 0;
+    const int32 num_arr_out = out_buses > 0 ? out_buses : 0;
+    if (num_arr_in > 0 && num_arr_out > 0) {
+        std::vector<SpeakerArrangement> arr_in(num_arr_in, SpeakerArr::kEmpty);
+        std::vector<SpeakerArrangement> arr_out(num_arr_out, SpeakerArr::kEmpty);
+        arr_in[0] = hosted->in_channels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
+        arr_out[0] = hosted->out_channels == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
+        hosted->processor->setBusArrangements(arr_in.data(), num_arr_in, arr_out.data(),
+                                              num_arr_out);
+    }
 
     ProcessSetup setup {};
     setup.processMode = kRealtime;
     setup.symbolicSampleSize = kSample32;
     setup.maxSamplesPerBlock = block_size > 0 ? block_size : 512;
     setup.sampleRate = sample_rate;
-    hosted->processor->setupProcessing(setup);
-    hosted->component->setActive(true);
-    hosted->processor->setProcessing(true);
+    hosted->setup_result = hosted->processor->setupProcessing(setup);
+    hosted->active_result = hosted->component->setActive(true);
+
+    // Buses are nominally active after setActive, but some plugins (e.g. JUCE's
+    // wrapper) only route audio for buses the host explicitly activates.
+    if (in_buses > 0) hosted->component->activateBus(kAudio, kInput, 0, true);
+    if (out_buses > 0) hosted->component->activateBus(kAudio, kOutput, 0, true);
+
+    hosted->processing_result = hosted->processor->setProcessing(true);
     hosted->active = true;
 
     hosted->in_ptrs.assign(hosted->in_channels, nullptr);
@@ -324,10 +370,44 @@ void vst3_run(void* handle, int frames) {
     data.inputEvents = &hosted->events;
     data.processContext = &hosted->context;
 
-    hosted->processor->process(data);
+    hosted->last_result = hosted->processor->process(data);
     hosted->changes.clearQueue();
     hosted->out_changes.clearQueue();
     hosted->events.clear();
+}
+
+/// Writes a short description of the component's audio buses to `out`.
+int vst3_bus_info(void* handle, char* out, int cap) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted || !hosted->component || !out || cap <= 0) return 0;
+    std::string text;
+    const int32 in_buses = hosted->component->getBusCount(kAudio, kInput);
+    const int32 out_buses = hosted->component->getBusCount(kAudio, kOutput);
+    for (int32 i = 0; i < in_buses; ++i) {
+        BusInfo bus {};
+        if (hosted->component->getBusInfo(kAudio, kInput, i, bus) == kResultOk)
+            text += " in" + std::to_string(i) + "=" + std::to_string(bus.channelCount)
+                    + (bus.busType == BusTypes::kMain ? "m" : "a");
+    }
+    for (int32 i = 0; i < out_buses; ++i) {
+        BusInfo bus {};
+        if (hosted->component->getBusInfo(kAudio, kOutput, i, bus) == kResultOk)
+            text += " out" + std::to_string(i) + "=" + std::to_string(bus.channelCount)
+                    + (bus.busType == BusTypes::kMain ? "m" : "a");
+    }
+    std::snprintf(out, cap, "%s", text.c_str());
+    return 1;
+}
+
+/// Reports the tresults captured during setup and the last `process` call.
+int vst3_status(void* handle, int* setup, int* active, int* processing, int* last) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted) return 0;
+    if (setup) *setup = static_cast<int>(hosted->setup_result);
+    if (active) *active = static_cast<int>(hosted->active_result);
+    if (processing) *processing = static_cast<int>(hosted->processing_result);
+    if (last) *last = static_cast<int>(hosted->last_result);
+    return 1;
 }
 
 /// Writes the component state to `out`; returns the byte count (or -1).
