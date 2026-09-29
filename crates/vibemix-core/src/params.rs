@@ -13,8 +13,8 @@ pub fn linear_to_db(linear: f32) -> f32 {
     20.0 * linear.abs().max(DB_FLOOR_LINEAR).log10()
 }
 
-/// Input trim range for strips, in dB.
-pub const TRIM_MIN_DB: f32 = -20.0;
+/// Input trim range for strips, in dB (symmetric so unity sits in the middle).
+pub const TRIM_MIN_DB: f32 = -24.0;
 pub const TRIM_MAX_DB: f32 = 24.0;
 
 /// Clamps an input trim value to the supported range.

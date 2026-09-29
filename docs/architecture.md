@@ -75,7 +75,7 @@ runtime still just toggles `active` slots for the mixer graph. Audio flow:
 strip inputs -> [input trim] -> [pre-fader inserts] -> [fader/pan/mute/solo] -> [post-fader inserts] -> sends[] -> bus accumulators -> [bus gain/mute] -> bus outputs
 ```
 
-Each strip has a dB input trim (`-20..+24 dB`, unity at 0) applied before the
+Each strip has a dB input trim (`-24..+24 dB`, unity at 0) applied before the
 plugin chain, so a low input can be brought up to a plugin's operating level (and
 hot inputs attenuated). All levels are measured as **peak dBFS** (`20·log10`);
 the strip has three meter taps — `in` (raw input), `gain` (post-trim, pre-plugin)
@@ -330,7 +330,7 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/strip/mute` | `int strip, int mute` |
 | `/vibemix/strip/solo` | `int strip, int solo` |
 | `/vibemix/strip/pan` | `int strip, float pan` |
-| `/vibemix/strip/input_gain` | `int strip, float db` (input trim, `-20..+24 dB`) |
+| `/vibemix/strip/input_gain` | `int strip, float db` (input trim, `-24..+24 dB`) |
 | `/vibemix/strip/name` | `int strip, string name` |
 | `/vibemix/strip/add` | none |
 | `/vibemix/strip/remove` | `int strip` |

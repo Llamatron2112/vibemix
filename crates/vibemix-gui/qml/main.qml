@@ -22,7 +22,7 @@ ApplicationWindow {
         id: backend
     }
 
-    readonly property int stripBody: 60
+    readonly property int stripBody: 76
     readonly property int pluginRowHeight: 18
     readonly property int pluginFrame: pluginRowHeight * 2 + 6
     readonly property color accentColor: palette.highlight
@@ -1217,7 +1217,7 @@ ApplicationWindow {
         }
 
         Rectangle {
-            width: root.stripBody
+            width: parent.width
             height: root.pluginFrame
             color: Qt.rgba(root.textColor.r, root.textColor.g, root.textColor.b, 0.04)
             border.color: root.borderColor
@@ -1303,7 +1303,10 @@ ApplicationWindow {
                         onClicked: (mouse) => {
                             if (mouse.button === Qt.RightButton) {
                                 pluginMenu.popup()
-                            } else {
+                            }
+                        }
+                        onDoubleClicked: (mouse) => {
+                            if (mouse.button === Qt.LeftButton) {
                                 root.openPluginGui(pluginListRoot.location, pluginListRoot.target, pluginRow.pluginData.slot)
                             }
                         }
@@ -2073,6 +2076,218 @@ ApplicationWindow {
         }
     }
 
+    // Horizontal slider whose fill grows out of a `reference` point (e.g. 0 dB
+    // trim, centred pan, unity send/return), so the neutral value sits in the
+    // middle of the track. Shares the Knob's value-entry/tooltip behaviour.
+    component MiniSlider: Item {
+        id: mini
+        property real from: -1
+        property real to: 1
+        property real value: 0
+        property real liveValue: 0
+        property real reference: (from + to) / 2
+        property real resetValue: reference
+        property bool dragging: false
+        property string valueText: ""
+        property string entryUnit: "linear"
+        readonly property bool interacting: mini.dragging || valueTimer.running
+        readonly property real displayValue: mini.interacting ? mini.liveValue : mini.value
+        readonly property string shownValueText: {
+            if (!mini.interacting) return mini.valueText
+            if (entryUnit === "pan") return root.panText(mini.liveValue)
+            if (entryUnit === "db") return root.trimText(mini.liveValue)
+            if (entryUnit === "gain-db") return root.gainText(mini.liveValue)
+            return Number(mini.liveValue).toFixed(3)
+        }
+        signal moved(real value)
+
+        implicitWidth: 60
+        implicitHeight: 14
+
+        onValueChanged: if (!mini.interacting) mini.liveValue = mini.value
+        onInteractingChanged: if (!mini.interacting) mini.liveValue = mini.value
+        Component.onCompleted: mini.liveValue = mini.value
+
+        function bump() { valueTimer.restart() }
+        function clamp01(v) { return Math.max(0, Math.min(1, isNaN(v) ? 0 : v)) }
+        function entryLabel() {
+            if (entryUnit === "pan") return "pan"
+            if (entryUnit === "db") return "trim"
+            if (entryUnit === "gain-db") return "gain"
+            return "value"
+        }
+        function entryFrom() {
+            if (entryUnit === "gain-db") return -60
+            if (entryUnit === "pan") return -1
+            return from
+        }
+        function entryTo() {
+            if (entryUnit === "gain-db") return root.gainToDb(Math.max(to, 1.0e-6))
+            if (entryUnit === "pan") return 1
+            return to
+        }
+        function entryFormat(v) {
+            if (entryUnit === "gain-db") return root.gainToDb(v).toFixed(1)
+            if (entryUnit === "pan") return root.panText(v)
+            if (entryUnit === "db") return (v >= 0 ? "+" : "") + Number(v).toFixed(1)
+            return Number(v).toFixed(3)
+        }
+        function entryParse(t) {
+            if (entryUnit === "gain-db") {
+                var db = Number(t)
+                return isNaN(db) ? NaN : root.dbToGain(db)
+            }
+            if (entryUnit === "pan") return root.panFromText(t)
+            return Number(t)
+        }
+        function setFromX(px) {
+            var span = mini.to - mini.from
+            var next = Math.max(mini.from, Math.min(mini.to, mini.from + px / track.width * span))
+            mini.liveValue = next
+            mini.moved(next)
+        }
+
+        Timer { id: valueTimer; interval: 700 }
+
+        readonly property real normalized: mini.clamp01((mini.displayValue - mini.from) / (mini.to - mini.from))
+        readonly property real referenceNorm: mini.clamp01((mini.reference - mini.from) / (mini.to - mini.from))
+
+        Rectangle {
+            id: track
+            anchors.fill: parent
+            color: root.meterBack
+            border.color: root.borderColor
+            border.width: 1
+        }
+
+        // Reference tick (the neutral value).
+        Rectangle {
+            x: Math.round(mini.referenceNorm * (track.width - 1))
+            width: 1
+            height: track.height
+            color: root.borderColor
+        }
+
+        // Fill from the reference to the current value.
+        Rectangle {
+            anchors.verticalCenter: track.verticalCenter
+            height: track.height - 4
+            color: root.accentColor
+            x: Math.min(mini.referenceNorm, mini.normalized) * track.width + 1
+            width: Math.abs(mini.normalized - mini.referenceNorm) * (track.width - 2)
+        }
+
+        Rectangle {
+            id: thumb
+            width: 6
+            height: track.height
+            x: mini.normalized * (track.width - thumb.width)
+            color: mini.dragging ? Qt.lighter(root.controlColor, 1.2) : root.controlColor
+            border.color: mini.dragging ? root.accentColor : root.borderColor
+            border.width: 1
+        }
+
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.LeftButton
+            preventStealing: true
+            onPressed: (mouse) => {
+                mini.liveValue = mini.value
+                mini.dragging = true
+                mini.setFromX(mouse.x)
+                mini.bump()
+            }
+            onPositionChanged: (mouse) => {
+                if (mini.dragging) {
+                    mini.setFromX(mouse.x)
+                    mini.bump()
+                }
+            }
+            onReleased: mini.dragging = false
+            onCanceled: mini.dragging = false
+            onDoubleClicked: {
+                mini.liveValue = mini.resetValue
+                mini.moved(mini.resetValue)
+                mini.bump()
+            }
+        }
+
+        TapHandler {
+            acceptedButtons: Qt.RightButton
+            onSingleTapped: miniMenu.popup()
+        }
+
+        TapHandler {
+            acceptedModifiers: Qt.ControlModifier
+            onSingleTapped: {
+                mini.liveValue = mini.resetValue
+                mini.moved(mini.resetValue)
+                mini.bump()
+            }
+        }
+
+        WheelHandler {
+            onWheel: (e) => {
+                var step = (mini.to - mini.from) * 0.03 * (e.angleDelta.y > 0 ? 1 : -1)
+                var next = Math.max(mini.from, Math.min(mini.to, mini.liveValue + step))
+                mini.liveValue = next
+                mini.moved(next)
+                mini.bump()
+            }
+        }
+
+        Menu {
+            id: miniMenu
+            MenuItem {
+                text: "Set value…"
+                onTriggered: miniEntry.openFor(mini.value)
+            }
+            MenuItem {
+                text: "Reset"
+                onTriggered: {
+                    mini.liveValue = mini.resetValue
+                    mini.moved(mini.resetValue)
+                    mini.bump()
+                }
+            }
+        }
+
+        NumberEntry {
+            id: miniEntry
+            label: mini.entryLabel()
+            from: mini.entryFrom()
+            to: mini.entryTo()
+            format: mini.entryFormat
+            parse: mini.entryParse
+            onCommitted: (v) => {
+                mini.liveValue = v
+                mini.moved(v)
+                mini.bump()
+            }
+        }
+
+        Rectangle {
+            z: 100
+            visible: mini.interacting && mini.shownValueText.length > 0
+            anchors.horizontalCenter: parent.horizontalCenter
+            y: -height - 2
+            width: miniValueLabel.implicitWidth + 8
+            height: miniValueLabel.implicitHeight + 2
+            color: root.panelColor
+            border.color: root.accentColor
+            border.width: 1
+
+            Label {
+                id: miniValueLabel
+                anchors.centerIn: parent
+                text: mini.shownValueText
+                color: root.textColor
+                font.pixelSize: 9
+                font.family: "monospace"
+            }
+        }
+    }
+
     component ParameterRow: Row {
         id: parameterRow
         property var controlData
@@ -2437,6 +2652,7 @@ ApplicationWindow {
                             id: paramEditCc
                             Layout.preferredWidth: 56
                             implicitHeight: 24
+                            font.pixelSize: 11
                             placeholderText: "0-127"
                             inputMethodHints: Qt.ImhDigitsOnly
                             onAccepted: editorWindow.commitParamBinding()
@@ -2566,6 +2782,7 @@ ApplicationWindow {
                     id: pickerFilter
                     Layout.fillWidth: true
                     implicitHeight: 24
+                    font.pixelSize: 11
                     placeholderText: "filter..."
                 }
 
@@ -2823,6 +3040,7 @@ ApplicationWindow {
                     id: bindingEditField
                     Layout.fillWidth: true
                     implicitHeight: 24
+                    font.pixelSize: 11
                     placeholderText: "CC 0-127"
                     inputMethodHints: Qt.ImhDigitsOnly
                     onAccepted: midiBindingsWindow.commitEditBinding()
@@ -2978,8 +3196,6 @@ ApplicationWindow {
             spacing: 6
             width: Math.max(implicitWidth, flick.width)
 
-            Label { text: "channels"; font.bold: true; font.pixelSize: 11; color: root.mutedText }
-
             RowLayout {
                 id: channelRow
                 spacing: 4
@@ -3049,24 +3265,22 @@ ApplicationWindow {
                                 onCommitted: (value) => backend.setStripName(stripCard.stripData.id, value)
                             }
 
-                                    Knob {
-                                        width: 22
-                                        height: 22
-                                        from: -20
-                                        to: 24
-                                        resetValue: 0
-                                        entryUnit: "db"
-                                        value: root.stripInputGain(stripCard.stripData.id)
-                                        valueText: root.trimText(root.stripInputGain(stripCard.stripData.id))
-                                        Layout.alignment: Qt.AlignHCenter
-                                        onMoved: (value) => backend.setStripInputGain(stripCard.stripData.id, value)
-                                    }
-
                             Label {
                                 text: "trim"
                                 color: root.mutedText
                                 font.pixelSize: 8
-                                Layout.alignment: Qt.AlignHCenter
+                                Layout.alignment: Qt.AlignLeft
+                            }
+
+                            MiniSlider {
+                                Layout.fillWidth: true
+                                from: -24
+                                to: 24
+                                resetValue: 0
+                                entryUnit: "db"
+                                value: root.stripInputGain(stripCard.stripData.id)
+                                valueText: root.trimText(root.stripInputGain(stripCard.stripData.id))
+                                onMoved: (value) => backend.setStripInputGain(stripCard.stripData.id, value)
                             }
 
                             PluginList {
@@ -3078,7 +3292,7 @@ ApplicationWindow {
                             }
 
                             RowLayout {
-                                Layout.fillWidth: true
+                                Layout.alignment: Qt.AlignHCenter
                                 Layout.fillHeight: true
                                 spacing: 4
 
@@ -3093,23 +3307,6 @@ ApplicationWindow {
                                         value: root.stripGain(stripCard.stripData.id)
                                         valueText: root.gainText(root.stripGain(stripCard.stripData.id))
                                         onMoved: (value) => backend.setStripGain(stripCard.stripData.id, value)
-                                    }
-
-                                    Knob {
-                                        width: 22
-                                        height: 22
-                                        Layout.alignment: Qt.AlignHCenter
-                                        entryUnit: "pan"
-                                        value: root.stripPan(stripCard.stripData.id)
-                                        valueText: root.panText(root.stripPan(stripCard.stripData.id))
-                                        onMoved: (value) => backend.setStripPan(stripCard.stripData.id, value)
-                                    }
-
-                                    Label {
-                                        text: "pan"
-                                        color: root.mutedText
-                                        font.pixelSize: 8
-                                        Layout.alignment: Qt.AlignHCenter
                                     }
                                 }
 
@@ -3146,6 +3343,24 @@ ApplicationWindow {
                                 }
                             }
 
+                            Label {
+                                text: "pan"
+                                color: root.mutedText
+                                font.pixelSize: 8
+                                Layout.alignment: Qt.AlignLeft
+                            }
+
+                            MiniSlider {
+                                Layout.fillWidth: true
+                                from: -1
+                                to: 1
+                                resetValue: 0
+                                entryUnit: "pan"
+                                value: root.stripPan(stripCard.stripData.id)
+                                valueText: root.panText(root.stripPan(stripCard.stripData.id))
+                                onMoved: (value) => backend.setStripPan(stripCard.stripData.id, value)
+                            }
+
                             PluginList {
                                 location: 1
                                 target: stripCard.stripData.id
@@ -3170,7 +3385,7 @@ ApplicationWindow {
                                     delegate: Column {
                                         id: sendRow
                                         property var busData: modelData
-                                        width: root.stripBody
+                                        width: parent.width
                                         spacing: 1
 
                                         RowLayout {
@@ -3233,7 +3448,7 @@ ApplicationWindow {
 
                             Row {
                                 spacing: 3
-                                Layout.alignment: Qt.AlignLeft
+                                Layout.alignment: Qt.AlignHCenter
                                 ToggleChip {
                                     text: "M"
                                     checked: root.stripMute(stripCard.stripData.id)
@@ -3348,64 +3563,53 @@ ApplicationWindow {
                                 text: "→ master"
                                 color: root.mutedText
                                 font.pixelSize: 8
-                                Layout.alignment: Qt.AlignLeft
+                                Layout.alignment: Qt.AlignHCenter
                             }
 
-                            RowLayout {
-                                visible: busCard.busData.return_inputs === true
-                                spacing: 6
-
-                                ColumnLayout {
-                                    spacing: 1
-
-                                    Knob {
-                                        width: 22
-                                        height: 22
-                                        Layout.alignment: Qt.AlignHCenter
-                                        from: 0
-                                        to: 2
-                                        resetValue: 1
-                                        entryUnit: "gain-db"
-                                        value: root.busSendGain(busCard.busData.id)
-                                        valueText: root.gainText(root.busSendGain(busCard.busData.id))
-                                        onMoved: (value) => backend.setBusSendGain(busCard.busData.id, value)
-                                    }
-
-                                    Label {
-                                        text: "SEND"
-                                        color: root.mutedText
-                                        font.pixelSize: 8
-                                        Layout.alignment: Qt.AlignHCenter
-                                    }
-                                }
-
-                                ColumnLayout {
-                                    spacing: 1
-
-                                    Knob {
-                                        width: 22
-                                        height: 22
-                                        Layout.alignment: Qt.AlignHCenter
-                                        from: 0
-                                        to: 2
-                                        resetValue: 1
-                                        entryUnit: "gain-db"
-                                        value: root.busReturnGain(busCard.busData.id)
-                                        valueText: root.gainText(root.busReturnGain(busCard.busData.id))
-                                        onMoved: (value) => backend.setBusReturnGain(busCard.busData.id, value)
-                                    }
-
-                                    Label {
-                                        text: "RET"
-                                        color: root.mutedText
-                                        font.pixelSize: 8
-                                        Layout.alignment: Qt.AlignHCenter
-                                    }
-                                }
-                            }
-
-                            RowLayout {
+                            ColumnLayout {
                                 Layout.fillWidth: true
+                                visible: busCard.busData.return_inputs === true
+                                spacing: 2
+
+                                Label {
+                                    text: "SEND"
+                                    color: root.mutedText
+                                    font.pixelSize: 8
+                                    Layout.alignment: Qt.AlignLeft
+                                }
+
+                                MiniSlider {
+                                    Layout.fillWidth: true
+                                    from: 0
+                                    to: 2
+                                    resetValue: 1
+                                    entryUnit: "gain-db"
+                                    value: root.busSendGain(busCard.busData.id)
+                                    valueText: root.gainText(root.busSendGain(busCard.busData.id))
+                                    onMoved: (value) => backend.setBusSendGain(busCard.busData.id, value)
+                                }
+
+                                Label {
+                                    text: "RET"
+                                    color: root.mutedText
+                                    font.pixelSize: 8
+                                    Layout.alignment: Qt.AlignLeft
+                                }
+
+                                MiniSlider {
+                                    Layout.fillWidth: true
+                                    from: 0
+                                    to: 2
+                                    resetValue: 1
+                                    entryUnit: "gain-db"
+                                    value: root.busReturnGain(busCard.busData.id)
+                                    valueText: root.gainText(root.busReturnGain(busCard.busData.id))
+                                    onMoved: (value) => backend.setBusReturnGain(busCard.busData.id, value)
+                                }
+                            }
+
+                            RowLayout {
+                                Layout.alignment: Qt.AlignHCenter
                                 Layout.fillHeight: true
                                 spacing: 4
 
