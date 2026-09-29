@@ -947,6 +947,7 @@ impl Controller {
                 if self.plugins.is_empty() {
                     self.plugins = load_catalog();
                 }
+                self.ensure_model_vst3_controls();
                 self.catalog_json = build_catalog(&self.plugins, &self.health);
                 save_catalog(&self.plugins);
                 let sample_rate = self.engine.sample_rate() as f64;
@@ -1054,6 +1055,8 @@ impl Controller {
                         Ok(()) => {
                             self.uis.clear();
                             self.model = loaded;
+                            self.ensure_model_vst3_controls();
+                            save_catalog(&self.plugins);
                             self.engine.sync_port_names(&self.model);
                             self.rebuild_shared_bindings();
                             self.missing_report = missing_report_json(
@@ -1063,7 +1066,7 @@ impl Controller {
                             self.pending_session = Some((true, path.clone(), String::new()));
                             Actions {
                                 snapshot: true,
-                                catalog: false,
+                                catalog: true,
                             }
                         }
                         Err(error) => {
