@@ -3,6 +3,16 @@
 Deferred ideas and follow-ups that are not part of the current roadmap
 (`docs/architecture.md`). Nothing here is committed to a phase.
 
+## Plugin health
+
+- **Detect plugin updates** (same URI, reinstalled binary) and retest them. Store
+  the `.so` `mtime`+`size` in the verdict and extend "untested" to
+  "no verdict or fingerprint changed". The check is cheap (one `stat` per
+  plugin); the plumbing is what's missing: the `lilv` crate doesn't expose the
+  library path (`lilv_plugin_get_library_uri`), so this needs a `lilv_sys` access
+  or a small C shim. Bundle-level fingerprinting is coarse (one `.so` per
+  bundle can hold many plugins).
+
 ## Debugging / diagnostics
 
 - **Fuller verbose/debug mode.** `--debug` currently only logs the smoke child's
@@ -40,13 +50,3 @@ Deferred ideas and follow-ups that are not part of the current roadmap
   experience for very large collections.
 - Parallelize the plugin sweep (currently sequential forks) if startup testing
   ever feels slow on big collections.
-
-## Plugin health
-
-- **Detect plugin updates** (same URI, reinstalled binary) and retest them. Store
-  the `.so` `mtime`+`size` in the verdict and extend "untested" to
-  "no verdict or fingerprint changed". The check is cheap (one `stat` per
-  plugin); the plumbing is what's missing: the `lilv` crate doesn't expose the
-  library path (`lilv_plugin_get_library_uri`), so this needs a `lilv_sys` access
-  or a small C shim. Bundle-level fingerprinting is coarse (one `.so` per
-  bundle can hold many plugins).

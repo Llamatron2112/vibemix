@@ -420,7 +420,14 @@ post-fader, `2` bus insert — and `target` (the strip or bus id).
 - **Phase 6** - MIDI: clock-slave sync (tempo/transport from incoming MIDI
   clock), LV2 host tempo (`time:Position`/`time:tempo`), a MIDI control surface
   (CC to faders/params, learnable, saved with the session), transport/position
-  counters, and a mono/stereo plugin-picker filter. See below.
+  counters, and a mono/stereo plugin-picker filter. Done. See below.
+- **Phase 6 follow-ups** - plugin health: an isolated fork-per-plugin sweep that
+  replaces the blacklist (persisted verdicts, red picker entries, test-all /
+  cancel), plus three host-correctness fixes it surfaced (NULL
+  `extension_data`, output-atom re-arm, worker joined before instance free);
+  and mixer-UI polish (wider centred cards, reference mini-sliders for
+  trim/pan/send/return, entry-font fixes). Done. See "LV2 hosting" / "Plugin
+  health".
 - **Unscheduled** - a native PipeWire `pw_filter` backend (finalizing the
   `AudioBackend` trait). No arbitrary module graph / port matrix is planned; the
   strip/bus/preset mixer topology is the design.
@@ -462,9 +469,10 @@ CC; a matching `MidiOut` (feedback) is deferred.
 - **Out of scope:** instruments and MIDI-only plugins (would drift toward a DAW
   / sequencer); clock generation; MIDI output/feedback (future).
 
-Designations: LV2 plugins are still the only plugin format (Phase 7 below is
-unscheduled). A format-agnostic host trait would be required before adding CLAP
-(clean licensing) or VST3 (GPLv3 SDK implications); VST2 is not planned.
+Designations: LV2 plugins are still the only plugin format (Phase 7 is
+unscheduled; see `docs/backlog.md`). A format-agnostic host trait would be
+required before adding CLAP (clean licensing) or VST3 (GPLv3 SDK implications);
+VST2 is not planned.
 
 ## Editing history and clipboard
 
