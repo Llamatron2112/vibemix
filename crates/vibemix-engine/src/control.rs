@@ -314,6 +314,12 @@ impl Controller {
                 }
             }
 
+            // A MIDI control-surface CC changed a parameter; push it to the UI
+            // immediately instead of waiting for the next state query.
+            if self.engine.midi_map().take_changed() {
+                actions.snapshot = true;
+            }
+
             let Some(address) = target else {
                 continue;
             };

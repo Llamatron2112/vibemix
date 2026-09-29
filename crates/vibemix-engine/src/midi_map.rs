@@ -87,6 +87,9 @@ pub struct SharedMidi {
     learn_channel: AtomicU32,
     learn_cc: AtomicU32,
     learn_done: AtomicBool,
+    /// Set when a binding changed a parameter, so the controller broadcasts
+    /// fresh state to the GUI without waiting for a query.
+    changed: AtomicBool,
 }
 
 impl Default for SharedMidi {
@@ -106,7 +109,13 @@ impl SharedMidi {
             learn_channel: AtomicU32::new(0),
             learn_cc: AtomicU32::new(0),
             learn_done: AtomicBool::new(false),
+            changed: AtomicBool::new(false),
         }
+    }
+
+    /// Returns `true` once after the control surface has changed a parameter.
+    pub fn take_changed(&self) -> bool {
+        self.changed.swap(false, Ordering::AcqRel)
     }
 
     pub fn set_bindings(&self, bindings: &[MidiBinding]) {
@@ -185,6 +194,7 @@ impl SharedMidi {
                 continue;
             }
             self.apply(slot, value, params);
+            self.changed.store(true, Ordering::Release);
             return true;
         }
         false
@@ -293,6 +303,28 @@ mod tests {
         let learned = midi.take_learned().expect("learned");
         assert_eq!(learned.cc, 7);
         assert_eq!(learned.channel, 0);
+    }
+
+    #[test]
+    fn control_changes_are_reported_once() {
+        let params = SharedParams::new(1, 1);
+        let midi = SharedMidi::new();
+        midi.set_bindings(&[MidiBinding {
+            channel: 0,
+            cc: 7,
+            relative: false,
+            target: MidiTarget::StripGain,
+            location: 0,
+            target_id: 0,
+            slot: 0,
+            param: 0,
+            min: 0.0,
+            max: 2.0,
+        }]);
+        assert!(!midi.take_changed());
+        assert!(midi.handle_cc(0, 7, 100, &params));
+        assert!(midi.take_changed());
+        assert!(!midi.take_changed());
     }
 
     #[test]
