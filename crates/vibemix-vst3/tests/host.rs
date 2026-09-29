@@ -52,7 +52,7 @@ fn discovers_and_hosts_the_test_effect() {
     assert_eq!(state.len(), 4);
     instance.load_state(&state);
 
-    let handle = instance.state_handle();
+    let handle = instance.instance_handle();
     assert_eq!(handle.save(), state);
     instance.set_control(0, 0.9);
     handle.restore(&state);

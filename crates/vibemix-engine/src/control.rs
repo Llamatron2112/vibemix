@@ -96,7 +96,7 @@ pub struct Controller {
     scan: Scan,
     smoke_ok: HashSet<String>,
     smoke_bad: HashSet<String>,
-    uis: HashMap<(u32, u32, u32), (UiWindow, Box<UiWriteCtx>)>,
+    uis: HashMap<(u32, u32, u32), OpenUi>,
     ui_cache: HashMap<String, Option<UiCandidate>>,
     ui_safe: HashMap<String, bool>,
     missing_report: Option<String>,
@@ -112,6 +112,34 @@ pub struct Controller {
     pending_learn: Option<MidiBinding>,
     /// Last time a plugin-parameter edit echoed state to the UI.
     last_param_echo: Instant,
+}
+
+/// An open plugin editor: an LV2 toolkit UI or a VST3 `IPlugView`.
+enum OpenUi {
+    Lv2 {
+        window: UiWindow,
+        context: Box<UiWriteCtx>,
+    },
+    Vst3(vibemix_vst3::View),
+}
+
+impl OpenUi {
+    fn pump(&mut self) {
+        match self {
+            OpenUi::Lv2 { window, context } => {
+                window.pump();
+                context.forward_outputs(window);
+            }
+            OpenUi::Vst3(view) => view.pump(),
+        }
+    }
+
+    fn wants_close(&self) -> bool {
+        match self {
+            OpenUi::Lv2 { window, .. } => window.wants_close(),
+            OpenUi::Vst3(view) => view.wants_close(),
+        }
+    }
 }
 
 struct UiWriteCtx {
@@ -1429,56 +1457,60 @@ impl Controller {
         if self.uis.contains_key(&key) {
             return;
         }
-        let (uri, handle) = if let Some(chain) = strip_chain(location) {
-            let uri = self
-                .model
+        let plugin = if let Some(chain) = strip_chain(location) {
+            self.model
                 .strip(StripId(target))
                 .and_then(|entry| strip_plugin_list(entry, chain).get(slot as usize))
-                .map(|plugin| plugin.uri.clone());
-            let handle = self.engine.plugin_handle(target as usize, chain, slot as usize);
-            match (uri, handle) {
-                (Some(uri), Some(handle)) => (uri, handle),
-                _ => return,
-            }
+                .map(|plugin| (plugin.uri.clone(), plugin.format, plugin.name.clone()))
         } else {
-            let uri = self
-                .model
+            self.model
                 .bus(BusId(target))
                 .and_then(|entry| entry.plugins.get(slot as usize))
-                .map(|plugin| plugin.uri.clone());
-            let handle = self.engine.bus_plugin_handle(target as usize, slot as usize);
-            match (uri, handle) {
-                (Some(uri), Some(handle)) => (uri, handle),
-                _ => return,
-            }
+                .map(|plugin| (plugin.uri.clone(), plugin.format, plugin.name.clone()))
+        };
+        let Some((uri, format, model_name)) = plugin else {
+            return;
+        };
+
+        // Title the native window with the plugin's name (user rename wins,
+        // then the catalog name, then the URI).
+        let title = if model_name.is_empty() {
+            self.plugins
+                .iter()
+                .find(|info| info.id == uri)
+                .map(|info| info.name.clone())
+                .unwrap_or_else(|| uri.clone())
+        } else {
+            model_name
+        };
+
+        if format == PluginFormat::Vst3 {
+            let state = if let Some(chain) = strip_chain(location) {
+                self.engine.state_proxy(target as usize, chain, slot as usize)
+            } else {
+                self.engine.bus_state_proxy(target as usize, slot as usize)
+            };
+            let Some(view) = state.and_then(|state| state.open_view(&title)) else {
+                tracing::warn!(%uri, "failed to open VST3 editor");
+                return;
+            };
+            tracing::info!(location, target, slot, %uri, "opened VST3 editor");
+            self.uis.insert(key, OpenUi::Vst3(view));
+            return;
+        }
+
+        let handle = if let Some(chain) = strip_chain(location) {
+            self.engine.plugin_handle(target as usize, chain, slot as usize)
+        } else {
+            self.engine.bus_plugin_handle(target as usize, slot as usize)
+        };
+        let Some(handle) = handle else {
+            return;
         };
 
         if !self.ui_is_safe(&uri) {
             return;
         }
-
-        // Title the native window with the plugin's name (user rename wins,
-        // then the catalog name, then the URI).
-        let model_name = if let Some(chain) = strip_chain(location) {
-            self.model
-                .strip(StripId(target))
-                .and_then(|entry| strip_plugin_list(entry, chain).get(slot as usize))
-                .map(|plugin| plugin.name.clone())
-        } else {
-            self.model
-                .bus(BusId(target))
-                .and_then(|entry| entry.plugins.get(slot as usize))
-                .map(|plugin| plugin.name.clone())
-        };
-        let title = model_name
-            .filter(|name| !name.is_empty())
-            .or_else(|| {
-                self.plugins
-                    .iter()
-                    .find(|info| info.id == uri)
-                    .map(|info| info.name.clone())
-            })
-            .unwrap_or_else(|| uri.clone());
 
         let candidate = self
             .ui_cache
@@ -1540,36 +1572,40 @@ impl Controller {
         }
 
         tracing::info!(location, target, slot, %uri, "opened plugin UI");
-        self.uis.insert(key, (window, context));
+        self.uis.insert(key, OpenUi::Lv2 { window, context });
     }
 
     /// Mirrors a host-driven parameter change into the plugin's native UI, so
     /// the UI's own controls follow edits made in the vibemix editor.
     fn reflect_param_to_ui(&self, location: u32, target: u32, slot: u32, param: u32, value: f32) {
-        let Some((window, context)) = self.uis.get(&(location, target, slot)) else {
+        let Some(ui) = self.uis.get(&(location, target, slot)) else {
             return;
         };
-        let Some((port, _)) = context
-            .ports
-            .iter()
-            .find(|(_, mapped)| *mapped == param as usize)
-        else {
-            return;
-        };
-        window.port_event(
-            *port,
-            std::mem::size_of::<f32>() as u32,
-            0,
-            &value.to_ne_bytes(),
-        );
+        match ui {
+            OpenUi::Lv2 { window, context } => {
+                let Some((port, _)) = context
+                    .ports
+                    .iter()
+                    .find(|(_, mapped)| *mapped == param as usize)
+                else {
+                    return;
+                };
+                window.port_event(
+                    *port,
+                    std::mem::size_of::<f32>() as u32,
+                    0,
+                    &value.to_ne_bytes(),
+                );
+            }
+            OpenUi::Vst3(view) => view.set_param(param as usize, value),
+        }
     }
 
     fn pump_uis(&mut self) {
         let mut closed = Vec::new();
-        for (key, (window, context)) in self.uis.iter_mut() {
-            window.pump();
-            context.forward_outputs(window);
-            if window.wants_close() {
+        for (key, ui) in self.uis.iter_mut() {
+            ui.pump();
+            if ui.wants_close() {
                 closed.push(*key);
             }
         }
@@ -1695,7 +1731,7 @@ impl Controller {
             return;
         };
         if self.plugins[index].format != PluginFormat::Vst3
-            || !self.plugins[index].controls.is_empty()
+            || (!self.plugins[index].controls.is_empty() && self.plugins[index].has_ui)
         {
             return;
         }
@@ -1719,6 +1755,7 @@ impl Controller {
             .cloned()
             .map(ControlInfo::from)
             .collect();
+        self.plugins[index].has_ui = instance.has_editor();
     }
 
     /// Appends a fully-described plugin slot (uri, params, LV2 state, bypass) to

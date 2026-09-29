@@ -1,10 +1,14 @@
 // C ABI around the VST3 SDK hosting helpers. The Rust side owns plugin
 // instances through opaque `Hosted*` handles.
 
+#include <X11/Xlib.h>
+#include <X11/Xatom.h>
+
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <vector>
 
@@ -15,6 +19,7 @@
 #include "public.sdk/source/vst/hosting/parameterchanges.h"
 #include "public.sdk/source/vst/hosting/plugprovider.h"
 
+#include "pluginterfaces/gui/iplugview.h"
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
@@ -124,6 +129,43 @@ struct Hosted {
     tresult processing_result = kResultOk;
     tresult last_result = kResultOk;
 };
+
+struct VibemixVst3View;
+
+/// The frame JUCE (and others) call to resize/close the editor window.
+class PlugFrame : public IPlugFrame {
+public:
+    explicit PlugFrame(VibemixVst3View* owner) : owner(owner) {}
+
+    tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* newSize) override;
+
+    DECLARE_FUNKNOWN_METHODS
+
+private:
+    VibemixVst3View* owner;
+};
+
+IMPLEMENT_FUNKNOWN_METHODS(PlugFrame, IPlugFrame, IPlugFrame::iid)
+
+struct VibemixVst3View {
+    IPtr<IEditController> controller;
+    IPtr<IPlugView> view;
+    IPtr<PlugFrame> frame;
+    Display* dpy = nullptr;
+    Window win = 0;
+    Atom wm_delete = 0;
+    bool wants_close = false;
+};
+
+tresult PlugFrame::resizeView(IPlugView*, ViewRect* newSize) {
+    if (owner && owner->dpy && owner->win && newSize && newSize->getWidth() > 0 &&
+        newSize->getHeight() > 0) {
+        XResizeWindow(owner->dpy, owner->win, (unsigned)newSize->getWidth(),
+                      (unsigned)newSize->getHeight());
+        XFlush(owner->dpy);
+    }
+    return kResultTrue;
+}
 
 } // namespace
 
@@ -376,6 +418,42 @@ void vst3_run(void* handle, int frames) {
     hosted->events.clear();
 }
 
+/// Writes a description of the plugin's editor support to `out`.
+int vst3_editor_info(void* handle, char* out, int cap) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted || !out || cap <= 0) return 0;
+    if (!hosted->controller) {
+        std::snprintf(out, cap, "no-controller");
+        return 1;
+    }
+    IPlugView* view = hosted->controller->createView(ViewType::kEditor);
+    if (!view) {
+        std::snprintf(out, cap, "no-editor");
+        return 1;
+    }
+    std::string types;
+    if (view->isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) == kResultTrue)
+        types += "x11 ";
+    if (view->isPlatformTypeSupported(kPlatformTypeHWND) == kResultTrue) types += "hwnd ";
+    if (view->isPlatformTypeSupported(kPlatformTypeNSView) == kResultTrue) types += "nsview ";
+    if (view->isPlatformTypeSupported(kPlatformTypeUIView) == kResultTrue) types += "uiview ";
+    if (types.empty()) types = "unsupported";
+    std::snprintf(out, cap, "editor:%s", types.c_str());
+    view->release();
+    return 1;
+}
+
+/// Whether the plugin offers an X11-embeddable editor.
+int vst3_has_editor(void* handle) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted || !hosted->controller) return 0;
+    IPlugView* view = hosted->controller->createView(ViewType::kEditor);
+    if (!view) return 0;
+    const int ok = view->isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) == kResultTrue;
+    view->release();
+    return ok;
+}
+
 /// Writes a short description of the component's audio buses to `out`.
 int vst3_bus_info(void* handle, char* out, int cap) {
     auto* hosted = static_cast<Hosted*>(handle);
@@ -420,6 +498,107 @@ int vst3_save_state(void* handle, char* out, int cap) {
     if (size <= 0) return 0;
     if (out && cap >= size) std::memcpy(out, stream.getData(), size);
     return size;
+}
+
+void vst3_view_close(void* handle);
+
+/// Opens the plugin's editor embedded into a fresh X11 window. Returns an
+/// opaque view handle, or null when the plugin has no X11 editor.
+void* vst3_view_open(void* instance, const char* title) {
+    static std::once_flag x_once;
+    std::call_once(x_once, [] { XInitThreads(); });
+
+    auto* hosted = static_cast<Hosted*>(instance);
+    if (!hosted || !hosted->controller) return nullptr;
+    IPtr<IPlugView> view = hosted->controller->createView(ViewType::kEditor);
+    if (!view) return nullptr;
+    if (view->isPlatformTypeSupported(kPlatformTypeX11EmbedWindowID) != kResultTrue) return nullptr;
+
+    Display* dpy = XOpenDisplay(nullptr);
+    if (!dpy) return nullptr;
+    const int screen = DefaultScreen(dpy);
+    const char* window_title = (title && *title) ? title : "vibemix plugin";
+    Window win = XCreateSimpleWindow(dpy, RootWindow(dpy, screen), 80, 80, 400, 300, 0,
+                                     BlackPixel(dpy, screen), WhitePixel(dpy, screen));
+    XStoreName(dpy, win, window_title);
+    {
+        Atom net_wm_name = XInternAtom(dpy, "_NET_WM_NAME", False);
+        Atom utf8_string = XInternAtom(dpy, "UTF8_STRING", False);
+        XChangeProperty(dpy, win, net_wm_name, utf8_string, 8, PropModeReplace,
+                        (const unsigned char*)window_title, (int)std::strlen(window_title));
+    }
+    Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
+    XSetWMProtocols(dpy, win, &wm_delete, 1);
+    XMapWindow(dpy, win);
+    XFlush(dpy);
+
+    auto* self = new VibemixVst3View();
+    self->controller = hosted->controller;
+    self->view = view;
+    self->dpy = dpy;
+    self->win = win;
+    self->wm_delete = wm_delete;
+    self->frame = new PlugFrame(self);
+    self->view->setFrame(self->frame);
+
+    if (self->view->attached((void*)(uintptr_t)win, kPlatformTypeX11EmbedWindowID) !=
+        kResultTrue) {
+        vst3_view_close(self);
+        return nullptr;
+    }
+
+    ViewRect rect {};
+    if (self->view->getSize(&rect) == kResultTrue && rect.getWidth() > 0 &&
+        rect.getHeight() > 0) {
+        XResizeWindow(dpy, win, (unsigned)rect.getWidth(), (unsigned)rect.getHeight());
+        XFlush(dpy);
+    }
+    return self;
+}
+
+/// Processes pending X events; a WM_DELETE_WINDOW sets the close flag.
+void vst3_view_pump(void* handle) {
+    auto* self = static_cast<VibemixVst3View*>(handle);
+    if (!self || !self->dpy) return;
+    while (XPending(self->dpy) > 0) {
+        XEvent event;
+        XNextEvent(self->dpy, &event);
+        if (event.type == ClientMessage &&
+            (Atom)event.xclient.data.l[0] == self->wm_delete) {
+            self->wants_close = true;
+        }
+    }
+}
+
+int vst3_view_wants_close(void* handle) {
+    auto* self = static_cast<VibemixVst3View*>(handle);
+    return (self && self->wants_close) ? 1 : 0;
+}
+
+/// Mirrors a host-driven parameter change into the plugin's editor.
+void vst3_view_set_param(void* handle, int index, float value) {
+    auto* self = static_cast<VibemixVst3View*>(handle);
+    if (!self || !self->controller) return;
+    ParameterInfo info {};
+    if (self->controller->getParameterInfo(index, info) == kResultOk)
+        self->controller->setParamNormalized(info.id, value);
+}
+
+void vst3_view_close(void* handle) {
+    auto* self = static_cast<VibemixVst3View*>(handle);
+    if (!self) return;
+    if (self->view) {
+        self->view->removed();
+        self->view->setFrame(nullptr);
+    }
+    self->view = nullptr;
+    self->frame = nullptr;
+    if (self->dpy) {
+        if (self->win) XDestroyWindow(self->dpy, self->win);
+        XCloseDisplay(self->dpy);
+        self->dpy = nullptr;
+    }
+    delete self;
 }
 
 /// Applies state previously produced by `vst3_save_state`.

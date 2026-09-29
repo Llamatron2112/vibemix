@@ -77,6 +77,13 @@ extern "C" {
         last: *mut c_int,
     ) -> c_int;
     fn vst3_bus_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
+    fn vst3_editor_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
+    fn vst3_has_editor(handle: *mut c_void) -> c_int;
+    fn vst3_view_open(instance: *mut c_void, title: *const c_char) -> *mut c_void;
+    fn vst3_view_pump(handle: *mut c_void);
+    fn vst3_view_wants_close(handle: *mut c_void) -> c_int;
+    fn vst3_view_set_param(handle: *mut c_void, index: c_int, value: f32);
+    fn vst3_view_close(handle: *mut c_void);
     fn vst3_save_state(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_load_state(handle: *mut c_void, data: *const c_char, len: c_int);
 }
@@ -336,6 +343,23 @@ impl PluginInstance {
         (setup, active, processing, last)
     }
 
+    /// Whether the plugin offers an X11-embeddable editor.
+    pub fn has_editor(&self) -> bool {
+        unsafe { vst3_has_editor(self.handle) != 0 }
+    }
+
+    /// Short description of the plugin's editor support (for diagnostics).
+    pub fn editor_info(&self) -> String {
+        let mut buf = [0i8; 256];
+        let ok = unsafe { vst3_editor_info(self.handle, buf.as_mut_ptr(), buf.len() as c_int) };
+        if ok == 0 {
+            return String::new();
+        }
+        unsafe { CStr::from_ptr(buf.as_ptr()) }
+            .to_string_lossy()
+            .into_owned()
+    }
+
     /// Short description of the component's audio buses (for diagnostics).
     pub fn bus_info(&self) -> String {
         let mut buf = [0i8; 256];
@@ -350,21 +374,21 @@ impl PluginInstance {
 
     /// A handle for saving/restoring state from another thread (the control
     /// thread), mirroring the LV2 state proxy. Valid while the instance lives.
-    pub fn state_handle(&self) -> StateHandle {
-        StateHandle {
+    pub fn instance_handle(&self) -> InstanceHandle {
+        InstanceHandle {
             handle: self.handle,
         }
     }
 }
 
 /// Cross-thread handle to a live instance's state.
-pub struct StateHandle {
+pub struct InstanceHandle {
     handle: *mut c_void,
 }
 
-unsafe impl Send for StateHandle {}
+unsafe impl Send for InstanceHandle {}
 
-impl Clone for StateHandle {
+impl Clone for InstanceHandle {
     fn clone(&self) -> Self {
         Self {
             handle: self.handle,
@@ -372,13 +396,48 @@ impl Clone for StateHandle {
     }
 }
 
-impl StateHandle {
+impl InstanceHandle {
     pub fn save(&self) -> Vec<u8> {
         save_blob(self.handle)
     }
 
     pub fn restore(&self, state: &[u8]) {
         restore_blob(self.handle, state);
+    }
+
+    /// Opens the plugin's editor embedded into a fresh X11 window.
+    pub fn open_view(&self, title: &str) -> Option<View> {
+        let c_title = CString::new(title).ok()?;
+        let handle = unsafe { vst3_view_open(self.handle, c_title.as_ptr()) };
+        (!handle.is_null()).then_some(View { handle })
+    }
+}
+
+/// A hosted plugin editor window (`IPlugView` embedded in X11).
+pub struct View {
+    handle: *mut c_void,
+}
+
+unsafe impl Send for View {}
+
+impl View {
+    pub fn pump(&self) {
+        unsafe { vst3_view_pump(self.handle) };
+    }
+
+    pub fn wants_close(&self) -> bool {
+        unsafe { vst3_view_wants_close(self.handle) != 0 }
+    }
+
+    /// Mirrors a host-driven parameter change into the editor.
+    pub fn set_param(&self, index: usize, value: f32) {
+        unsafe { vst3_view_set_param(self.handle, index as c_int, value) };
+    }
+}
+
+impl Drop for View {
+    fn drop(&mut self) {
+        unsafe { vst3_view_close(self.handle) };
     }
 }
 

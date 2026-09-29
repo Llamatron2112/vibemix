@@ -26,7 +26,7 @@ const COMMAND_CAPACITY: usize = 64;
 #[derive(Clone)]
 pub enum SlotState {
     Lv2(StateProxy),
-    Vst3(vibemix_vst3::StateHandle),
+    Vst3(vibemix_vst3::InstanceHandle),
 }
 
 impl SlotState {
@@ -41,6 +41,15 @@ impl SlotState {
                 let bytes = handle.save();
                 (!bytes.is_empty()).then(|| vibemix_vst3::encode_blob(&bytes))
             }
+        }
+    }
+
+    /// Opens the plugin's native editor (VST3 only; LV2 UIs go through the LV2
+    /// host).
+    pub fn open_view(&self, title: &str) -> Option<vibemix_vst3::View> {
+        match self {
+            SlotState::Vst3(handle) => handle.open_view(title),
+            SlotState::Lv2(_) => None,
         }
     }
 }
@@ -1919,7 +1928,7 @@ fn instantiate_vst3(
     plugin: &PluginSlot,
     sample_rate: f64,
     buffer_size: usize,
-) -> Option<(SlotPlugin, vibemix_vst3::StateHandle)> {
+) -> Option<(SlotPlugin, vibemix_vst3::InstanceHandle)> {
     let bundle = plugin.bundle.as_deref()?;
     let open = |vst3: &vibemix_vst3::Host| {
         vst3.instantiate(
@@ -1931,7 +1940,7 @@ fn instantiate_vst3(
         )
     };
     let first = open(vst3)?;
-    let handle = first.state_handle();
+    let handle = first.instance_handle();
     let slot_plugin = match (first.audio_input_count(), first.audio_output_count()) {
         (2, 2) => SlotPlugin::Stereo(Box::new(first) as Box<dyn PluginNode>),
         (1, 1) => {

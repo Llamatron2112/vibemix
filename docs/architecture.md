@@ -265,6 +265,14 @@ rather than taking the engine down. The smoke test runs headless (the window is
 never mapped) and also exercises the output-forwarding path, so it produces no
 visible flash.
 
+VST3 editors are hosted separately: the plugin's `IPlugView` is embedded into a
+raw X11 window (`kPlatformTypeX11EmbedWindowID`) created per editor, with a
+minimal `IPlugFrame` handling plugin-driven resizes and the window's close
+button. Host-driven parameter edits reach the editor through
+`IEditController::setParamNormalized`, and the editor button is only shown when
+the plugin reports an X11-editable view. VST3 editors are not gated by the LV2
+UI smoke test (they cannot be exercised headlessly the same way).
+
 Not supported: Qt plugin UIs (and GTK4).
 
 This hosts all mono/stereo plugins, including meters/analysers with atom output

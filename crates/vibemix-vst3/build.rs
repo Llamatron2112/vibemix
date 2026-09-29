@@ -131,6 +131,8 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=dl");
     println!("cargo:rustc-link-lib=dylib=pthread");
     println!("cargo:rustc-link-lib=dylib=m");
+    // VST3 `IPlugView` hosting embeds the editor into a raw X11 window.
+    println!("cargo:rustc-link-lib=dylib=X11");
 
     // --- Test effect, built as a .vst3 bundle ------------------------------
     let bundle = out.join("test.vst3");

@@ -36,9 +36,10 @@ Deferred ideas and follow-ups that are not part of the current roadmap
   since 3.8** — no copyleft implications) is vendored as a submodule and built
   without CMake. The node trait, format-tagged model and `vibemix-vst3` host
   crate are in place; the engine discovers/adds/processes VST3 plugins, edits
-  their parameters in the built-in editor, saves/restores their state with the
-  session, and loading is sandboxed (`--smoke-vst3` per add plus the batch
-  sweep, which covers VST3 too). Remaining: `IPlugView` GUI hosting.
+  their parameters in the built-in editor, hosts their native `IPlugView`
+  editor (embedded in X11), saves/restores their state with the session, and
+  loading is sandboxed (`--smoke-vst3` per add plus the batch sweep, which
+  covers VST3 too).
 - Qt plugin UIs (and GTK4).
 
 ## Audio backend

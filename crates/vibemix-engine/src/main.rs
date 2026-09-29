@@ -190,8 +190,9 @@ fn run_probe_vst3(bundle: &str, class_id: &str) -> ! {
     let (setup, active, processing, _) = instance.status();
     eprintln!(
         "probe: in={in_ch} out={out_ch} params={params} set_all={set_all} \
-         setup={setup} active={active} processing={processing} buses={}",
-        instance.bus_info()
+         setup={setup} active={active} processing={processing} buses={} {}",
+        instance.bus_info(),
+        instance.editor_info()
     );
 
     for param in 0..params {
@@ -237,6 +238,19 @@ fn run_probe_vst3(bundle: &str, class_id: &str) -> ! {
     }
     let (_, _, _, last) = instance.status();
     eprintln!("probe: final out_peak={last_peak} last_process={last}");
+    if std::env::var_os("VIBEMIX_PROBE_VIEW").is_some() {
+        match instance.instance_handle().open_view("vibemix probe") {
+            Some(view) => {
+                for _ in 0..10 {
+                    view.pump();
+                }
+                std::thread::sleep(std::time::Duration::from_millis(300));
+                view.pump();
+                eprintln!("probe: view opened, wants_close={}", view.wants_close());
+            }
+            None => eprintln!("probe: view open failed"),
+        }
+    }
     std::process::exit(0);
 }
 
