@@ -261,6 +261,7 @@ struct MixerGraph {
     commands: Consumer<EngineCommand>,
     garbage: Producer<SlotPlugin>,
     garbage_chains: Producer<Vec<SlotPlugin>>,
+    garbage_bus_chains: Producer<Vec<Vec<SlotPlugin>>>,
     garbage_nested: Producer<Vec<StripChains>>,
     garbage_delays: Producer<Vec<Vec<dsp::DelayLine>>>,
     strip_gain_smooth: Vec<f32>,
@@ -420,8 +421,8 @@ impl MixerGraph {
                     let old = std::mem::replace(&mut self.plugin_chains, chains);
                     if let Err(chains) = self.garbage_nested.push(old) { std::mem::forget(chains); }
                     let old_bus = std::mem::replace(&mut self.bus_chains, bus_chains);
-                    for chain in old_bus {
-                        if let Err(chain) = self.garbage_chains.push(chain) { std::mem::forget(chain); }
+                    if let Err(old_bus) = self.garbage_bus_chains.push(old_bus) {
+                        std::mem::forget(old_bus);
                     }
                 }
                 EngineCommand::SetSampleRate {
@@ -1001,6 +1002,7 @@ pub struct JackEngine {
     commands: Producer<EngineCommand>,
     garbage: Consumer<SlotPlugin>,
     garbage_chains: Consumer<Vec<SlotPlugin>>,
+    garbage_bus_chains: Consumer<Vec<Vec<SlotPlugin>>>,
     garbage_nested: Consumer<Vec<StripChains>>,
     garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
     garbage_order: Consumer<RetiredOrder>,
@@ -1117,6 +1119,8 @@ impl JackEngine {
             rtrb::RingBuffer::<SlotPlugin>::new(garbage_plugins_capacity);
         let (garbage_chains_producer, garbage_chains) =
             rtrb::RingBuffer::<Vec<SlotPlugin>>::new(garbage_chains_capacity);
+        let (garbage_bus_chains_producer, garbage_bus_chains) =
+            rtrb::RingBuffer::<Vec<Vec<SlotPlugin>>>::new(4);
         let (garbage_nested_producer, garbage_nested) =
             rtrb::RingBuffer::<Vec<StripChains>>::new(garbage_nested_capacity);
         let (garbage_delays_producer, garbage_delays) =
@@ -1136,6 +1140,7 @@ impl JackEngine {
             commands: command_consumer,
             garbage: garbage_producer,
             garbage_chains: garbage_chains_producer,
+            garbage_bus_chains: garbage_bus_chains_producer,
             garbage_nested: garbage_nested_producer,
             garbage_delays: garbage_delays_producer,
             strip_gain_smooth: vec![0.0; strip_count],
@@ -1204,6 +1209,7 @@ impl JackEngine {
             commands,
             garbage,
             garbage_chains,
+            garbage_bus_chains,
             garbage_nested,
             garbage_delays,
             garbage_order,
@@ -2000,6 +2006,7 @@ impl JackEngine {
     pub fn drain_garbage(&mut self) {
         while self.garbage.pop().is_ok() {}
         while self.garbage_chains.pop().is_ok() {}
+        while self.garbage_bus_chains.pop().is_ok() {}
         while self.garbage_nested.pop().is_ok() {}
         while self.garbage_delays.pop().is_ok() {}
         while self.garbage_order.pop().is_ok() {}
