@@ -15,9 +15,6 @@ static SOCKET: OnceLock<UdpSocket> = OnceLock::new();
 static ENGINE_ADDR: OnceLock<SocketAddr> = OnceLock::new();
 static VIEW: OnceLock<Mutex<View>> = OnceLock::new();
 static ACTION: Mutex<String> = Mutex::new(String::new());
-static LAST_SNAPSHOT: Mutex<String> = Mutex::new(String::new());
-static LAST_VALUES: Mutex<String> = Mutex::new(String::new());
-static LAST_CATALOG: Mutex<String> = Mutex::new(String::new());
 static PENDING_REPORT: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_SESSION: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
 static SESSION_PATH: Mutex<String> = Mutex::new(String::new());
@@ -35,8 +32,22 @@ static XRUNS: AtomicU32 = AtomicU32::new(0);
 static CLIPBOARD: Mutex<(bool, u32, String)> = Mutex::new((false, 0, String::new()));
 static EDIT_STATE: Mutex<(u32, u32, String, String)> =
     Mutex::new((0, 0, String::new(), String::new()));
-static CLOCK: Mutex<(bool, bool, f32, f32, f32, f32)> =
-    Mutex::new((false, false, 120.0, 0.0, 0.0, 4.0));
+type ClockState = (bool, bool, f32, f32, f32, f32);
+static CLOCK: Mutex<ClockState> = Mutex::new((false, false, 120.0, 0.0, 0.0, 4.0));
+
+// Revision counters so the 30 Hz poll only clones/re-serialises the large
+// payloads (structure, values, catalog, meters) when they actually changed.
+static STRUCTURE_REV: AtomicU64 = AtomicU64::new(0);
+static VALUES_REV: AtomicU64 = AtomicU64::new(0);
+static CATALOG_REV: AtomicU64 = AtomicU64::new(0);
+static METERS_REV: AtomicU64 = AtomicU64::new(0);
+static LAST_STRUCTURE_REV: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_VALUES_REV: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_CATALOG_REV: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_METERS_REV: AtomicU64 = AtomicU64::new(u64::MAX);
+static LAST_CLOCK: Mutex<Option<ClockState>> = Mutex::new(None);
+static LAST_SESSION_PATH: Mutex<String> = Mutex::new(String::new());
+static LAST_RECENT: Mutex<String> = Mutex::new(String::new());
 
 struct View {
     structure_json: String,
@@ -187,6 +198,8 @@ fn receive_loop(socket: UdpSocket) {
                     guard.values_json = values;
                     guard.connected = true;
                     drop(guard);
+                    STRUCTURE_REV.fetch_add(1, Ordering::Release);
+                    VALUES_REV.fetch_add(1, Ordering::Release);
 
                     if PENDING_CLEAN.swap(false, Ordering::SeqCst) {
                         if let Ok(mut saved) = SAVED_STATE.lock() {
@@ -248,6 +261,8 @@ fn receive_loop(socket: UdpSocket) {
                     let mut guard = view().lock().expect("view lock");
                     guard.catalog_json = json;
                     guard.connected = true;
+                    drop(guard);
+                    CATALOG_REV.fetch_add(1, Ordering::Release);
                 }
                 Some(ControlMessage::MissingConnections { json }) => {
                     if let Ok(mut guard) = PENDING_REPORT.lock() {
@@ -313,6 +328,8 @@ fn receive_loop(socket: UdpSocket) {
                     guard.bus_l = buses_l;
                     guard.bus_r = buses_r;
                     guard.connected = true;
+                    drop(guard);
+                    METERS_REV.fetch_add(1, Ordering::Release);
                 }
                 _ => {}
             }
@@ -930,50 +947,33 @@ impl Default for BackendRust {
 
 impl qobject::Backend {
     pub fn poll(mut self: Pin<&mut Self>) {
-        let snapshot = build_snapshot_json();
-        let snapshot_changed = {
-            let mut last = LAST_SNAPSHOT.lock().expect("snapshot lock");
-            if *last != snapshot {
-                *last = snapshot.clone();
-                true
-            } else {
-                false
-            }
-        };
-        if snapshot_changed {
+        let structure_rev = STRUCTURE_REV.load(Ordering::Acquire);
+        if structure_rev != LAST_STRUCTURE_REV.load(Ordering::Relaxed) {
+            LAST_STRUCTURE_REV.store(structure_rev, Ordering::Relaxed);
+            let snapshot = build_snapshot_json();
             self.as_mut().set_snapshot(QString::from(snapshot.as_str()));
         }
 
-        let values = build_values_json();
-        let values_changed = {
-            let mut last = LAST_VALUES.lock().expect("values lock");
-            if *last != values {
-                *last = values.clone();
-                true
-            } else {
-                false
-            }
-        };
-        if values_changed {
+        let values_rev = VALUES_REV.load(Ordering::Acquire);
+        if values_rev != LAST_VALUES_REV.load(Ordering::Relaxed) {
+            LAST_VALUES_REV.store(values_rev, Ordering::Relaxed);
+            let values = build_values_json();
             self.as_mut().set_values(QString::from(values.as_str()));
         }
 
-        let catalog = build_catalog_json();
-        let catalog_changed = {
-            let mut last = LAST_CATALOG.lock().expect("catalog lock");
-            if *last != catalog {
-                *last = catalog.clone();
-                true
-            } else {
-                false
-            }
-        };
-        if catalog_changed {
+        let catalog_rev = CATALOG_REV.load(Ordering::Acquire);
+        if catalog_rev != LAST_CATALOG_REV.load(Ordering::Relaxed) {
+            LAST_CATALOG_REV.store(catalog_rev, Ordering::Relaxed);
+            let catalog = build_catalog_json();
             self.as_mut().set_catalog(QString::from(catalog.as_str()));
         }
 
-        self.as_mut()
-            .set_meters(QString::from(build_meters_json().as_str()));
+        let meters_rev = METERS_REV.load(Ordering::Acquire);
+        if meters_rev != LAST_METERS_REV.load(Ordering::Relaxed) {
+            LAST_METERS_REV.store(meters_rev, Ordering::Relaxed);
+            self.as_mut()
+                .set_meters(QString::from(build_meters_json().as_str()));
+        }
         self.as_mut().set_connected(is_connected());
         self.as_mut()
             .set_action(QString::from(last_action().as_str()));
@@ -985,11 +985,26 @@ impl qobject::Backend {
 
         self.as_mut().set_dirty(DIRTY.load(Ordering::SeqCst));
         if let Ok(path) = SESSION_PATH.lock() {
-            self.as_mut().set_session_path(QString::from(path.as_str()));
+            let changed = LAST_SESSION_PATH
+                .lock()
+                .map(|last| *last != *path)
+                .unwrap_or(true);
+            if changed {
+                self.as_mut().set_session_path(QString::from(path.as_str()));
+                if let Ok(mut last) = LAST_SESSION_PATH.lock() {
+                    *last = path.clone();
+                }
+            }
         }
         if let Ok(list) = RECENT.lock() {
             if let Ok(json) = serde_json::to_string(&*list) {
-                self.as_mut().set_recent_files(QString::from(json.as_str()));
+                let changed = LAST_RECENT.lock().map(|last| *last != json).unwrap_or(true);
+                if changed {
+                    self.as_mut().set_recent_files(QString::from(json.as_str()));
+                    if let Ok(mut last) = LAST_RECENT.lock() {
+                        *last = json;
+                    }
+                }
             }
         }
         if let Some((ok, path, error)) =
@@ -1040,16 +1055,26 @@ impl qobject::Backend {
             self.as_mut().set_redo_label(QString::from(edit.3.as_str()));
         }
         if let Ok(clock) = CLOCK.lock() {
-            let json = serde_json::json!({
-                "locked": clock.0,
-                "playing": clock.1,
-                "bpm": clock.2,
-                "beats": clock.3,
-                "seconds": clock.4,
-                "beats_per_bar": clock.5,
-            })
-            .to_string();
-            self.as_mut().set_clock(QString::from(json.as_str()));
+            let snapshot = (clock.0, clock.1, clock.2, clock.3, clock.4, clock.5);
+            let changed = LAST_CLOCK
+                .lock()
+                .map(|last| *last != Some(snapshot))
+                .unwrap_or(true);
+            if changed {
+                let json = serde_json::json!({
+                    "locked": clock.0,
+                    "playing": clock.1,
+                    "bpm": clock.2,
+                    "beats": clock.3,
+                    "seconds": clock.4,
+                    "beats_per_bar": clock.5,
+                })
+                .to_string();
+                self.as_mut().set_clock(QString::from(json.as_str()));
+                if let Ok(mut last) = LAST_CLOCK.lock() {
+                    *last = Some(snapshot);
+                }
+            }
         }
     }
 

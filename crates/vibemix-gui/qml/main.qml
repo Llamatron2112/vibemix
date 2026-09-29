@@ -1320,15 +1320,24 @@ ApplicationWindow {
         property real from: 0
         property real to: 2
         property real value: 1
+        property real liveValue: 1
         property real resetValue: 1
         property real dragStart: 0
         property string valueText: ""
         property string entryUnit: "db"
         readonly property bool interacting: dragHandler.active || valueTimer.running
+        readonly property real displayValue: fader.interacting ? fader.liveValue : fader.value
+        readonly property string shownValueText: fader.interacting
+            ? root.gainText(fader.liveValue)
+            : fader.valueText
         signal moved(real value)
 
         implicitWidth: 22
         implicitHeight: 150
+
+        onValueChanged: if (!fader.interacting) fader.liveValue = fader.value
+        onInteractingChanged: if (!fader.interacting) fader.liveValue = fader.value
+        Component.onCompleted: fader.liveValue = fader.value
 
         function bump() { valueTimer.restart() }
         function entryFrom() { return entryUnit === "db" ? -60 : from }
@@ -1344,7 +1353,7 @@ ApplicationWindow {
 
         Timer { id: valueTimer; interval: 700 }
 
-        readonly property real normalized: (to > from) ? Math.max(0, Math.min(1, (value - from) / (to - from))) : 0
+        readonly property real normalized: (to > from) ? Math.max(0, Math.min(1, (fader.displayValue - from) / (to - from))) : 0
 
         Rectangle {
             id: track
@@ -1382,14 +1391,16 @@ ApplicationWindow {
             grabPermissions: PointerHandler.TakeOverForbidden
             onActiveChanged: {
                 if (dragHandler.active) {
-                    fader.dragStart = fader.value
+                    fader.dragStart = fader.liveValue
                     fader.bump()
                 }
             }
             onTranslationChanged: {
                 var span = fader.to - fader.from
                 var delta = -dragHandler.translation.y / track.height * span
-                fader.moved(Math.max(fader.from, Math.min(fader.to, fader.dragStart + delta)))
+                var next = Math.max(fader.from, Math.min(fader.to, fader.dragStart + delta))
+                fader.liveValue = next
+                fader.moved(next)
                 fader.bump()
             }
         }
@@ -1400,10 +1411,13 @@ ApplicationWindow {
                 var y = eventPoint.position.y
                 var clamped = Math.max(track.y, Math.min(track.y + track.height, y))
                 var n = 1 - (clamped - track.y) / track.height
-                fader.moved(fader.from + n * (fader.to - fader.from))
+                var next = fader.from + n * (fader.to - fader.from)
+                fader.liveValue = next
+                fader.moved(next)
                 fader.bump()
             }
             onDoubleTapped: {
+                fader.liveValue = fader.resetValue
                 fader.moved(fader.resetValue)
                 fader.bump()
             }
@@ -1412,6 +1426,7 @@ ApplicationWindow {
         TapHandler {
             acceptedModifiers: Qt.ControlModifier
             onSingleTapped: {
+                fader.liveValue = fader.resetValue
                 fader.moved(fader.resetValue)
                 fader.bump()
             }
@@ -1420,7 +1435,9 @@ ApplicationWindow {
         WheelHandler {
             onWheel: (e) => {
                 var step = (fader.to - fader.from) * 0.03 * (e.angleDelta.y > 0 ? 1 : -1)
-                fader.moved(Math.max(fader.from, Math.min(fader.to, fader.value + step)))
+                var next = Math.max(fader.from, Math.min(fader.to, fader.liveValue + step))
+                fader.liveValue = next
+                fader.moved(next)
                 fader.bump()
             }
         }
@@ -1446,6 +1463,7 @@ ApplicationWindow {
             format: fader.entryFormat
             parse: fader.entryParse
             onCommitted: (v) => {
+                fader.liveValue = v
                 fader.moved(v)
                 fader.bump()
             }
@@ -1453,7 +1471,7 @@ ApplicationWindow {
 
         Rectangle {
             z: 100
-            visible: fader.interacting && fader.valueText.length > 0
+            visible: fader.interacting && fader.shownValueText.length > 0
             anchors.horizontalCenter: parent.horizontalCenter
             y: -height - 2
             width: valueLabel.implicitWidth + 8
@@ -1465,7 +1483,7 @@ ApplicationWindow {
             Label {
                 id: valueLabel
                 anchors.centerIn: parent
-                text: fader.valueText
+                text: fader.shownValueText
                 color: root.textColor
                 font.pixelSize: 9
                 font.family: "monospace"
@@ -1482,8 +1500,8 @@ ApplicationWindow {
         property real delay: 0
         property var formatValue: function(v) { return Number(v).toFixed(2) }
         readonly property string valueText: slider.formatValue ? slider.formatValue(slider.displayValue) : ""
-        readonly property real displayValue: slider.dragging ? slider.liveValue : slider.value
         readonly property bool interacting: slider.dragging || valueTimer.running
+        readonly property real displayValue: slider.interacting ? slider.liveValue : slider.value
         signal moved(real value)
         signal delayMoved(real ms)
 
@@ -1592,12 +1610,15 @@ ApplicationWindow {
                 refreshHover()
             }
             onDoubleClicked: {
+                slider.liveValue = slider.resetValue
                 slider.moved(slider.resetValue)
                 slider.bump()
             }
             onWheel: (wheel) => {
                 var step = wheel.angleDelta.y > 0 ? 0.03 : -0.03
-                slider.moved(slider.norm(slider.value + step))
+                var next = slider.norm(slider.liveValue + step)
+                slider.liveValue = next
+                slider.moved(next)
                 slider.bump()
             }
         }
@@ -1605,6 +1626,7 @@ ApplicationWindow {
         TapHandler {
             acceptedModifiers: Qt.ControlModifier
             onSingleTapped: {
+                slider.liveValue = slider.resetValue
                 slider.moved(slider.resetValue)
                 slider.bump()
             }
@@ -1808,15 +1830,28 @@ ApplicationWindow {
         property real from: -1
         property real to: 1
         property real value: 0
+        property real liveValue: 0
         property real dragStart: 0
         property real resetValue: (from + to) / 2
         property string valueText: ""
         property string entryUnit: "linear"
         readonly property bool interacting: knobDrag.active || valueTimer.running
+        readonly property real displayValue: knob.interacting ? knob.liveValue : knob.value
+        readonly property string shownValueText: {
+            if (!knob.interacting) return knob.valueText
+            if (entryUnit === "pan") return root.panText(knob.liveValue)
+            if (entryUnit === "db") return root.trimText(knob.liveValue)
+            if (entryUnit === "gain-db") return root.gainText(knob.liveValue)
+            return Number(knob.liveValue).toFixed(3)
+        }
         signal moved(real value)
 
         implicitWidth: 26
         implicitHeight: 26
+
+        onValueChanged: if (!knob.interacting) knob.liveValue = knob.value
+        onInteractingChanged: if (!knob.interacting) knob.liveValue = knob.value
+        Component.onCompleted: knob.liveValue = knob.value
 
         function bump() { valueTimer.restart() }
         function entryLabel() {
@@ -1851,7 +1886,7 @@ ApplicationWindow {
 
         Timer { id: valueTimer; interval: 700 }
 
-        readonly property real normalized: (to > from) ? Math.max(0, Math.min(1, (value - from) / (to - from))) : 0
+        readonly property real normalized: (to > from) ? Math.max(0, Math.min(1, (knob.displayValue - from) / (to - from))) : 0
 
         Rectangle {
             anchors.fill: parent
@@ -1878,13 +1913,15 @@ ApplicationWindow {
             grabPermissions: PointerHandler.TakeOverForbidden
             onActiveChanged: {
                 if (knobDrag.active) {
-                    knob.dragStart = knob.value
+                    knob.dragStart = knob.liveValue
                     knob.bump()
                 }
             }
             onTranslationChanged: {
                 var delta = -knobDrag.translation.y / 120 * (knob.to - knob.from)
-                knob.moved(Math.max(knob.from, Math.min(knob.to, knob.dragStart + delta)))
+                var next = Math.max(knob.from, Math.min(knob.to, knob.dragStart + delta))
+                knob.liveValue = next
+                knob.moved(next)
                 knob.bump()
             }
         }
@@ -1892,6 +1929,7 @@ ApplicationWindow {
         TapHandler {
             acceptedModifiers: Qt.NoModifier
             onDoubleTapped: {
+                knob.liveValue = knob.resetValue
                 knob.moved(knob.resetValue)
                 knob.bump()
             }
@@ -1900,6 +1938,7 @@ ApplicationWindow {
         TapHandler {
             acceptedModifiers: Qt.ControlModifier
             onSingleTapped: {
+                knob.liveValue = knob.resetValue
                 knob.moved(knob.resetValue)
                 knob.bump()
             }
@@ -1926,6 +1965,7 @@ ApplicationWindow {
             format: knob.entryFormat
             parse: knob.entryParse
             onCommitted: (v) => {
+                knob.liveValue = v
                 knob.moved(v)
                 knob.bump()
             }
@@ -1933,7 +1973,7 @@ ApplicationWindow {
 
         Rectangle {
             z: 100
-            visible: knob.interacting && knob.valueText.length > 0
+            visible: knob.interacting && knob.shownValueText.length > 0
             anchors.horizontalCenter: parent.horizontalCenter
             y: -height - 2
             width: knobValueLabel.implicitWidth + 8
@@ -1945,7 +1985,7 @@ ApplicationWindow {
             Label {
                 id: knobValueLabel
                 anchors.centerIn: parent
-                text: knob.valueText
+                text: knob.shownValueText
                 color: root.textColor
                 font.pixelSize: 9
                 font.family: "monospace"
