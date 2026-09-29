@@ -4,6 +4,7 @@
 #include <X11/Xlib.h>
 #include <X11/Xatom.h>
 
+#include <atomic>
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
@@ -99,7 +100,7 @@ public:
     tresult PLUGIN_API beginEdit(ParamID) SMTG_OVERRIDE { return kResultOk; }
     tresult PLUGIN_API performEdit(ParamID id, ParamValue value) SMTG_OVERRIDE;
     tresult PLUGIN_API endEdit(ParamID) SMTG_OVERRIDE { return kResultOk; }
-    tresult PLUGIN_API restartComponent(int32) SMTG_OVERRIDE { return kResultOk; }
+    tresult PLUGIN_API restartComponent(int32 flags) SMTG_OVERRIDE;
 
     DECLARE_FUNKNOWN_METHODS
 
@@ -125,6 +126,16 @@ struct Hosted {
     int32 out_channels = 0;
     std::vector<float*> in_ptrs;
     std::vector<float*> out_ptrs;
+    // All audio buses are presented to the plugin; bus 0 is the wired
+    // main signal, aux buses (e.g. a sidechain input) get silence.
+    int32 in_bus_count = 0;
+    int32 out_bus_count = 0;
+    std::vector<AudioBusBuffers> in_bus_buffers;
+    std::vector<AudioBusBuffers> out_bus_buffers;
+    std::vector<std::vector<float*>> aux_in_ptrs;
+    std::vector<std::vector<float*>> aux_out_ptrs;
+    std::vector<float> silence_frames;
+    std::vector<float> aux_out_frames;
     ParameterChanges changes;
     ParameterChanges out_changes;
     EventList events;
@@ -136,6 +147,7 @@ struct Hosted {
     tresult last_result = kResultOk;
     std::mutex param_edits_mutex;
     std::vector<std::pair<int, float>> param_edits;
+    std::atomic<int32> restart_flags {0};
 
     void push_param_edit(int index, float value) {
         std::lock_guard<std::mutex> lock(param_edits_mutex);
@@ -156,6 +168,11 @@ tresult ComponentHandler::performEdit(ParamID id, ParamValue value) {
             break;
         }
     }
+    return kResultOk;
+}
+
+tresult ComponentHandler::restartComponent(int32 flags) {
+    if (owner) owner->restart_flags.fetch_or(flags);
     return kResultOk;
 }
 
@@ -328,6 +345,56 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
 
     hosted->in_ptrs.assign(hosted->in_channels, nullptr);
     hosted->out_ptrs.assign(hosted->out_channels, nullptr);
+
+    // Present every bus to the plugin. Bus 0 is wired (in `vst3_run`) to the
+    // real buffers; aux input buses (e.g. sidechain) are fed silence and aux
+    // output buses get throwaway scratch, so the bus topology matches what the
+    // plugin was configured with.
+    constexpr int32 kScratchFrames = 8192;
+    hosted->in_bus_count = in_buses;
+    hosted->out_bus_count = out_buses;
+    hosted->in_bus_buffers.assign(in_buses > 0 ? in_buses : 0, AudioBusBuffers {});
+    hosted->out_bus_buffers.assign(out_buses > 0 ? out_buses : 0, AudioBusBuffers {});
+    hosted->aux_in_ptrs.assign(in_buses > 0 ? in_buses : 0, {});
+    hosted->aux_out_ptrs.assign(out_buses > 0 ? out_buses : 0, {});
+    hosted->silence_frames.assign(kScratchFrames, 0.0f);
+
+    int32 aux_out_channels = 0;
+    for (int32 b = 1; b < out_buses; ++b) {
+        BusInfo info {};
+        if (hosted->component->getBusInfo(kAudio, kOutput, b, info) == kResultOk)
+            aux_out_channels += info.channelCount;
+    }
+    hosted->aux_out_frames.assign(static_cast<size_t>(aux_out_channels) * kScratchFrames, 0.0f);
+
+    for (int32 b = 1; b < in_buses; ++b) {
+        BusInfo info {};
+        const int32 channels =
+            hosted->component->getBusInfo(kAudio, kInput, b, info) == kResultOk
+                ? info.channelCount
+                : 0;
+        hosted->aux_in_ptrs[b].assign(channels, hosted->silence_frames.data());
+        hosted->in_bus_buffers[b].numChannels = channels;
+        hosted->in_bus_buffers[b].channelBuffers32 = hosted->aux_in_ptrs[b].data();
+    }
+    int32 aux_out_offset = 0;
+    for (int32 b = 1; b < out_buses; ++b) {
+        BusInfo info {};
+        const int32 channels =
+            hosted->component->getBusInfo(kAudio, kOutput, b, info) == kResultOk
+                ? info.channelCount
+                : 0;
+        auto& ptrs = hosted->aux_out_ptrs[b];
+        ptrs.assign(channels, nullptr);
+        for (auto& ptr : ptrs) {
+            ptr = hosted->aux_out_frames.data() +
+                  static_cast<size_t>(aux_out_offset) * kScratchFrames;
+            ++aux_out_offset;
+        }
+        hosted->out_bus_buffers[b].numChannels = channels;
+        hosted->out_bus_buffers[b].channelBuffers32 = ptrs.data();
+    }
+
     hosted->context.sampleRate = sample_rate;
     hosted->context.state = ProcessContext::kPlaying;
 
@@ -421,21 +488,25 @@ void vst3_run(void* handle, int frames) {
     auto* hosted = static_cast<Hosted*>(handle);
     if (!hosted || !hosted->processor) return;
 
-    AudioBusBuffers in_bus {};
-    in_bus.numChannels = hosted->in_channels;
-    in_bus.channelBuffers32 = hosted->in_ptrs.data();
-    AudioBusBuffers out_bus {};
-    out_bus.numChannels = hosted->out_channels;
-    out_bus.channelBuffers32 = hosted->out_ptrs.data();
+    // Bus 0 is the wired main signal; its pointer array is refreshed here
+    // because the Rust side connects the buffers after opening the plugin.
+    if (hosted->in_bus_count > 0) {
+        hosted->in_bus_buffers[0].numChannels = hosted->in_channels;
+        hosted->in_bus_buffers[0].channelBuffers32 = hosted->in_ptrs.data();
+    }
+    if (hosted->out_bus_count > 0) {
+        hosted->out_bus_buffers[0].numChannels = hosted->out_channels;
+        hosted->out_bus_buffers[0].channelBuffers32 = hosted->out_ptrs.data();
+    }
 
     ProcessData data {};
     data.processMode = kRealtime;
     data.symbolicSampleSize = kSample32;
     data.numSamples = frames;
-    data.numInputs = hosted->in_channels > 0 ? 1 : 0;
-    data.inputs = hosted->in_channels > 0 ? &in_bus : nullptr;
-    data.numOutputs = hosted->out_channels > 0 ? 1 : 0;
-    data.outputs = hosted->out_channels > 0 ? &out_bus : nullptr;
+    data.numInputs = hosted->in_bus_count;
+    data.inputs = hosted->in_bus_count > 0 ? hosted->in_bus_buffers.data() : nullptr;
+    data.numOutputs = hosted->out_bus_count;
+    data.outputs = hosted->out_bus_count > 0 ? hosted->out_bus_buffers.data() : nullptr;
     data.inputParameterChanges = &hosted->changes;
     data.outputParameterChanges = &hosted->out_changes;
     data.inputEvents = &hosted->events;
@@ -519,6 +590,20 @@ int vst3_take_param_edit(void* handle, int* index, float* value) {
     return 1;
 }
 
+/// Returns and clears the restart flags requested by the plugin.
+int vst3_take_restart_flags(void* handle) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted) return 0;
+    return hosted->restart_flags.exchange(0);
+}
+
+/// The plugin's reported processing latency in samples.
+int vst3_latency(void* handle) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted || !hosted->processor) return 0;
+    return static_cast<int>(hosted->processor->getLatencySamples());
+}
+
 /// Reports the tresults captured during setup and the last `process` call.
 int vst3_status(void* handle, int* setup, int* active, int* processing, int* last) {
     auto* hosted = static_cast<Hosted*>(handle);
@@ -544,9 +629,9 @@ int vst3_save_state(void* handle, char* out, int cap) {
 
 void vst3_view_close(void* handle);
 
-/// Opens the plugin's editor embedded into a fresh X11 window. Returns an
-/// opaque view handle, or null when the plugin has no X11 editor.
-void* vst3_view_open(void* instance, const char* title) {
+/// Opens the plugin's editor embedded into a fresh X11 window (never mapped
+/// when `headless`). Returns an opaque view handle, or null on failure.
+static void* open_view_impl(void* instance, const char* title, int headless) {
     static std::once_flag x_once;
     std::call_once(x_once, [] { XInitThreads(); });
 
@@ -571,7 +656,7 @@ void* vst3_view_open(void* instance, const char* title) {
     }
     Atom wm_delete = XInternAtom(dpy, "WM_DELETE_WINDOW", False);
     XSetWMProtocols(dpy, win, &wm_delete, 1);
-    XMapWindow(dpy, win);
+    if (!headless) XMapWindow(dpy, win);
     XFlush(dpy);
 
     auto* self = new VibemixVst3View();
@@ -596,6 +681,19 @@ void* vst3_view_open(void* instance, const char* title) {
         XFlush(dpy);
     }
     return self;
+}
+
+void* vst3_view_open(void* instance, const char* title) {
+    return open_view_impl(instance, title, 0);
+}
+
+/// Creates and tears down the editor headlessly, to catch crashing editors
+/// before opening one for real. Returns 1 when the editor was usable.
+int vst3_smoke_editor(void* instance) {
+    void* view = open_view_impl(instance, "vibemix editor smoke", 1);
+    if (!view) return 0;
+    vst3_view_close(view);
+    return 1;
 }
 
 /// Processes pending X events; a WM_DELETE_WINDOW sets the close flag.

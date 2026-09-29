@@ -79,7 +79,10 @@ extern "C" {
     fn vst3_bus_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_editor_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_has_editor(handle: *mut c_void) -> c_int;
+    fn vst3_smoke_editor(instance: *mut c_void) -> c_int;
     fn vst3_take_param_edit(handle: *mut c_void, index: *mut c_int, value: *mut f32) -> c_int;
+    fn vst3_take_restart_flags(handle: *mut c_void) -> c_int;
+    fn vst3_latency(handle: *mut c_void) -> c_int;
     fn vst3_view_open(instance: *mut c_void, title: *const c_char) -> *mut c_void;
     fn vst3_view_pump(handle: *mut c_void);
     fn vst3_view_wants_close(handle: *mut c_void) -> c_int;
@@ -349,6 +352,11 @@ impl PluginInstance {
         unsafe { vst3_has_editor(self.handle) != 0 }
     }
 
+    /// Creates and tears down the editor headlessly (crash canary).
+    pub fn smoke_editor(&self) -> bool {
+        unsafe { vst3_smoke_editor(self.handle) != 0 }
+    }
+
     /// Short description of the plugin's editor support (for diagnostics).
     pub fn editor_info(&self) -> String {
         let mut buf = [0i8; 256];
@@ -411,6 +419,24 @@ impl InstanceHandle {
         let (mut index, mut value) = (0, 0.0f32);
         let got = unsafe { vst3_take_param_edit(self.handle, &mut index, &mut value) };
         (got != 0).then_some((index.max(0) as usize, value))
+    }
+
+    /// Returns and clears the plugin's `IComponentHandler` restart flags.
+    pub fn take_restart_flags(&self) -> i32 {
+        unsafe { vst3_take_restart_flags(self.handle) }
+    }
+
+    /// The plugin's reported processing latency in samples.
+    pub fn latency(&self) -> u32 {
+        unsafe { vst3_latency(self.handle).max(0) as u32 }
+    }
+
+    pub fn param_count(&self) -> usize {
+        unsafe { vst3_param_count(self.handle).max(0) as usize }
+    }
+
+    pub fn param_value(&self, index: usize) -> f32 {
+        unsafe { vst3_get_param(self.handle, index as c_int) }
     }
 
     /// Opens the plugin's editor embedded into a fresh X11 window.

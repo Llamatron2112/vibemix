@@ -54,6 +54,10 @@ struct Args {
     #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "CLASS"])]
     smoke_vst3: Vec<String>,
 
+    /// Smoke-test a VST3 editor headlessly: `--smoke-vst3-ui <bundle> <class-id>`.
+    #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "CLASS"])]
+    smoke_vst3_ui: Vec<String>,
+
     /// Probe a VST3 plugin's audio path: `--probe-vst3 <bundle> <class-id>`.
     #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "CLASS"])]
     probe_vst3: Vec<String>,
@@ -92,6 +96,9 @@ fn main() -> Result<()> {
     }
     if args.smoke_vst3.len() == 2 {
         run_smoke_vst3(&args.smoke_vst3[0], &args.smoke_vst3[1]);
+    }
+    if args.smoke_vst3_ui.len() == 2 {
+        run_smoke_vst3_ui(&args.smoke_vst3_ui[0], &args.smoke_vst3_ui[1]);
     }
     if args.probe_vst3.len() == 2 {
         run_probe_vst3(&args.probe_vst3[0], &args.probe_vst3[1]);
@@ -165,6 +172,11 @@ fn run_smoke(uri: &str) -> ! {
 fn run_smoke_vst3(bundle: &str, class_id: &str) -> ! {
     smoke::disable_core_dumps();
     std::process::exit(smoke::smoke_plugin_vst3(bundle, class_id));
+}
+
+fn run_smoke_vst3_ui(bundle: &str, class_id: &str) -> ! {
+    smoke::disable_core_dumps();
+    std::process::exit(smoke::smoke_plugin_vst3_ui(bundle, class_id));
 }
 
 /// Feeds a sine through a VST3 plugin and reports the output peak per block, so

@@ -34,6 +34,12 @@ const CATALOG_THROTTLE: Duration = Duration::from_millis(250);
 /// editor's value display tracks a drag without flooding the control socket.
 const PARAM_ECHO_INTERVAL: Duration = Duration::from_millis(50);
 
+// `IComponentHandler::restartComponent` flags (VST3 `RestartFlags`).
+const VST3_RESTART_RELOAD: i32 = 1 << 0;
+const VST3_RESTART_IO: i32 = 1 << 1;
+const VST3_RESTART_PARAM_VALUES: i32 = 1 << 2;
+const VST3_RESTART_LATENCY: i32 = 1 << 3;
+
 #[derive(Default)]
 struct Actions {
     snapshot: bool,
@@ -99,6 +105,8 @@ pub struct Controller {
     uis: HashMap<(u32, u32, u32), OpenUi>,
     ui_cache: HashMap<String, Option<UiCandidate>>,
     ui_safe: HashMap<String, bool>,
+    /// Per-class VST3 editor smoke results.
+    vst3_ui_safe: HashMap<String, bool>,
     missing_report: Option<String>,
     pending_session: Option<(bool, String, String)>,
     sample_rate: u32,
@@ -293,6 +301,7 @@ impl Controller {
             uis: HashMap::new(),
             ui_cache: HashMap::new(),
             ui_safe: HashMap::new(),
+            vst3_ui_safe: HashMap::new(),
             missing_report,
             pending_session: None,
             sample_rate,
@@ -1422,38 +1431,28 @@ impl Controller {
         if let Some(safe) = self.ui_safe.get(uri) {
             return *safe;
         }
-
-        let safe = (|| {
-            let executable = std::env::current_exe().ok()?;
-            let mut child = Command::new(executable)
-                .arg("--smoke-ui")
-                .arg(uri)
-                .stdout(Stdio::null())
-                .stderr(Stdio::null())
-                .spawn()
-                .ok()?;
-            let deadline = Instant::now() + Duration::from_secs(10);
-            loop {
-                match child.try_wait() {
-                    Ok(Some(status)) => return Some(status.success()),
-                    Ok(None) => {
-                        if Instant::now() > deadline {
-                            let _ = child.kill();
-                            let _ = child.wait();
-                            return Some(false);
-                        }
-                        std::thread::sleep(Duration::from_millis(20));
-                    }
-                    Err(_) => return Some(true),
-                }
-            }
-        })()
-        .unwrap_or(true);
-
+        let safe = ui_smoke_ok(&["--smoke-ui", uri], Duration::from_secs(10));
         if !safe {
             tracing::warn!(%uri, "plugin UI failed smoke test; not opening");
         }
         self.ui_safe.insert(uri.to_string(), safe);
+        safe
+    }
+
+    /// Runs the VST3 editor headlessly in a child so a crashing editor is
+    /// refused rather than taking the engine down.
+    fn vst3_ui_is_safe(&mut self, bundle: &str, class_id: &str) -> bool {
+        if let Some(safe) = self.vst3_ui_safe.get(class_id) {
+            return *safe;
+        }
+        let safe = ui_smoke_ok(
+            &["--smoke-vst3-ui", bundle, class_id],
+            Duration::from_secs(10),
+        );
+        if !safe {
+            tracing::warn!(%class_id, "VST3 editor failed smoke test; not opening");
+        }
+        self.vst3_ui_safe.insert(class_id.to_string(), safe);
         safe
     }
 
@@ -1466,14 +1465,28 @@ impl Controller {
             self.model
                 .strip(StripId(target))
                 .and_then(|entry| strip_plugin_list(entry, chain).get(slot as usize))
-                .map(|plugin| (plugin.uri.clone(), plugin.format, plugin.name.clone()))
+                .map(|plugin| {
+                    (
+                        plugin.uri.clone(),
+                        plugin.format,
+                        plugin.bundle.clone(),
+                        plugin.name.clone(),
+                    )
+                })
         } else {
             self.model
                 .bus(BusId(target))
                 .and_then(|entry| entry.plugins.get(slot as usize))
-                .map(|plugin| (plugin.uri.clone(), plugin.format, plugin.name.clone()))
+                .map(|plugin| {
+                    (
+                        plugin.uri.clone(),
+                        plugin.format,
+                        plugin.bundle.clone(),
+                        plugin.name.clone(),
+                    )
+                })
         };
-        let Some((uri, format, model_name)) = plugin else {
+        let Some((uri, format, bundle, model_name)) = plugin else {
             return;
         };
 
@@ -1490,6 +1503,13 @@ impl Controller {
         };
 
         if format == PluginFormat::Vst3 {
+            let Some(bundle) = bundle else {
+                tracing::warn!(%uri, "VST3 plugin has no bundle for editor");
+                return;
+            };
+            if !self.vst3_ui_is_safe(&bundle, &uri) {
+                return;
+            }
             let state = if let Some(chain) = strip_chain(location) {
                 self.engine.state_proxy(target as usize, chain, slot as usize)
             } else {
@@ -1610,9 +1630,19 @@ impl Controller {
         }
     }
 
+    fn apply_vst3_param(&self, location: u32, target: u32, slot: u32, param: usize, value: f32) {
+        if let Some(chain) = strip_chain(location) {
+            self.params
+                .set_plugin_param(target as usize, chain, slot as usize, param, value);
+        } else {
+            self.params
+                .set_bus_plugin_param(target as usize, slot as usize, param, value);
+        }
+    }
+
     /// Folds parameter moves made in open VST3 editors into the shared state
     /// (mirrors the LV2 `ui:portEvent` write-back). Returns true if any moved.
-    fn drain_vst3_param_edits(&mut self) -> bool {
+    fn drain_vst3_param_edits(&self) -> bool {
         let mut changed = false;
         for (key, ui) in self.uis.iter() {
             let OpenUi::Vst3 { handle, .. } = ui else {
@@ -1620,18 +1650,22 @@ impl Controller {
             };
             let (location, target, slot) = *key;
             while let Some((param, value)) = handle.take_param_edit() {
-                if let Some(chain) = strip_chain(location) {
-                    self.params.set_plugin_param(
-                        target as usize,
-                        chain,
-                        slot as usize,
-                        param,
-                        value,
-                    );
-                } else {
-                    self.params.set_bus_plugin_param(target as usize, slot as usize, param, value);
+                self.apply_vst3_param(location, target, slot, param, value);
+                changed = true;
+            }
+
+            // The plugin may have changed its own parameters, latency or IO.
+            let flags = handle.take_restart_flags();
+            if flags & VST3_RESTART_PARAM_VALUES != 0 {
+                for param in 0..handle.param_count().min(MAX_PARAMS) {
+                    let value = handle.param_value(param);
+                    self.apply_vst3_param(location, target, slot, param, value);
                 }
                 changed = true;
+            }
+            if flags & (VST3_RESTART_LATENCY | VST3_RESTART_IO | VST3_RESTART_RELOAD) != 0 {
+                let latency = handle.latency();
+                tracing::info!(flags, latency, location, target, slot, "VST3 plugin requested restart");
             }
         }
         changed
@@ -2762,6 +2796,38 @@ fn build_catalog(plugins: &[PluginEntry], health: &HealthStore) -> String {
 }
 
 /// Mono/stereo LV2 plugins plus every VST3 effect, in catalog order.
+/// Runs the engine binary with `args` as a throwaway UI smoke test. A child
+/// that exits non-zero or exceeds `timeout` is considered unsafe; a failure to
+/// spawn at all is treated as safe (same as the LV2 path).
+fn ui_smoke_ok(args: &[&str], timeout: Duration) -> bool {
+    let Ok(executable) = std::env::current_exe() else {
+        return true;
+    };
+    let Ok(mut child) = Command::new(executable)
+        .args(args)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+    else {
+        return true;
+    };
+    let deadline = Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => return status.success(),
+            Ok(None) => {
+                if Instant::now() > deadline {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    return false;
+                }
+                std::thread::sleep(Duration::from_millis(20));
+            }
+            Err(_) => return true,
+        }
+    }
+}
+
 fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> {
     let mut entries: Vec<PluginEntry> = host
         .discover()

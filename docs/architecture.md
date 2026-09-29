@@ -272,9 +272,16 @@ button. Host-driven parameter edits reach the editor through
 `IEditController::setParamNormalized`, and moves made in the editor are folded
 back into the shared parameter state via an `IComponentHandler::performEdit`
 queue (mirroring the LV2 `ui:portEvent` write-back), so they survive session
-saves and are pushed to the DSP. The editor button is only shown when the
-plugin reports an X11-editable view. VST3 editors are not gated by the LV2 UI
-smoke test (they cannot be exercised headlessly the same way).
+saves and are pushed to the DSP. `restartComponent` is observed as well:
+`kParamValuesChanged` resyncs the shared values, and latency/IO/reload requests
+are logged. Opening an editor is gated by a headless child smoke test
+(`--smoke-vst3-ui`), and the editor button is only shown when the plugin
+reports an X11-editable view.
+
+Every audio bus the plugin declares is presented during processing: bus 0 is
+wired to the strip/bus signal, extra input buses (e.g. a sidechain) are fed
+silence, and extra output buses get throwaway scratch, so a plugin's bus
+topology is preserved even though vibemix only routes the main bus.
 
 Not supported: Qt plugin UIs (and GTK4).
 

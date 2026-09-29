@@ -11,6 +11,7 @@ use vibemix_lv2::Host;
 
 pub const SMOKE_OK: i32 = 0;
 pub const SMOKE_INSTANTIATE_FAILED: i32 = 2;
+pub const SMOKE_FAILED: i32 = 3;
 
 const SMOKE_FRAMES: usize = 512;
 const SMOKE_BLOCKS: usize = 64;
@@ -72,6 +73,26 @@ pub fn smoke_plugin_vst3(bundle: &str, class_id: &str) -> i32 {
         instance.run(SMOKE_FRAMES);
     }
     SMOKE_OK
+}
+
+/// Creates and tears down a VST3 plugin's editor headlessly, so a crashing
+/// editor is caught before the engine opens one for real.
+pub fn smoke_plugin_vst3_ui(bundle: &str, class_id: &str) -> i32 {
+    let host = vibemix_vst3::Host::new();
+    let Some(instance) = host.instantiate(
+        bundle,
+        class_id,
+        48_000.0,
+        SMOKE_FRAMES,
+        vibemix_vst3::PluginInstance::max_frames(),
+    ) else {
+        return SMOKE_INSTANTIATE_FAILED;
+    };
+    if instance.smoke_editor() {
+        SMOKE_OK
+    } else {
+        SMOKE_FAILED
+    }
 }
 
 /// A plugin to smoke-test.
