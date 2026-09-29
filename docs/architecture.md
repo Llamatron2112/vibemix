@@ -373,9 +373,54 @@ post-fader, `2` bus insert — and `target` (the strip or bus id).
   Done (no AppImage/Flatpak).
 - **Phase 5** - editor quality-of-life: single-plugin clipboard (copy/cut/paste,
   chain-aware), duplicate strip/bus, and snapshot-based undo/redo. Done.
+- **Phase 6** - MIDI: clock-slave sync (tempo/transport from incoming MIDI
+  clock), LV2 host tempo (`time:Position`/`time:tempo`), a MIDI control surface
+  (CC to faders/params, learnable, saved with the session), transport/position
+  counters, and a mono/stereo plugin-picker filter. See below.
 - **Unscheduled** - a native PipeWire `pw_filter` backend (finalizing the
   `AudioBackend` trait). No arbitrary module graph / port matrix is planned; the
   strip/bus/preset mixer topology is the design.
+
+### Phase 6 - MIDI
+
+The mixer is a MIDI **clock slave** (computers make poor clock masters): it
+follows an incoming 24 PPQN MIDI clock to derive tempo and transport, and never
+generates clock. A single JACK `MidiIn` port carries clock, transport, notes and
+CC; a matching `MidiOut` (feedback) is deferred.
+
+- **Host tempo:** each block a `time:Position` atom (`frame`, `beat`, `bar`,
+  `barBeat`, `beatsPerMinute`) is forged into every atom input port that
+  `atom:supports time:Position`, and the `time:tempo` instantiate option is
+  provided, so tempo-synced effects (e.g. LSP delays) follow the clock. Incoming
+  MIDI is also forwarded to plugin atom inputs that support `midi:MidiEvent`.
+- **Transport:** `0xFA` Start (reset position), `0xFB` Continue (resume), `0xFC`
+  Stop (hold position), optional `0xF2` Song Position; a "locked" state with a
+  timeout when clock stops.
+- **Control surface:** incoming CC is matched against a per-session binding table
+  (fixed, lock-free, applied on the audio thread) and drives strip fader (gain),
+  pan, mute, solo, bus fader (gain), bus mute, send gain/delay, and plugin
+  parameters/bypass. Absolute and relative encoders are supported, matched CCs
+  are consumed (others are forwarded to plugins), and bindings are learnable and
+  saved in the session.
+- **UI:** the top status bar has a right-click menu to toggle counters
+  (beats:bars since start, minutes:seconds, loop indicator) and open a small
+  loop-settings popup (unit beats/bars, value, beats-per-bar). The engine
+  publishes `{ locked, playing, bpm, beats_since_start, seconds_since_start }`
+  at meter rate; counter/loop settings live in the session.
+- **Channels:** each strip and bus owns an optional MIDI channel ("any", or
+  1-16) set from the bindings grid; its fader/pan/mute/solo/send bindings
+  listen on that channel (several strips may share one, and mixer bindings
+  ignore their stored channel in favour of the owner's). Each plugin owns a
+  single optional channel too: while learning a parameter, only CCs on that
+  channel are captured, and the binding follows it. Plugin parameters are bound
+  from the plugin editor (right-click a parameter row for CC/Learn/Clear), and
+  active bindings show as `channel:CC` beside the row.
+- **Out of scope:** instruments and MIDI-only plugins (would drift toward a DAW
+  / sequencer); clock generation; MIDI output/feedback (future).
+
+Designations: LV2 plugins are still the only plugin format (Phase 7 below is
+unscheduled). A format-agnostic host trait would be required before adding CLAP
+(clean licensing) or VST3 (GPLv3 SDK implications); VST2 is not planned.
 
 ## Editing history and clipboard
 

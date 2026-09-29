@@ -211,10 +211,12 @@ ApplicationWindow {
         var delay = entry.send_delays[busId]
         return delay === undefined ? 0 : delay
     }
-    function filteredCatalog(query) {
-        if (!query) return catalog
-        var needle = query.toLowerCase()
+    function filteredCatalog(query, channel) {
+        var needle = query ? query.toLowerCase() : ""
         return catalog.filter(function(entry) {
+            if (channel === "mono" && entry.inputs !== 1) return false
+            if (channel === "stereo" && entry.inputs !== 2) return false
+            if (!needle) return true
             return entry.name.toLowerCase().indexOf(needle) >= 0
                 || entry.uri.toLowerCase().indexOf(needle) >= 0
         })
@@ -223,6 +225,169 @@ ApplicationWindow {
         var text = String(url)
         if (text.indexOf("file://") === 0) text = text.slice(7)
         return text
+    }
+
+    function transportUi() {
+        var t = mix.transport_ui
+        return t ? t : ({ beats: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8 })
+    }
+    function setTransportUi(patch) {
+        var t = root.transportUi()
+        var next = {
+            beats: t.beats, time: t.time, loop_indicator: t.loop_indicator,
+            loop_bars: t.loop_bars, loop_length: t.loop_length
+        }
+        for (var k in patch) next[k] = patch[k]
+        backend.setTransportUi(JSON.stringify(next))
+    }
+    function clockInfo() { return JSON.parse(backend.clock) }
+    function beatsPerBar() {
+        var bpb = root.clockInfo().beats_per_bar
+        return bpb > 0 ? bpb : 4
+    }
+    function beatCounter() {
+        var c = root.clockInfo()
+        var bpb = root.beatsPerBar()
+        return (Math.floor(c.beats / bpb) + 1) + "." + (Math.floor(c.beats % bpb) + 1)
+    }
+    function timeCounter() {
+        var s = Math.floor(root.clockInfo().seconds)
+        var m = Math.floor(s / 60)
+        s = s % 60
+        return m + ":" + (s < 10 ? "0" : "") + s
+    }
+    function loopInfo() {
+        var t = root.transportUi()
+        var c = root.clockInfo()
+        var len = Math.max(1, t.loop_length)
+        var total = t.loop_bars ? len * root.beatsPerBar() : len
+        var index = Math.floor(((c.beats % total) + total) % total / total * len)
+        return { count: len, index: index, bars: t.loop_bars }
+    }
+    function midiKindName(kind) {
+        switch (kind) {
+        case 0: return "strip_gain"
+        case 1: return "strip_pan"
+        case 2: return "strip_mute"
+        case 3: return "strip_solo"
+        case 4: return "bus_gain"
+        case 5: return "bus_mute"
+        case 6: return "send_gain"
+        case 7: return "send_delay"
+        case 8: return "plugin_param"
+        case 9: return "plugin_bypass"
+        default: return ""
+        }
+    }
+    function bindingSpec(name, paramLabel, kind, target, min, max) {
+        return {
+            label: name + " — " + paramLabel,
+            kind: kind, location: 0, target: target,
+            slot: 0, param: 0, min: min, max: max
+        }
+    }
+    function midiBindingRows() {
+        var rows = []
+        for (var i = 0; i < mix.strips.length; ++i) {
+            var s = mix.strips[i]
+            var sc = s.midi_channel !== undefined ? s.midi_channel : null
+            rows.push({
+                label: s.name,
+                is_bus: false,
+                target: s.id,
+                channel: sc,
+                cells: [
+                    root.bindingSpec(s.name, "fader", 0, s.id, 0.0, 2.0),
+                    root.bindingSpec(s.name, "pan", 1, s.id, -1.0, 1.0),
+                    root.bindingSpec(s.name, "mute", 2, s.id, 0.0, 1.0),
+                    root.bindingSpec(s.name, "solo", 3, s.id, 0.0, 1.0)
+                ]
+            })
+        }
+        for (var j = 0; j < mix.buses.length; ++j) {
+            var b = mix.buses[j]
+            var bc = b.midi_channel !== undefined ? b.midi_channel : null
+            rows.push({
+                label: b.name,
+                is_bus: true,
+                target: b.id,
+                channel: bc,
+                cells: [
+                    root.bindingSpec(b.name, "fader", 4, b.id, 0.0, 2.0),
+                    null,
+                    root.bindingSpec(b.name, "mute", 5, b.id, 0.0, 1.0),
+                    null
+                ]
+            })
+        }
+        return rows
+    }
+    function pluginBinding(location, target, slot, param) {
+        var list = mix.midi_bindings || []
+        for (var i = 0; i < list.length; ++i) {
+            var b = list[i]
+            if (b.target === "plugin_param" && b.location === location
+                    && b.target_id === target && b.slot === slot && b.param === param) {
+                return b
+            }
+        }
+        return null
+    }
+    function paramBindingText(location, target, slot, param) {
+        var b = root.pluginBinding(location, target, slot, param)
+        if (!b) {
+            return ""
+        }
+        return (b.channel >= 16 ? "any" : String(b.channel + 1)) + ":" + b.cc
+    }
+    function pluginSlot(location, target, slot) {
+        var strips = mix.strips || []
+        var buses = mix.buses || []
+        var owners = location === 2 ? buses : strips
+        for (var i = 0; i < owners.length; ++i) {
+            if (owners[i].id !== target) {
+                continue
+            }
+            var plugins = location === 1 ? owners[i].plugins_post : owners[i].plugins
+            plugins = plugins || []
+            for (var j = 0; j < plugins.length; ++j) {
+                if (plugins[j].slot === slot) {
+                    return plugins[j]
+                }
+            }
+        }
+        return null
+    }
+    function pluginMidiChannel(location, target, slot) {
+        var plugin = root.pluginSlot(location, target, slot)
+        return plugin && plugin.midi_channel !== undefined ? plugin.midi_channel : null
+    }
+    function channelLabel(channel) {
+        return channel === null || channel === undefined ? "any" : ("ch " + (channel + 1))
+    }
+    function midiCcFor(kind, location, target, slot, param) {
+        var name = root.midiKindName(kind)
+        var list = mix.midi_bindings || []
+        for (var i = 0; i < list.length; ++i) {
+            var b = list[i]
+            if (b.target === name && b.location === location && b.target_id === target
+                    && b.slot === slot && b.param === param) {
+                return String(b.cc)
+            }
+        }
+        return ""
+    }
+    function midiBindFromField(kind, location, target, slot, param, min, max, text) {
+        var t = String(text).trim()
+        if (t === "") {
+            backend.midiUnbind(kind, location, target, slot, param)
+            return
+        }
+        var cc = parseInt(t, 10)
+        if (isNaN(cc) || cc < 0 || cc > 127) {
+            return
+        }
+        backend.midiBind(kind, location, target, slot, param, min, max, 16, cc)
     }
     function fileName(path) {
         if (!path) return "untitled"
@@ -353,38 +518,125 @@ ApplicationWindow {
             }
         }
 
+        Menu {
+            title: "MIDI"
+            MenuItem {
+                text: "MIDI sync"
+                checkable: true
+                checked: mix.midi_sync === true
+                enabled: backend.connected
+                onTriggered: backend.setMidiSync(!(mix.midi_sync === true))
+            }
+            MenuSeparator { }
+            MenuItem {
+                text: "MIDI bindings…"
+                enabled: backend.connected
+                onTriggered: midiBindingsWindow.show()
+            }
+        }
+
         background: Rectangle {
             color: palette.button
 
-            RowLayout {
-                anchors.right: parent.right
-                anchors.rightMargin: 8
-                anchors.verticalCenter: parent.verticalCenter
-                spacing: 8
+            MouseArea {
+                anchors.fill: parent
+                acceptedButtons: Qt.RightButton
+                onClicked: transportMenu.popup()
 
-                Label {
-                    text: backend.action
-                    visible: backend.action.length > 0
-                    color: root.mutedText
-                    font.pixelSize: 11
+                RowLayout {
+                    anchors.right: parent.right
+                    anchors.rightMargin: 8
+                    anchors.verticalCenter: parent.verticalCenter
+                    spacing: 8
+
+                    Label {
+                        visible: root.transportUi().beats
+                        text: root.beatCounter()
+                        color: backend.clock.indexOf("\"locked\":true") >= 0 ? root.textColor : root.mutedText
+                        font.pixelSize: 11
+                        font.family: "monospace"
+                    }
+
+                    Label {
+                        visible: root.transportUi().time
+                        text: root.timeCounter()
+                        color: root.mutedText
+                        font.pixelSize: 11
+                        font.family: "monospace"
+                    }
+
+                    Label {
+                        visible: backend.clock.length > 0 && root.clockInfo().playing
+                        text: "\u25B6"
+                        color: root.accentColor
+                        font.pixelSize: 10
+                    }
+
+                    Row {
+                        visible: root.transportUi().loop_indicator && backend.clock.length > 0
+                        spacing: 2
+
+                        Repeater {
+                            model: root.loopInfo().count
+                            Rectangle {
+                                width: 6
+                                height: 6
+                                color: index <= root.loopInfo().index ? root.accentColor : root.borderColor
+                            }
+                        }
+                    }
+
+                    Label {
+                        text: backend.action
+                        visible: backend.action.length > 0
+                        color: root.mutedText
+                        font.pixelSize: 11
+                    }
+
+                    Label {
+                        text: backend.xruns + " xruns"
+                        visible: backend.xruns > 0
+                        color: "#e53935"
+                        font.pixelSize: 11
+                    }
+
+                    Rectangle {
+                        implicitWidth: 8
+                        implicitHeight: 8
+                        color: backend.connected ? "#43a047" : "#e53935"
+
+                        HoverHandler { id: statusDotHover }
+                        ToolTip.visible: statusDotHover.hovered
+                        ToolTip.text: backend.connected ? "connected" : "not running"
+                        ToolTip.delay: 300
+                    }
                 }
 
-                Label {
-                    text: backend.xruns + " xruns"
-                    visible: backend.xruns > 0
-                    color: "#e53935"
-                    font.pixelSize: 11
-                }
-
-                Rectangle {
-                    implicitWidth: 8
-                    implicitHeight: 8
-                    color: backend.connected ? "#43a047" : "#e53935"
-
-                    HoverHandler { id: statusDotHover }
-                    ToolTip.visible: statusDotHover.hovered
-                    ToolTip.text: backend.connected ? "connected" : "not running"
-                    ToolTip.delay: 300
+                Menu {
+                    id: transportMenu
+                    MenuItem {
+                        text: "Beats:bars counter"
+                        checkable: true
+                        checked: root.transportUi().beats
+                        onTriggered: root.setTransportUi({ beats: !root.transportUi().beats })
+                    }
+                    MenuItem {
+                        text: "Minutes:seconds counter"
+                        checkable: true
+                        checked: root.transportUi().time
+                        onTriggered: root.setTransportUi({ time: !root.transportUi().time })
+                    }
+                    MenuItem {
+                        text: "Loop indicator"
+                        checkable: true
+                        checked: root.transportUi().loop_indicator
+                        onTriggered: root.setTransportUi({ loop_indicator: !root.transportUi().loop_indicator })
+                    }
+                    MenuSeparator { }
+                    MenuItem {
+                        text: "Loop settings…"
+                        onTriggered: loopDialog.open()
+                    }
                 }
             }
         }
@@ -571,6 +823,7 @@ ApplicationWindow {
         pickerWindow.location = location
         pickerWindow.target = target
         pickerFilter.text = ""
+        pickerWindow.channelFilter = ""
         pickerWindow.show()
     }
 
@@ -630,6 +883,61 @@ ApplicationWindow {
             font.pixelSize: 11
             horizontalAlignment: Text.AlignHCenter
             verticalAlignment: Text.AlignVCenter
+        }
+    }
+
+    component BindingCell: Rectangle {
+        id: cell
+        property var spec: null
+        property var bindingHost: null
+        implicitWidth: 56
+        implicitHeight: 22
+        color: (cellHover.hovered && cell.spec !== null) ? root.controlColor : "transparent"
+        border.color: root.borderColor
+        border.width: 1
+
+        Label {
+            anchors.centerIn: parent
+            text: cell.spec === null
+                ? ""
+                : (root.midiCcFor(cell.spec.kind, cell.spec.location, cell.spec.target,
+                    cell.spec.slot, cell.spec.param) || "—")
+            color: root.textColor
+            font.pixelSize: 10
+        }
+
+        HoverHandler { id: cellHover }
+
+        MouseArea {
+            anchors.fill: parent
+            enabled: cell.spec !== null
+            onClicked: cellMenu.popup()
+        }
+
+        Menu {
+            id: cellMenu
+            MenuItem {
+                text: "Edit…"
+                enabled: cell.spec !== null
+                onTriggered: {
+                    if (cell.bindingHost) {
+                        cell.bindingHost.beginEditBinding(cell.spec)
+                    }
+                }
+            }
+            MenuItem {
+                text: "Learn"
+                enabled: cell.spec !== null
+                onTriggered: backend.midiLearn(cell.spec.kind, cell.spec.location,
+                    cell.spec.target, cell.spec.slot, cell.spec.param,
+                    cell.spec.min, cell.spec.max)
+            }
+            MenuItem {
+                text: "Clear"
+                enabled: cell.spec !== null
+                onTriggered: backend.midiUnbind(cell.spec.kind, cell.spec.location,
+                    cell.spec.target, cell.spec.slot, cell.spec.param)
+            }
         }
     }
 
@@ -1652,6 +1960,7 @@ ApplicationWindow {
         property int paramLocation
         property int paramTarget
         property int paramSlot
+        property var bindingHost: null
         spacing: 6
 
         readonly property real currentValue: root.paramValue(paramLocation, paramTarget, paramSlot, paramIndex)
@@ -1764,6 +2073,49 @@ ApplicationWindow {
                 Keys.onEscapePressed: valueField.visible = false
             }
         }
+
+        Label {
+            width: 56
+            text: root.paramBindingText(parameterRow.paramLocation, parameterRow.paramTarget, parameterRow.paramSlot, parameterRow.paramIndex)
+            color: root.mutedText
+            font.pixelSize: 10
+            horizontalAlignment: Text.AlignRight
+            verticalAlignment: Text.AlignVCenter
+            anchors.verticalCenter: parent.verticalCenter
+        }
+
+        TapHandler {
+            acceptedButtons: Qt.RightButton
+            onTapped: parameterMenu.popup()
+        }
+
+        Menu {
+            id: parameterMenu
+            MenuItem {
+                text: "MIDI binding…"
+                onTriggered: {
+                    if (parameterRow.bindingHost) {
+                        parameterRow.bindingHost.beginParamBinding(
+                            parameterRow.paramLocation,
+                            parameterRow.paramTarget,
+                            parameterRow.paramSlot,
+                            parameterRow.paramIndex,
+                            parameterRow.controlData.min,
+                            parameterRow.controlData.max,
+                            parameterRow.controlData.name)
+                    }
+                }
+            }
+            MenuItem {
+                text: "clear binding"
+                enabled: root.paramBindingText(parameterRow.paramLocation, parameterRow.paramTarget, parameterRow.paramSlot, parameterRow.paramIndex) !== ""
+                onTriggered: backend.midiUnbind(
+                    parameterRow.paramLocation,
+                    parameterRow.paramTarget,
+                    parameterRow.paramSlot,
+                    parameterRow.paramIndex)
+            }
+        }
     }
 
     Component {
@@ -1776,6 +2128,7 @@ ApplicationWindow {
             property int slot: -1
             property string editorKey: ""
             property string pluginUri: ""
+            property var bindingSpec: null
             visible: true
             width: 500
             height: 560
@@ -1783,6 +2136,47 @@ ApplicationWindow {
             minimumHeight: 240
             title: root.pluginName(editorWindow.location, editorWindow.target, editorWindow.slot)
             color: root.palette.window
+
+            function beginParamBinding(location, target, slot, param, min, max, label) {
+                var lo = (min === undefined || isNaN(min)) ? 0 : min
+                var hi = (max === undefined || isNaN(max)) ? 1 : max
+                editorWindow.bindingSpec = {
+                    label: label, kind: 8, location: location, target: target,
+                    slot: slot, param: param, min: lo, max: hi
+                }
+                var existing = root.pluginBinding(location, target, slot, param)
+                paramEditCc.text = existing ? String(existing.cc) : ""
+                paramEdit.open()
+            }
+
+            function commitParamBinding() {
+                var spec = editorWindow.bindingSpec
+                if (!spec) {
+                    paramEdit.close()
+                    return
+                }
+                var cc = parseInt(paramEditCc.text, 10)
+                if (!isNaN(cc) && cc >= 0 && cc <= 127) {
+                    backend.midiBind(spec.kind, spec.location, spec.target, spec.slot, spec.param, spec.min, spec.max, 16, cc)
+                }
+                paramEdit.close()
+            }
+
+            function learnParamBinding() {
+                var spec = editorWindow.bindingSpec
+                if (spec) {
+                    backend.midiLearn(spec.kind, spec.location, spec.target, spec.slot, spec.param, spec.min, spec.max)
+                }
+                paramEdit.close()
+            }
+
+            function clearParamBinding() {
+                var spec = editorWindow.bindingSpec
+                if (spec) {
+                    backend.midiUnbind(spec.kind, spec.location, spec.target, spec.slot, spec.param)
+                }
+                paramEdit.close()
+            }
 
             ColumnLayout {
                 anchors.fill: parent
@@ -1807,6 +2201,45 @@ ApplicationWindow {
                     FlatButton {
                         text: "close"
                         onClicked: editorWindow.close()
+                    }
+                }
+
+                RowLayout {
+                    spacing: 6
+
+                    Label {
+                        text: "MIDI channel"
+                        color: root.mutedText
+                        font.pixelSize: 11
+                    }
+
+                    FlatButton {
+                        text: root.channelLabel(root.pluginMidiChannel(editorWindow.location, editorWindow.target, editorWindow.slot))
+                        onClicked: pluginChannelMenu.popup()
+
+                        Menu {
+                            id: pluginChannelMenu
+                            MenuItem {
+                                text: "any"
+                                onTriggered: backend.setPluginMidiChannel(editorWindow.location, editorWindow.target, editorWindow.slot, 16)
+                            }
+                            MenuSeparator {}
+                            Repeater {
+                                model: 16
+                                MenuItem {
+                                    text: "ch " + (index + 1)
+                                    onTriggered: backend.setPluginMidiChannel(editorWindow.location, editorWindow.target, editorWindow.slot, index)
+                                }
+                            }
+                        }
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: "parameters learn only on this channel"
+                        color: root.mutedText
+                        font.pixelSize: 10
+                        elide: Text.ElideRight
                     }
                 }
 
@@ -1837,7 +2270,91 @@ ApplicationWindow {
                                 paramLocation: editorWindow.location
                                 paramTarget: editorWindow.target
                                 paramSlot: editorWindow.slot
+                                bindingHost: editorWindow
                             }
+                        }
+                    }
+                }
+            }
+
+            Dialog {
+                id: paramEdit
+                title: "MIDI binding"
+                modal: true
+                anchors.centerIn: parent
+                width: 300
+                padding: 10
+
+                contentItem: ColumnLayout {
+                    width: paramEdit.availableWidth
+                    spacing: 8
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: editorWindow.bindingSpec ? editorWindow.bindingSpec.label : ""
+                        color: root.textColor
+                        elide: Text.ElideRight
+                        font.pixelSize: 11
+                    }
+
+                    Label {
+                        Layout.fillWidth: true
+                        text: "channel: " + root.channelLabel(root.pluginMidiChannel(editorWindow.location, editorWindow.target, editorWindow.slot))
+                        color: root.mutedText
+                        font.pixelSize: 11
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        Label {
+                            text: "CC"
+                            color: root.mutedText
+                            font.pixelSize: 11
+                        }
+                        TextField {
+                            id: paramEditCc
+                            Layout.preferredWidth: 56
+                            implicitHeight: 24
+                            placeholderText: "0-127"
+                            inputMethodHints: Qt.ImhDigitsOnly
+                            onAccepted: editorWindow.commitParamBinding()
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        FlatButton {
+                            Layout.preferredWidth: 64
+                            text: "learn"
+                            onClicked: editorWindow.learnParamBinding()
+                        }
+                        FlatButton {
+                            Layout.preferredWidth: 64
+                            text: "clear"
+                            onClicked: editorWindow.clearParamBinding()
+                        }
+                        Item { Layout.fillWidth: true }
+                    }
+
+                    RowLayout {
+                        Layout.fillWidth: true
+                        spacing: 6
+
+                        Item { Layout.fillWidth: true }
+                        FlatButton {
+                            Layout.preferredWidth: 72
+                            text: "cancel"
+                            onClicked: paramEdit.close()
+                        }
+                        FlatButton {
+                            Layout.preferredWidth: 64
+                            text: "ok"
+                            onClicked: editorWindow.commitParamBinding()
                         }
                     }
                 }
@@ -1852,6 +2369,7 @@ ApplicationWindow {
         property int location: 0
         property int target: -1
         property bool scanning: false
+        property string channelFilter: ""
 
         modality: Qt.ApplicationModal
         flags: Qt.Dialog
@@ -1905,16 +2423,38 @@ ApplicationWindow {
                 }
             }
 
-            TextField {
-                id: pickerFilter
+            RowLayout {
                 Layout.fillWidth: true
-                implicitHeight: 24
-                placeholderText: "filter..."
+                spacing: 4
+
+                TextField {
+                    id: pickerFilter
+                    Layout.fillWidth: true
+                    implicitHeight: 24
+                    placeholderText: "filter..."
+                }
+
+                FlatButton {
+                    text: "all"
+                    enabled: pickerWindow.channelFilter !== ""
+                    onClicked: pickerWindow.channelFilter = ""
+                }
+                FlatButton {
+                    text: "mono"
+                    enabled: pickerWindow.channelFilter !== "mono"
+                    onClicked: pickerWindow.channelFilter = "mono"
+                }
+                FlatButton {
+                    text: "stereo"
+                    enabled: pickerWindow.channelFilter !== "stereo"
+                    onClicked: pickerWindow.channelFilter = "stereo"
+                }
             }
 
             Label {
                 Layout.fillWidth: true
-                text: root.filteredCatalog(pickerFilter.text).length + " / " + catalog.length + " plugins"
+                text: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter).length
+                    + " / " + catalog.length + " plugins"
                 color: root.mutedText
                 font.pixelSize: 9
             }
@@ -1924,7 +2464,7 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
                 clip: true
-                model: root.filteredCatalog(pickerFilter.text)
+                model: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter)
                 boundsBehavior: Flickable.StopAtBounds
                 ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
 
@@ -1956,6 +2496,265 @@ ApplicationWindow {
                         }
                     }
                 }
+            }
+        }
+    }
+
+    Window {
+        id: midiBindingsWindow
+        title: "MIDI bindings"
+        modality: Qt.ApplicationModal
+        flags: Qt.Dialog
+        transientParent: root
+        visible: false
+        width: 520
+        height: 560
+        color: palette.window
+
+        function beginEditBinding(spec) {
+            if (!spec) {
+                return
+            }
+            bindingEdit.spec = spec
+            bindingEditField.text = root.midiCcFor(spec.kind, spec.location, spec.target, spec.slot, spec.param)
+            bindingEdit.open()
+        }
+
+        function commitEditBinding() {
+            var spec = bindingEdit.spec
+            if (!spec) {
+                bindingEdit.close()
+                return
+            }
+            root.midiBindFromField(spec.kind, spec.location, spec.target, spec.slot, spec.param, spec.min, spec.max, bindingEditField.text)
+            bindingEdit.close()
+        }
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: "click a parameter to Edit / Learn / Clear"
+                    color: root.mutedText
+                    font.pixelSize: 11
+                }
+                FlatButton {
+                    text: "clear all"
+                    onClicked: backend.midiBindingsClear()
+                }
+                FlatButton {
+                    text: "close"
+                    onClicked: midiBindingsWindow.close()
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+
+                Label {
+                    Layout.preferredWidth: 160
+                    text: ""
+                }
+                Label {
+                    Layout.preferredWidth: 56
+                    text: "channel"
+                    horizontalAlignment: Text.AlignHCenter
+                    color: root.mutedText
+                    font.pixelSize: 10
+                }
+                Repeater {
+                    model: ["fader", "pan", "mute", "solo"]
+                    Label {
+                        Layout.preferredWidth: 56
+                        text: modelData
+                        horizontalAlignment: Text.AlignHCenter
+                        color: root.mutedText
+                        font.pixelSize: 10
+                    }
+                }
+            }
+
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                Column {
+                    width: midiBindingsWindow.width - 40
+                    spacing: 2
+
+                    Repeater {
+                        model: root.midiBindingRows()
+
+                        RowLayout {
+                            id: bindingRow
+                            width: parent.width
+                            spacing: 4
+
+                            property var rowData: modelData
+
+                            Label {
+                                Layout.preferredWidth: 160
+                                text: bindingRow.rowData.label
+                                elide: Text.ElideRight
+                                color: root.textColor
+                                font.pixelSize: 11
+                            }
+
+                            FlatButton {
+                                Layout.preferredWidth: 56
+                                text: root.channelLabel(bindingRow.rowData.channel)
+                                onClicked: channelMenu.popup()
+
+                                Menu {
+                                    id: channelMenu
+
+                                    MenuItem {
+                                        text: "any"
+                                        onTriggered: bindingRow.rowData.is_bus
+                                            ? backend.setBusMidiChannel(bindingRow.rowData.target, 16)
+                                            : backend.setStripMidiChannel(bindingRow.rowData.target, 16)
+                                    }
+                                    MenuSeparator {}
+                                    Repeater {
+                                        model: 16
+                                        MenuItem {
+                                            text: "ch " + (index + 1)
+                                            onTriggered: bindingRow.rowData.is_bus
+                                                ? backend.setBusMidiChannel(bindingRow.rowData.target, index)
+                                                : backend.setStripMidiChannel(bindingRow.rowData.target, index)
+                                        }
+                                    }
+                                }
+                            }
+
+                            Repeater {
+                                model: bindingRow.rowData.cells
+                                BindingCell {
+                                    Layout.preferredWidth: 56
+                                    spec: modelData
+                                    bindingHost: midiBindingsWindow
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        Dialog {
+            id: bindingEdit
+            property var spec: null
+            title: "MIDI binding"
+            modal: true
+            anchors.centerIn: parent
+            width: 280
+            padding: 10
+
+            contentItem: ColumnLayout {
+                width: bindingEdit.availableWidth
+                spacing: 8
+
+                Label {
+                    Layout.fillWidth: true
+                    text: bindingEdit.spec ? bindingEdit.spec.label : ""
+                    color: root.textColor
+                    elide: Text.ElideRight
+                    font.pixelSize: 11
+                }
+
+                TextField {
+                    id: bindingEditField
+                    Layout.fillWidth: true
+                    implicitHeight: 24
+                    placeholderText: "CC 0-127"
+                    inputMethodHints: Qt.ImhDigitsOnly
+                    onAccepted: midiBindingsWindow.commitEditBinding()
+                }
+
+                RowLayout {
+                    Layout.fillWidth: true
+                    Item { Layout.fillWidth: true }
+                    FlatButton {
+                        text: "cancel"
+                        onClicked: bindingEdit.close()
+                    }
+                    FlatButton {
+                        text: "ok"
+                        onClicked: midiBindingsWindow.commitEditBinding()
+                    }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: loopDialog
+        title: "loop settings"
+        modal: true
+        width: 320
+        anchors.centerIn: parent
+        padding: 10
+
+        contentItem: ColumnLayout {
+            width: loopDialog.availableWidth
+            spacing: 8
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: "beats per bar"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                SpinBox {
+                    from: 1
+                    to: 16
+                    value: Math.round(root.beatsPerBar())
+                    onValueModified: backend.setBeatsPerBar(value)
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: "loop unit"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                FlatButton {
+                    text: root.transportUi().loop_bars ? "bars" : "beats"
+                    onClicked: root.setTransportUi({ loop_bars: !root.transportUi().loop_bars })
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    Layout.fillWidth: true
+                    text: root.transportUi().loop_bars ? "loop bars" : "loop beats"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                SpinBox {
+                    from: 1
+                    to: 64
+                    value: root.transportUi().loop_length
+                    onValueModified: root.setTransportUi({ loop_length: value })
+                }
+            }
+
+            FlatButton {
+                text: "close"
+                onClicked: loopDialog.close()
             }
         }
     }

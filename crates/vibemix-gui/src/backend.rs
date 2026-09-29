@@ -1,3 +1,5 @@
+#![allow(clippy::too_many_arguments)]
+
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::pin::Pin;
@@ -33,6 +35,8 @@ static XRUNS: AtomicU32 = AtomicU32::new(0);
 static CLIPBOARD: Mutex<(bool, u32, String)> = Mutex::new((false, 0, String::new()));
 static EDIT_STATE: Mutex<(u32, u32, String, String)> =
     Mutex::new((0, 0, String::new(), String::new()));
+static CLOCK: Mutex<(bool, bool, f32, f32, f32, f32)> =
+    Mutex::new((false, false, 120.0, 0.0, 0.0, 4.0));
 
 struct View {
     structure_json: String,
@@ -265,6 +269,18 @@ fn receive_loop(socket: UdpSocket) {
                         *guard = (undo_depth, redo_depth, undo_label, redo_label);
                     }
                 }
+                Some(ControlMessage::Clock {
+                    locked,
+                    playing,
+                    bpm,
+                    beats,
+                    seconds,
+                    beats_per_bar,
+                }) => {
+                    if let Ok(mut guard) = CLOCK.lock() {
+                        *guard = (locked, playing, bpm, beats, seconds, beats_per_bar);
+                    }
+                }
                 Some(ControlMessage::Meters {
                     strips_in_l,
                     strips_in_r,
@@ -469,6 +485,7 @@ fn build_plugins(
             "name": plugin.get("name").cloned().unwrap_or(serde_json::json!("")),
             "bypassed": plugin.get("bypassed").cloned().unwrap_or(serde_json::json!(false)),
             "has_ui": plugin.get("has_ui").cloned().unwrap_or(serde_json::json!(false)),
+            "midi_channel": plugin.get("midi_channel").cloned().unwrap_or(serde_json::Value::Null),
             "controls": controls_structure,
         }));
         params_values.insert(
@@ -531,6 +548,7 @@ fn split_state(json: &str) -> (String, String) {
             strips_structure.push(serde_json::json!({
                 "id": id,
                 "name": strip.get("name").cloned().unwrap_or(serde_json::json!("")),
+                "midi_channel": strip.get("midi_channel").cloned().unwrap_or(serde_json::Value::Null),
                 "plugins": plugins_structure,
                 "plugins_post": plugins_post_structure,
             }));
@@ -566,6 +584,7 @@ fn split_state(json: &str) -> (String, String) {
             buses_structure.push(serde_json::json!({
                 "id": id,
                 "name": bus.get("name").cloned().unwrap_or(serde_json::json!("")),
+                "midi_channel": bus.get("midi_channel").cloned().unwrap_or(serde_json::Value::Null),
                 "mix_to_master": bus.get("mix_to_master").cloned().unwrap_or(serde_json::json!(false)),
                 "return_inputs": bus.get("return_inputs").cloned().unwrap_or(serde_json::json!(false)),
                 "plugins": plugins_structure,
@@ -582,8 +601,15 @@ fn split_state(json: &str) -> (String, String) {
         }
     }
 
-    let structure =
-        serde_json::json!({"strips": strips_structure, "buses": buses_structure}).to_string();
+    // Low-frequency, structural metadata the QML reads from `mix`.
+    let structure = serde_json::json!({
+        "strips": strips_structure,
+        "buses": buses_structure,
+        "beats_per_bar": value.get("beats_per_bar").cloned().unwrap_or(serde_json::json!(4.0)),
+        "midi_bindings": value.get("midi_bindings").cloned().unwrap_or(serde_json::json!([])),
+        "transport_ui": value.get("transport_ui").cloned().unwrap_or(serde_json::json!({})),
+    })
+    .to_string();
     let values = serde_json::json!({
         "strips": strips_values,
         "buses": buses_values,
@@ -625,6 +651,7 @@ pub mod qobject {
         #[qproperty(i32, redo_depth)]
         #[qproperty(QString, undo_label)]
         #[qproperty(QString, redo_label)]
+        #[qproperty(QString, clock)]
         #[namespace = "vibemix"]
         type Backend = super::BackendRust;
 
@@ -772,13 +799,57 @@ pub mod qobject {
         #[cxx_name = "duplicateBus"]
         fn duplicate_bus(&self, bus: i32);
 
-        #[qinvokable]
-        #[cxx_name = "undo"]
-        fn undo(&self);
+    #[qinvokable]
+    #[cxx_name = "undo"]
+    fn undo(&self);
+
+    #[qinvokable]
+    #[cxx_name = "redo"]
+    fn redo(&self);
+
+    #[qinvokable]
+    #[cxx_name = "setTransportUi"]
+    fn set_transport_ui(&self, json: &QString);
+
+    #[qinvokable]
+    #[cxx_name = "setBeatsPerBar"]
+    fn set_beats_per_bar(&self, value: f32);
 
         #[qinvokable]
-        #[cxx_name = "redo"]
-        fn redo(&self);
+        #[cxx_name = "midiLearn"]
+        fn midi_learn(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32, min: f32, max: f32);
+
+    #[qinvokable]
+    #[cxx_name = "midiLearnCancel"]
+    fn midi_learn_cancel(&self);
+
+        #[qinvokable]
+        #[cxx_name = "midiBindingsClear"]
+        fn midi_bindings_clear(&self);
+
+        #[qinvokable]
+        #[cxx_name = "setMidiSync"]
+        fn set_midi_sync(&self, on: bool);
+
+        #[qinvokable]
+        #[cxx_name = "setStripMidiChannel"]
+        fn set_strip_midi_channel(&self, strip: i32, channel: i32);
+
+        #[qinvokable]
+        #[cxx_name = "setBusMidiChannel"]
+        fn set_bus_midi_channel(&self, bus: i32, channel: i32);
+
+        #[qinvokable]
+        #[cxx_name = "setPluginMidiChannel"]
+        fn set_plugin_midi_channel(&self, location: i32, target: i32, slot: i32, channel: i32);
+
+        #[qinvokable]
+        #[cxx_name = "midiBind"]
+        fn midi_bind(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32, min: f32, max: f32, channel: i32, cc: i32);
+
+        #[qinvokable]
+        #[cxx_name = "midiUnbind"]
+        fn midi_unbind(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32);
 
         #[qinvokable]
         #[cxx_name = "saveSession"]
@@ -818,6 +889,7 @@ pub struct BackendRust {
     redo_depth: i32,
     undo_label: QString,
     redo_label: QString,
+    clock: QString,
 }
 
 impl Default for BackendRust {
@@ -851,6 +923,7 @@ impl Default for BackendRust {
             redo_depth: 0,
             undo_label: QString::from(""),
             redo_label: QString::from(""),
+            clock: QString::from("{\"locked\":false,\"playing\":false,\"bpm\":120,\"beats\":0,\"seconds\":0,\"beats_per_bar\":4}"),
         }
     }
 }
@@ -965,6 +1038,18 @@ impl qobject::Backend {
             self.as_mut().set_redo_depth(edit.1 as i32);
             self.as_mut().set_undo_label(QString::from(edit.2.as_str()));
             self.as_mut().set_redo_label(QString::from(edit.3.as_str()));
+        }
+        if let Ok(clock) = CLOCK.lock() {
+            let json = serde_json::json!({
+                "locked": clock.0,
+                "playing": clock.1,
+                "bpm": clock.2,
+                "beats": clock.3,
+                "seconds": clock.4,
+                "beats_per_bar": clock.5,
+            })
+            .to_string();
+            self.as_mut().set_clock(QString::from(json.as_str()));
         }
     }
 
@@ -1250,6 +1335,120 @@ impl qobject::Backend {
     pub fn redo(&self) {
         note_action("redo");
         send(ControlMessage::Redo);
+    }
+
+    pub fn set_transport_ui(&self, json: &QString) {
+        note_action("transport ui");
+        send(ControlMessage::SetTransportUi {
+            json: json.to_string(),
+        });
+    }
+
+    pub fn set_beats_per_bar(&self, value: f32) {
+        note_action("beats per bar");
+        send(ControlMessage::SetBeatsPerBar { value });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn midi_learn(
+        &self,
+        kind: i32,
+        location: i32,
+        target: i32,
+        slot: i32,
+        param: i32,
+        min: f32,
+        max: f32,
+    ) {
+        note_action("midi learn");
+        send(ControlMessage::MidiLearn {
+            kind: kind as u32,
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+            param: param as u32,
+            min,
+            max,
+        });
+    }
+
+    pub fn midi_learn_cancel(&self) {
+        note_action("midi learn cancel");
+        send(ControlMessage::MidiLearnCancel);
+    }
+
+    pub fn midi_bindings_clear(&self) {
+        note_action("clear midi bindings");
+        send(ControlMessage::MidiBindingsClear);
+    }
+
+    pub fn set_midi_sync(&self, on: bool) {
+        note_action("midi sync");
+        send(ControlMessage::SetMidiSync { on });
+    }
+
+    pub fn set_strip_midi_channel(&self, strip: i32, channel: i32) {
+        note_action("strip midi channel");
+        send(ControlMessage::SetStripMidiChannel {
+            strip: strip as u32,
+            channel: channel as u32,
+        });
+    }
+
+    pub fn set_bus_midi_channel(&self, bus: i32, channel: i32) {
+        note_action("bus midi channel");
+        send(ControlMessage::SetBusMidiChannel {
+            bus: bus as u32,
+            channel: channel as u32,
+        });
+    }
+
+    pub fn set_plugin_midi_channel(&self, location: i32, target: i32, slot: i32, channel: i32) {
+        note_action("plugin midi channel");
+        send(ControlMessage::SetPluginMidiChannel {
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+            channel: channel as u32,
+        });
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub fn midi_bind(
+        &self,
+        kind: i32,
+        location: i32,
+        target: i32,
+        slot: i32,
+        param: i32,
+        min: f32,
+        max: f32,
+        channel: i32,
+        cc: i32,
+    ) {
+        note_action("bind midi cc");
+        send(ControlMessage::MidiBind {
+            kind: kind as u32,
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+            param: param as u32,
+            min,
+            max,
+            channel: channel as u32,
+            cc: cc as u32,
+        });
+    }
+
+    pub fn midi_unbind(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32) {
+        note_action("unbind midi cc");
+        send(ControlMessage::MidiUnbind {
+            kind: kind as u32,
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+            param: param as u32,
+        });
     }
 
     pub fn save_session(&self, path: &QString, width: i32, height: i32, maximized: bool) {
