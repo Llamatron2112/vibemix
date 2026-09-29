@@ -120,7 +120,11 @@ enum OpenUi {
         window: UiWindow,
         context: Box<UiWriteCtx>,
     },
-    Vst3(vibemix_vst3::View),
+    Vst3 {
+        view: vibemix_vst3::View,
+        /// Kept so editor-driven parameter moves can be drained.
+        handle: vibemix_vst3::InstanceHandle,
+    },
 }
 
 impl OpenUi {
@@ -130,14 +134,14 @@ impl OpenUi {
                 window.pump();
                 context.forward_outputs(window);
             }
-            OpenUi::Vst3(view) => view.pump(),
+            OpenUi::Vst3 { view, .. } => view.pump(),
         }
     }
 
     fn wants_close(&self) -> bool {
         match self {
             OpenUi::Lv2 { window, .. } => window.wants_close(),
-            OpenUi::Vst3(view) => view.wants_close(),
+            OpenUi::Vst3 { view, .. } => view.wants_close(),
         }
     }
 }
@@ -362,6 +366,7 @@ impl Controller {
 
             self.engine.drain_garbage();
             self.pump_uis();
+            let param_edits = self.drain_vst3_param_edits();
 
             if let Some(learned) = self.engine.midi_map().take_learned() {
                 if let Some(mut binding) = self.pending_learn.take() {
@@ -424,14 +429,14 @@ impl Controller {
             if actions.catalog {
                 self.send_catalog(address);
             }
-            if actions.snapshot {
+            if actions.snapshot || param_edits {
                 self.send_state(address);
             }
             if self.clipboard_dirty {
                 self.clipboard_dirty = false;
                 self.send_clipboard(address);
             }
-            if self.edit_dirty || actions.snapshot {
+            if self.edit_dirty || actions.snapshot || param_edits {
                 self.edit_dirty = false;
                 self.send_edit_state(address);
             }
@@ -1490,12 +1495,16 @@ impl Controller {
             } else {
                 self.engine.bus_state_proxy(target as usize, slot as usize)
             };
-            let Some(view) = state.and_then(|state| state.open_view(&title)) else {
+            let Some(handle) = state.and_then(|state| state.vst3_handle()) else {
+                tracing::warn!(%uri, "no VST3 instance for editor");
+                return;
+            };
+            let Some(view) = handle.open_view(&title) else {
                 tracing::warn!(%uri, "failed to open VST3 editor");
                 return;
             };
             tracing::info!(location, target, slot, %uri, "opened VST3 editor");
-            self.uis.insert(key, OpenUi::Vst3(view));
+            self.uis.insert(key, OpenUi::Vst3 { view, handle });
             return;
         }
 
@@ -1597,8 +1606,35 @@ impl Controller {
                     &value.to_ne_bytes(),
                 );
             }
-            OpenUi::Vst3(view) => view.set_param(param as usize, value),
+            OpenUi::Vst3 { view, .. } => view.set_param(param as usize, value),
         }
+    }
+
+    /// Folds parameter moves made in open VST3 editors into the shared state
+    /// (mirrors the LV2 `ui:portEvent` write-back). Returns true if any moved.
+    fn drain_vst3_param_edits(&mut self) -> bool {
+        let mut changed = false;
+        for (key, ui) in self.uis.iter() {
+            let OpenUi::Vst3 { handle, .. } = ui else {
+                continue;
+            };
+            let (location, target, slot) = *key;
+            while let Some((param, value)) = handle.take_param_edit() {
+                if let Some(chain) = strip_chain(location) {
+                    self.params.set_plugin_param(
+                        target as usize,
+                        chain,
+                        slot as usize,
+                        param,
+                        value,
+                    );
+                } else {
+                    self.params.set_bus_plugin_param(target as usize, slot as usize, param, value);
+                }
+                changed = true;
+            }
+        }
+        changed
     }
 
     fn pump_uis(&mut self) {

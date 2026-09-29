@@ -87,18 +87,24 @@ bool parse_uid(const char* hex, VST3::UID& uid) {
     return true;
 }
 
-/// Minimal IComponentHandler: many plugins expect the host to provide one.
+struct Hosted;
+
+/// Minimal IComponentHandler: many plugins expect the host to provide one, and
+/// `performEdit` carries the editor's parameter moves back to the host.
 class ComponentHandler : public IComponentHandler {
 public:
-    ComponentHandler() { FUNKNOWN_CTOR }
+    explicit ComponentHandler(Hosted* owner) : owner(owner) { FUNKNOWN_CTOR }
     ~ComponentHandler() noexcept { FUNKNOWN_DTOR }
 
     tresult PLUGIN_API beginEdit(ParamID) SMTG_OVERRIDE { return kResultOk; }
-    tresult PLUGIN_API performEdit(ParamID, ParamValue) SMTG_OVERRIDE { return kResultOk; }
+    tresult PLUGIN_API performEdit(ParamID id, ParamValue value) SMTG_OVERRIDE;
     tresult PLUGIN_API endEdit(ParamID) SMTG_OVERRIDE { return kResultOk; }
     tresult PLUGIN_API restartComponent(int32) SMTG_OVERRIDE { return kResultOk; }
 
     DECLARE_FUNKNOWN_METHODS
+
+private:
+    Hosted* owner;
 };
 
 IMPLEMENT_FUNKNOWN_METHODS(ComponentHandler, IComponentHandler, IComponentHandler::iid)
@@ -128,7 +134,30 @@ struct Hosted {
     tresult active_result = kResultOk;
     tresult processing_result = kResultOk;
     tresult last_result = kResultOk;
+    std::mutex param_edits_mutex;
+    std::vector<std::pair<int, float>> param_edits;
+
+    void push_param_edit(int index, float value) {
+        std::lock_guard<std::mutex> lock(param_edits_mutex);
+        if (param_edits.size() < 256) param_edits.emplace_back(index, value);
+    }
 };
+
+tresult ComponentHandler::performEdit(ParamID id, ParamValue value) {
+    if (!owner || !owner->controller) return kResultOk;
+    // Keep the controller's value in sync for the editor, then queue the move
+    // for the engine (which folds it into the shared parameter state).
+    owner->controller->setParamNormalized(id, value);
+    const int32 count = owner->controller->getParameterCount();
+    for (int32 i = 0; i < count; ++i) {
+        ParameterInfo info {};
+        if (owner->controller->getParameterInfo(i, info) == kResultOk && info.id == id) {
+            owner->push_param_edit(i, static_cast<float>(value));
+            break;
+        }
+    }
+    return kResultOk;
+}
 
 struct VibemixVst3View;
 
@@ -246,7 +275,7 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     hosted->component = hosted->provider->getComponentPtr();
     hosted->controller = hosted->provider->getControllerPtr();
     if (hosted->controller) {
-        hosted->component_handler = new ComponentHandler();
+        hosted->component_handler = new ComponentHandler(hosted);
         hosted->controller->setComponentHandler(hosted->component_handler);
     }
     if (!hosted->component) {
@@ -474,6 +503,19 @@ int vst3_bus_info(void* handle, char* out, int cap) {
                     + (bus.busType == BusTypes::kMain ? "m" : "a");
     }
     std::snprintf(out, cap, "%s", text.c_str());
+    return 1;
+}
+
+/// Pops one editor-driven parameter move; returns 0 when the queue is empty.
+int vst3_take_param_edit(void* handle, int* index, float* value) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted) return 0;
+    std::lock_guard<std::mutex> lock(hosted->param_edits_mutex);
+    if (hosted->param_edits.empty()) return 0;
+    const auto edit = hosted->param_edits.front();
+    hosted->param_edits.erase(hosted->param_edits.begin());
+    if (index) *index = edit.first;
+    if (value) *value = edit.second;
     return 1;
 }
 

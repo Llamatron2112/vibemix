@@ -79,6 +79,7 @@ extern "C" {
     fn vst3_bus_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_editor_info(handle: *mut c_void, out: *mut c_char, cap: c_int) -> c_int;
     fn vst3_has_editor(handle: *mut c_void) -> c_int;
+    fn vst3_take_param_edit(handle: *mut c_void, index: *mut c_int, value: *mut f32) -> c_int;
     fn vst3_view_open(instance: *mut c_void, title: *const c_char) -> *mut c_void;
     fn vst3_view_pump(handle: *mut c_void);
     fn vst3_view_wants_close(handle: *mut c_void) -> c_int;
@@ -403,6 +404,13 @@ impl InstanceHandle {
 
     pub fn restore(&self, state: &[u8]) {
         restore_blob(self.handle, state);
+    }
+
+    /// Pops a parameter move made in the plugin's editor, if any.
+    pub fn take_param_edit(&self) -> Option<(usize, f32)> {
+        let (mut index, mut value) = (0, 0.0f32);
+        let got = unsafe { vst3_take_param_edit(self.handle, &mut index, &mut value) };
+        (got != 0).then_some((index.max(0) as usize, value))
     }
 
     /// Opens the plugin's editor embedded into a fresh X11 window.

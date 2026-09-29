@@ -269,9 +269,12 @@ VST3 editors are hosted separately: the plugin's `IPlugView` is embedded into a
 raw X11 window (`kPlatformTypeX11EmbedWindowID`) created per editor, with a
 minimal `IPlugFrame` handling plugin-driven resizes and the window's close
 button. Host-driven parameter edits reach the editor through
-`IEditController::setParamNormalized`, and the editor button is only shown when
-the plugin reports an X11-editable view. VST3 editors are not gated by the LV2
-UI smoke test (they cannot be exercised headlessly the same way).
+`IEditController::setParamNormalized`, and moves made in the editor are folded
+back into the shared parameter state via an `IComponentHandler::performEdit`
+queue (mirroring the LV2 `ui:portEvent` write-back), so they survive session
+saves and are pushed to the DSP. The editor button is only shown when the
+plugin reports an X11-editable view. VST3 editors are not gated by the LV2 UI
+smoke test (they cannot be exercised headlessly the same way).
 
 Not supported: Qt plugin UIs (and GTK4).
 

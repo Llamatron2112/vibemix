@@ -44,11 +44,10 @@ impl SlotState {
         }
     }
 
-    /// Opens the plugin's native editor (VST3 only; LV2 UIs go through the LV2
-    /// host).
-    pub fn open_view(&self, title: &str) -> Option<vibemix_vst3::View> {
+    /// The VST3 instance handle, if this is a VST3 plugin.
+    pub fn vst3_handle(&self) -> Option<vibemix_vst3::InstanceHandle> {
         match self {
-            SlotState::Vst3(handle) => handle.open_view(title),
+            SlotState::Vst3(handle) => Some(handle.clone()),
             SlotState::Lv2(_) => None,
         }
     }
