@@ -1293,11 +1293,13 @@ impl Controller {
         self.health_immediate = true;
     }
 
-    fn plugin_is_safe(&mut self, uri: &str) -> bool {
-        if self.smoke_ok.contains(uri) {
+    /// Runs the engine binary as a throwaway smoke test for `key` (an LV2 URI or
+    /// a VST3 class id), caching and recording the verdict.
+    fn run_smoke_child(&mut self, key: &str, args: &[&str]) -> bool {
+        if self.smoke_ok.contains(key) {
             return true;
         }
-        if self.smoke_bad.contains(uri) {
+        if self.smoke_bad.contains(key) {
             return false;
         }
 
@@ -1305,7 +1307,7 @@ impl Controller {
             return true;
         };
         let mut command = Command::new(executable);
-        command.arg("--smoke").arg(uri);
+        command.args(args);
         if crate::smoke::debug_enabled() {
             // Leave stdio inherited so a plugin's own diagnostics stay visible.
         } else {
@@ -1326,31 +1328,31 @@ impl Controller {
         loop {
             match child.try_wait() {
                 Ok(Some(status)) if status.success() => {
-                    self.smoke_ok.insert(uri.to_string());
-                    self.record_health(uri, Status::Ok, String::new());
+                    self.smoke_ok.insert(key.to_string());
+                    self.record_health(key, Status::Ok, String::new());
                     return true;
                 }
                 Ok(Some(status)) => {
-                    self.smoke_bad.insert(uri.to_string());
+                    self.smoke_bad.insert(key.to_string());
                     let reason = if let Some(signal) = status.signal() {
                         let name = crate::smoke::signal_name(signal);
-                        tracing::warn!(%uri, signal, "plugin crashed during smoke test, refusing to load");
+                        tracing::warn!(plugin = %key, signal, "plugin crashed during smoke test, refusing to load");
                         name.to_string()
                     } else {
                         let code = status.code().unwrap_or(-1);
-                        tracing::warn!(%uri, code, "plugin failed smoke test, refusing to load");
+                        tracing::warn!(plugin = %key, code, "plugin failed smoke test, refusing to load");
                         format!("exit {code}")
                     };
-                    self.record_health(uri, Status::Failed, reason);
+                    self.record_health(key, Status::Failed, reason);
                     return false;
                 }
                 Ok(None) => {
                     if Instant::now() > deadline {
                         let _ = child.kill();
                         let _ = child.wait();
-                        self.smoke_bad.insert(uri.to_string());
-                        tracing::warn!(%uri, "plugin smoke test timed out, refusing to load");
-                        self.record_health(uri, Status::Failed, "timeout".to_string());
+                        self.smoke_bad.insert(key.to_string());
+                        tracing::warn!(plugin = %key, "plugin smoke test timed out, refusing to load");
+                        self.record_health(key, Status::Failed, "timeout".to_string());
                         return false;
                     }
                     std::thread::sleep(Duration::from_millis(10));
@@ -1358,6 +1360,14 @@ impl Controller {
                 Err(_) => return true,
             }
         }
+    }
+
+    fn plugin_is_safe(&mut self, uri: &str) -> bool {
+        self.run_smoke_child(uri, &["--smoke", uri])
+    }
+
+    fn vst3_is_safe(&mut self, bundle: &str, class_id: &str) -> bool {
+        self.run_smoke_child(class_id, &["--smoke-vst3", bundle, class_id])
     }
 
     fn ui_is_safe(&mut self, uri: &str) -> bool {
@@ -1711,10 +1721,22 @@ impl Controller {
             }
         };
 
-        // LV2 plugins are smoke-tested in a throwaway child. VST3 has no
-        // sandboxed smoke test yet, so adding one instantiates it in-process.
-        if plugin.format == PluginFormat::Lv2 && !self.plugin_is_safe(&plugin.uri) {
-            return false;
+        // Plugins are smoke-tested in a throwaway child before being loaded.
+        match plugin.format {
+            PluginFormat::Lv2 => {
+                if !self.plugin_is_safe(&plugin.uri) {
+                    return false;
+                }
+            }
+            PluginFormat::Vst3 => {
+                let Some(bundle) = plugin.bundle.clone() else {
+                    tracing::warn!(uri = %plugin.uri, "VST3 plugin has no bundle path");
+                    return false;
+                };
+                if !self.vst3_is_safe(&bundle, &plugin.uri) {
+                    return false;
+                }
+            }
         }
 
         let sample_rate = self.engine.sample_rate() as f64;

@@ -51,6 +51,63 @@ pub fn smoke_plugin(host: &Host, uri: &str) -> i32 {
     SMOKE_OK
 }
 
+/// Instantiates a VST3 plugin and runs a few blocks of DC input.
+pub fn smoke_plugin_vst3(bundle: &str, class_id: &str) -> i32 {
+    let host = vibemix_vst3::Host::new();
+    let Some(mut instance) = host.instantiate(
+        bundle,
+        class_id,
+        48_000.0,
+        SMOKE_FRAMES,
+        vibemix_vst3::PluginInstance::max_frames(),
+    ) else {
+        return SMOKE_INSTANTIATE_FAILED;
+    };
+    for _ in 0..SMOKE_BLOCKS {
+        for channel in 0..instance.audio_input_count() {
+            for sample in instance.input_buffer_mut(channel)[..SMOKE_FRAMES].iter_mut() {
+                *sample = 0.1;
+            }
+        }
+        instance.run(SMOKE_FRAMES);
+    }
+    SMOKE_OK
+}
+
+/// A plugin to smoke-test.
+enum SmokeTarget {
+    Lv2 { uri: String, name: String },
+    Vst3 {
+        bundle: String,
+        class_id: String,
+        name: String,
+    },
+}
+
+impl SmokeTarget {
+    fn id(&self) -> &str {
+        match self {
+            SmokeTarget::Lv2 { uri, .. } => uri,
+            SmokeTarget::Vst3 { class_id, .. } => class_id,
+        }
+    }
+
+    fn name(&self) -> &str {
+        match self {
+            SmokeTarget::Lv2 { name, .. } | SmokeTarget::Vst3 { name, .. } => name,
+        }
+    }
+
+    fn run(&self, host: &Host) -> i32 {
+        match self {
+            SmokeTarget::Lv2 { uri, .. } => smoke_plugin(host, uri),
+            SmokeTarget::Vst3 {
+                bundle, class_id, ..
+            } => smoke_plugin_vst3(bundle, class_id),
+        }
+    }
+}
+
 /// Outcome of a smoke test child.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ChildOutcome {
@@ -68,26 +125,38 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
 
     let only: Option<std::collections::HashSet<String>> =
         only.map(|list| list.into_iter().collect());
+    let in_only = |id: &str| only.as_ref().is_none_or(|set| set.contains(id));
+
     let host = Host::new();
-    let targets: Vec<(String, String)> = host
+    let mut targets: Vec<SmokeTarget> = host
         .discover()
         .into_iter()
         .filter(|info| {
             info.hostable
                 && ((info.audio_inputs.len() == 2 && info.audio_outputs.len() == 2)
                     || (info.audio_inputs.len() == 1 && info.audio_outputs.len() == 1))
-                && only
-                    .as_ref()
-                    .is_none_or(|set| set.contains(&info.uri))
+                && in_only(&info.uri)
         })
-        .map(|info| (info.uri, info.name))
+        .map(|info| SmokeTarget::Lv2 {
+            uri: info.uri,
+            name: info.name,
+        })
         .collect();
+    for info in vibemix_vst3::Host::new().discover() {
+        if in_only(&info.class_id) {
+            targets.push(SmokeTarget::Vst3 {
+                bundle: info.bundle,
+                class_id: info.class_id,
+                name: info.name,
+            });
+        }
+    }
 
     emit(&serde_json::json!({ "scan": "start", "total": targets.len() }));
 
     let mut failed = 0usize;
-    for (uri, name) in &targets {
-        let outcome = scan_one(&host, uri);
+    for target in &targets {
+        let outcome = scan_one(&host, target);
         if !matches!(outcome, ChildOutcome::Ok) {
             failed += 1;
         }
@@ -99,8 +168,8 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
         };
         emit(&serde_json::json!({
             "scan": "plugin",
-            "uri": uri,
-            "name": name,
+            "uri": target.id(),
+            "name": target.name(),
             "status": status,
             "reason": reason,
         }));
@@ -115,7 +184,7 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
 }
 
 /// Forks, runs the smoke test in the child, and waits with a timeout.
-fn scan_one(host: &Host, uri: &str) -> ChildOutcome {
+fn scan_one(host: &Host, target: &SmokeTarget) -> ChildOutcome {
     // Flush so the forked child does not duplicate buffered output.
     let _ = std::io::stdout().flush();
 
@@ -131,7 +200,7 @@ fn scan_one(host: &Host, uri: &str) -> ChildOutcome {
                 libc::dup2(fd, libc::STDERR_FILENO);
             }
         }
-        let code = smoke_plugin(host, uri);
+        let code = target.run(host);
         unsafe { libc::_exit(if code == SMOKE_OK { 0 } else { 2 }) };
     }
     if pid < 0 {

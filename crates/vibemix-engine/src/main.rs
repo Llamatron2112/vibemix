@@ -50,6 +50,10 @@ struct Args {
     #[arg(long, hide = true)]
     smoke_ui: Option<String>,
 
+    /// Smoke-test a VST3 plugin: `--smoke-vst3 <bundle> <class-id>`.
+    #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "CLASS"])]
+    smoke_vst3: Vec<String>,
+
     /// Verbose plugin diagnostics (also via VIBEMIX_DEBUG=1).
     #[arg(long)]
     debug: bool,
@@ -81,6 +85,9 @@ fn main() -> Result<()> {
     }
     if let Some(uri) = args.smoke_ui.as_deref() {
         run_smoke_ui(uri);
+    }
+    if args.smoke_vst3.len() == 2 {
+        run_smoke_vst3(&args.smoke_vst3[0], &args.smoke_vst3[1]);
     }
     if args.scan_plugins {
         let only = (!args.only.is_empty()).then_some(args.only);
@@ -146,6 +153,11 @@ fn main() -> Result<()> {
 fn run_smoke(uri: &str) -> ! {
     smoke::disable_core_dumps();
     std::process::exit(smoke::smoke_plugin(&Host::new(), uri));
+}
+
+fn run_smoke_vst3(bundle: &str, class_id: &str) -> ! {
+    smoke::disable_core_dumps();
+    std::process::exit(smoke::smoke_plugin_vst3(bundle, class_id));
 }
 
 fn run_smoke_ui(uri: &str) -> ! {

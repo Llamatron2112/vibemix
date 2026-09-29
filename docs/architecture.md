@@ -280,9 +280,9 @@ defaults; `--example run_plugin <uri>` runs one plugin offline.
 
 ### Plugin health
 
-The engine sweeps every hostable mono/stereo plugin in an isolated child process
-and records the verdict, rather than hiding suspected crashers behind a
-blacklist. `vibemix-engine --scan-plugins` loads the `lilv` world once, `fork()`s
+The engine sweeps every hostable mono/stereo LV2 plugin (and every VST3 effect)
+in an isolated child process and records the verdict, rather than hiding
+suspected crashers behind a blacklist. `vibemix-engine --scan-plugins` loads the `lilv` world once, `fork()`s
 per plugin (the child is single-threaded, so this is safe), runs the same
 offline block test, and prints one JSON verdict per line (`ok` /
 `crash SIGSEGV` / `timeout` / `instantiate failed`). At startup the engine runs

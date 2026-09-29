@@ -140,11 +140,18 @@ impl HealthStore {
     }
 }
 
-/// Whether the LV2 sweep tests this plugin (hostable mono/stereo audio).
+/// Whether the sweep tests this plugin. LV2 is limited to hostable mono/stereo
+/// audio; VST3 has no channel metadata until instantiated, so test them all.
 fn sweepable(entry: &PluginEntry) -> bool {
-    entry.format == PluginFormat::Lv2
-        && entry.hostable
-        && ((entry.inputs == 2 && entry.outputs == 2) || (entry.inputs == 1 && entry.outputs == 1))
+    if !entry.hostable {
+        return false;
+    }
+    match entry.format {
+        PluginFormat::Lv2 => {
+            (entry.inputs == 2 && entry.outputs == 2) || (entry.inputs == 1 && entry.outputs == 1)
+        }
+        PluginFormat::Vst3 => true,
+    }
 }
 
 /// One line of the `--scan-plugins` stdout protocol.

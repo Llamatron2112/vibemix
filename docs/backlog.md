@@ -35,9 +35,10 @@ Deferred ideas and follow-ups that are not part of the current roadmap
   mostly overlaps LV2; VST2 is discontinued). The SDK (v3.8.1, **MIT-licensed
   since 3.8** — no copyleft implications) is vendored as a submodule and built
   without CMake. The node trait, format-tagged model and `vibemix-vst3` host
-  crate are in place; the engine discovers/adds/processes VST3 plugins.
-  Remaining: VST3 parameter metadata + editing, `IPlugView` GUI hosting, and a
-  sandboxed VST3 smoke test before loading untrusted plugins.
+  crate are in place; the engine discovers/adds/processes VST3 plugins, and
+  loading is sandboxed (`--smoke-vst3` per add plus the batch sweep, which now
+  covers VST3 too). Remaining: VST3 parameter metadata + editing, VST3 state
+  save/restore, and `IPlugView` GUI hosting.
 - Qt plugin UIs (and GTK4).
 
 ## Audio backend
