@@ -11,6 +11,7 @@ lv2_raw = "0.2"
 libc = "0.2"
 rtrb = "0.3"
 serde = { workspace = true }
+serde_json = { workspace = true }
 
 [build-dependencies]
 cc = "1"

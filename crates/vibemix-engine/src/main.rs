@@ -5,6 +5,7 @@ mod health;
 mod midi;
 mod midi_map;
 mod params;
+mod plugin;
 mod rt_guard;
 mod smoke;
 

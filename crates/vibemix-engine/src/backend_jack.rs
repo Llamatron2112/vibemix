@@ -10,6 +10,8 @@ use rtrb::{Consumer, Producer};
 use vibemix_core::model::{BusConnections, MixerModel, PluginSlot, StripConnections};
 use vibemix_lv2::{Host, MidiEvent, PluginInstance, SharedOutputs, StateEntry, StateProxy};
 
+use crate::plugin::PluginNode;
+
 use crate::dsp;
 use crate::midi::{Clock, MidiBlock};
 use crate::midi_map::SharedMidi;
@@ -37,20 +39,20 @@ struct Built {
 }
 
 pub enum SlotPlugin {
-    Stereo(Box<PluginInstance>),
-    Mono(Box<PluginInstance>, Box<PluginInstance>),
+    Stereo(Box<dyn PluginNode>),
+    Mono(Box<dyn PluginNode>, Box<dyn PluginNode>),
     /// Placeholder for a plugin that could not be loaded. It keeps the DSP
     /// chain aligned with the model slots and passes audio through untouched.
     Missing,
 }
 
 impl SlotPlugin {
-    fn restore_state(&mut self, entries: &[StateEntry]) {
+    fn load_state(&mut self, state: &str) {
         match self {
-            SlotPlugin::Stereo(instance) => instance.restore_state(entries),
+            SlotPlugin::Stereo(instance) => instance.load_state(state),
             SlotPlugin::Mono(left, right) => {
-                left.restore_state(entries);
-                right.restore_state(entries);
+                left.load_state(state);
+                right.load_state(state);
             }
             SlotPlugin::Missing => {}
         }
@@ -67,8 +69,9 @@ impl SlotPlugin {
     }
 }
 
-#[derive(serde::Serialize, serde::Deserialize)]
-struct StateBlob {    key: String,
+#[derive(serde::Serialize)]
+struct StateBlob {
+    key: String,
     type_: String,
     flags: u32,
     value: Vec<u8>,
@@ -89,21 +92,6 @@ pub fn encode_state(host: &Host, entries: &[StateEntry]) -> String {
         })
         .collect();
     serde_json::to_string(&blobs).unwrap_or_default()
-}
-
-pub fn decode_state(host: &Host, json: &str) -> Vec<StateEntry> {
-    let Ok(blobs) = serde_json::from_str::<Vec<StateBlob>>(json) else {
-        return Vec::new();
-    };
-    blobs
-        .into_iter()
-        .map(|blob| StateEntry {
-            key: host.map_uri(&blob.key),
-            type_: host.map_uri(&blob.type_),
-            flags: blob.flags,
-            value: blob.value,
-        })
-        .collect()
 }
 
 #[derive(Debug, Clone, serde::Serialize)]
@@ -428,7 +416,7 @@ impl MixerGraph {
 
             match plugin {
                 SlotPlugin::Stereo(instance) => {
-                    set_controls(instance, &self.params, index, chain, slot);
+                    set_controls(&mut **instance, &self.params, index, chain, slot);
                     instance.input_buffer_mut(0)[..frames]
                         .copy_from_slice(&self.strip_scratch[0][..frames]);
                     instance.input_buffer_mut(1)[..frames]
@@ -446,7 +434,7 @@ impl MixerGraph {
                 }
                 SlotPlugin::Mono(left, right) => {
                     for (channel, instance) in [(0usize, left), (1usize, right)] {
-                        set_controls(instance, &self.params, index, chain, slot);
+                        set_controls(&mut **instance, &self.params, index, chain, slot);
                         instance.input_buffer_mut(0)[..frames]
                             .copy_from_slice(&self.strip_scratch[channel][..frames]);
                         instance.write_midi(self.midi.as_slice());
@@ -489,7 +477,7 @@ impl MixerGraph {
 
             match plugin {
                 SlotPlugin::Stereo(instance) => {
-                    set_bus_controls(instance, &self.params, bus, slot);
+                    set_bus_controls(&mut **instance, &self.params, bus, slot);
                     instance.input_buffer_mut(0)[..frames]
                         .copy_from_slice(&self.bus_scratch[0][..frames]);
                     instance.input_buffer_mut(1)[..frames]
@@ -507,7 +495,7 @@ impl MixerGraph {
                 }
                 SlotPlugin::Mono(left, right) => {
                     for (channel, instance) in [(0usize, left), (1usize, right)] {
-                        set_bus_controls(instance, &self.params, bus, slot);
+                        set_bus_controls(&mut **instance, &self.params, bus, slot);
                         instance.input_buffer_mut(0)[..frames]
                             .copy_from_slice(&self.bus_scratch[channel][..frames]);
                         instance.write_midi(self.midi.as_slice());
@@ -1858,7 +1846,7 @@ impl JackEngine {
 }
 
 fn set_controls(
-    instance: &mut PluginInstance,
+    instance: &mut dyn PluginNode,
     params: &SharedParams,
     strip: usize,
     chain: usize,
@@ -1871,7 +1859,7 @@ fn set_controls(
 }
 
 fn set_bus_controls(
-    instance: &mut PluginInstance,
+    instance: &mut dyn PluginNode,
     params: &SharedParams,
     bus: usize,
     slot: usize,
@@ -1911,12 +1899,7 @@ pub fn instantiate_slot(
         return None;
     };
 
-    if !plugin.state.is_empty() {
-        let entries = decode_state(host, &plugin.state);
-        if !entries.is_empty() {
-            slot_plugin.restore_state(&entries);
-        }
-    }
+    slot_plugin.load_state(&plugin.state);
 
     Some((slot_plugin, proxy, handle))
 }
@@ -2058,10 +2041,13 @@ pub fn make_slot_plugin(
     instance: PluginInstance,
 ) -> Option<SlotPlugin> {
     match (instance.audio_input_count(), instance.audio_output_count()) {
-        (2, 2) => Some(SlotPlugin::Stereo(Box::new(instance))),
+        (2, 2) => Some(SlotPlugin::Stereo(Box::new(instance) as Box<dyn PluginNode>)),
         (1, 1) => {
             let second = host.instantiate(uri, sample_rate, nominal_block, max_block)?;
-            Some(SlotPlugin::Mono(Box::new(instance), Box::new(second)))
+            Some(SlotPlugin::Mono(
+                Box::new(instance) as Box<dyn PluginNode>,
+                Box::new(second) as Box<dyn PluginNode>,
+            ))
         }
         _ => None,
     }

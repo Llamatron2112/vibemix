@@ -4,6 +4,9 @@ use std::ptr;
 
 use libc::c_void;
 use lv2_raw::LV2Feature;
+use serde::{Deserialize, Serialize};
+
+use crate::urid::UridMap;
 
 pub const STATE_INTERFACE_URI: &str = "http://lv2plug.in/ns/ext/state#interface";
 
@@ -41,6 +44,48 @@ pub struct StateEntry {
     pub type_: u32,
     pub flags: u32,
     pub value: Vec<u8>,
+}
+
+/// Serialized (JSON) form of a plugin's LV2 state, with URIDs resolved back to
+/// URIs so it is stable across sessions.
+#[derive(Serialize, Deserialize)]
+struct StateBlob {
+    key: String,
+    type_: String,
+    flags: u32,
+    value: Vec<u8>,
+}
+
+pub fn encode_entries(entries: &[StateEntry]) -> String {
+    let urid = UridMap::shared();
+    let blobs: Vec<StateBlob> = entries
+        .iter()
+        .filter_map(|entry| {
+            Some(StateBlob {
+                key: urid.unmap(entry.key)?,
+                type_: urid.unmap(entry.type_)?,
+                flags: entry.flags,
+                value: entry.value.clone(),
+            })
+        })
+        .collect();
+    serde_json::to_string(&blobs).unwrap_or_default()
+}
+
+pub fn decode_entries(json: &str) -> Vec<StateEntry> {
+    let urid = UridMap::shared();
+    let Ok(blobs) = serde_json::from_str::<Vec<StateBlob>>(json) else {
+        return Vec::new();
+    };
+    blobs
+        .into_iter()
+        .map(|blob| StateEntry {
+            key: urid.map(&blob.key),
+            type_: urid.map(&blob.type_),
+            flags: blob.flags,
+            value: blob.value,
+        })
+        .collect()
 }
 
 pub struct StateProxy {

@@ -881,6 +881,23 @@ impl PluginInstance {
             state.restore(entries);
         }
     }
+
+    /// Serializes the plugin's LV2 state to a stable string (URIs, not URIDs).
+    pub fn save_state(&self) -> String {
+        match &self.state {
+            Some(state) if state.supports_save() => crate::state::encode_entries(&state.save()),
+            _ => String::new(),
+        }
+    }
+
+    /// Restores state previously produced by [`Self::save_state`].
+    pub fn load_state(&mut self, state: &str) {
+        if state.is_empty() {
+            return;
+        }
+        let entries = crate::state::decode_entries(state);
+        self.restore_state(&entries);
+    }
 }
 
 #[cfg(test)]
