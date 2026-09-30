@@ -923,6 +923,35 @@ impl Controller {
                     catalog: false,
                 }
             }
+            ControlMessage::SetPluginSidechainEnabled {
+                location,
+                target,
+                slot,
+                enabled,
+            } => {
+                if let Some(chain) = strip_chain(location) {
+                    if let Some(plugin) = self
+                        .model
+                        .strip_mut(StripId(target))
+                        .and_then(|strip| {
+                            strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
+                        })
+                    {
+                        plugin.sidechain_enabled = enabled;
+                    }
+                } else if let Some(plugin) = self
+                    .model
+                    .bus_mut(BusId(target))
+                    .and_then(|bus| bus.plugins.get_mut(slot as usize))
+                {
+                    plugin.sidechain_enabled = enabled;
+                }
+                self.apply_sidechain_params(location, target, slot);
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
             ControlMessage::SetPluginSidechain {
                 location,
                 target,
@@ -944,26 +973,14 @@ impl Controller {
                             {
                                 set_sidechain_source(&mut plugin.sidechain, strip_id, gain);
                             }
-                            self.params.set_sidechain_gain(
-                                target as usize,
-                                chain,
-                                slot as usize,
-                                source,
-                                gain,
-                            );
                         } else if let Some(plugin) = self
                             .model
                             .bus_mut(BusId(target))
                             .and_then(|bus| bus.plugins.get_mut(slot as usize))
                         {
                             set_sidechain_source(&mut plugin.sidechain, strip_id, gain);
-                            self.params.set_bus_sidechain_gain(
-                                target as usize,
-                                slot as usize,
-                                source,
-                                gain,
-                            );
                         }
+                        self.apply_sidechain_params(location, target, slot);
                     }
                 }
                 Actions {
@@ -991,22 +1008,14 @@ impl Controller {
                         {
                             set_sidechain_pre(&mut plugin.sidechain, strip_id, pre);
                         }
-                        self.params.set_sidechain_pre(
-                            target as usize,
-                            chain,
-                            slot as usize,
-                            source,
-                            pre,
-                        );
                     } else if let Some(plugin) = self
                         .model
                         .bus_mut(BusId(target))
                         .and_then(|bus| bus.plugins.get_mut(slot as usize))
                     {
                         set_sidechain_pre(&mut plugin.sidechain, strip_id, pre);
-                        self.params
-                            .set_bus_sidechain_pre(target as usize, slot as usize, source, pre);
                     }
+                    self.apply_sidechain_params(location, target, slot);
                 }
                 Actions {
                     snapshot: true,
@@ -1756,6 +1765,81 @@ impl Controller {
                 );
             }
             OpenUi::Vst3 { view, .. } => view.set_param(param as usize, value),
+        }
+    }
+
+    /// Re-seeds a plugin's sidechain gains/pre from its model config (sources
+    /// are ignored while the sidechain is disabled).
+    fn apply_sidechain_params(&mut self, location: u32, target: u32, slot: u32) {
+        let entries: Vec<(usize, f32, bool)> = if let Some(chain) = strip_chain(location) {
+            self.model
+                .strip(StripId(target))
+                .and_then(|strip| strip_plugin_list(strip, chain).get(slot as usize))
+                .map(|plugin| {
+                    plugin
+                        .sidechain
+                        .iter()
+                        .map(|entry| (entry.strip.0 as usize, entry.gain.0, entry.pre_fader))
+                        .collect()
+                })
+                .unwrap_or_default()
+        } else {
+            self.model
+                .bus(BusId(target))
+                .and_then(|bus| bus.plugins.get(slot as usize))
+                .map(|plugin| {
+                    plugin
+                        .sidechain
+                        .iter()
+                        .map(|entry| (entry.strip.0 as usize, entry.gain.0, entry.pre_fader))
+                        .collect()
+                })
+                .unwrap_or_default()
+        };
+        let enabled = if let Some(chain) = strip_chain(location) {
+            self.model
+                .strip(StripId(target))
+                .and_then(|strip| strip_plugin_list(strip, chain).get(slot as usize))
+                .map(|plugin| plugin.sidechain_enabled)
+                .unwrap_or(false)
+        } else {
+            self.model
+                .bus(BusId(target))
+                .and_then(|bus| bus.plugins.get(slot as usize))
+                .map(|plugin| plugin.sidechain_enabled)
+                .unwrap_or(false)
+        };
+
+        if let Some(chain) = strip_chain(location) {
+            for source in 0..self.params.sidechain_source_count() {
+                self.params
+                    .set_sidechain_gain(target as usize, chain, slot as usize, source, 0.0);
+                self.params
+                    .set_sidechain_pre(target as usize, chain, slot as usize, source, true);
+            }
+            if enabled {
+                for (source, gain, pre) in entries {
+                    self.params
+                        .set_sidechain_gain(target as usize, chain, slot as usize, source, gain);
+                    self.params
+                        .set_sidechain_pre(target as usize, chain, slot as usize, source, pre);
+                }
+            }
+        } else {
+            for source in 0..self.params.sidechain_source_count() {
+                self.params
+                    .set_bus_sidechain_gain(target as usize, slot as usize, source, 0.0);
+                self.params
+                    .set_bus_sidechain_pre(target as usize, slot as usize, source, true);
+            }
+            if enabled {
+                for (source, gain, pre) in entries {
+                    self.params
+                        .set_bus_sidechain_gain(target as usize, slot as usize, source, gain);
+                    self.params
+                        .set_bus_sidechain_pre(target as usize, slot as usize, source, pre);
+                }
+            }
         }
     }
 
@@ -2822,7 +2906,10 @@ fn structure_eq(a: &MixerModel, b: &MixerModel) -> bool {
 fn plugin_lists_eq(a: &[PluginSlot], b: &[PluginSlot]) -> bool {
     a.len() == b.len()
         && a.iter().zip(b).all(|(x, y)| {
-            x.uri == y.uri && x.state == y.state && sidechain_strips(x) == sidechain_strips(y)
+            x.uri == y.uri
+                && x.state == y.state
+                && x.sidechain_enabled == y.sidechain_enabled
+                && sidechain_strips(x) == sidechain_strips(y)
         })
 }
 
@@ -3166,6 +3253,7 @@ fn plugin_list_json<F: Fn(usize, usize) -> f32>(
                 "missing": plugin.missing,
                 "has_ui": has_ui,
                 "has_sidechain": has_sidechain,
+                "sidechain_enabled": plugin.sidechain_enabled,
                 "sidechain": sidechain,
                 "midi_channel": plugin.midi_channel,
                 "controls": control_list,
@@ -3383,10 +3471,12 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
                 params.set_bus_sidechain_gain(index, slot, source, 0.0);
                 params.set_bus_sidechain_pre(index, slot, source, true);
             }
-            for entry in &plugin.sidechain {
-                let source = entry.strip.0 as usize;
-                params.set_bus_sidechain_gain(index, slot, source, entry.gain.0);
-                params.set_bus_sidechain_pre(index, slot, source, entry.pre_fader);
+            if plugin.sidechain_enabled {
+                for entry in &plugin.sidechain {
+                    let source = entry.strip.0 as usize;
+                    params.set_bus_sidechain_gain(index, slot, source, entry.gain.0);
+                    params.set_bus_sidechain_pre(index, slot, source, entry.pre_fader);
+                }
             }
         }
     }
@@ -3417,10 +3507,12 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
                     params.set_sidechain_gain(index, chain, slot, source, 0.0);
                     params.set_sidechain_pre(index, chain, slot, source, true);
                 }
-                for entry in &plugin.sidechain {
-                    let source = entry.strip.0 as usize;
-                    params.set_sidechain_gain(index, chain, slot, source, entry.gain.0);
-                    params.set_sidechain_pre(index, chain, slot, source, entry.pre_fader);
+                if plugin.sidechain_enabled {
+                    for entry in &plugin.sidechain {
+                        let source = entry.strip.0 as usize;
+                        params.set_sidechain_gain(index, chain, slot, source, entry.gain.0);
+                        params.set_sidechain_pre(index, chain, slot, source, entry.pre_fader);
+                    }
                 }
             }
         }

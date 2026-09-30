@@ -223,7 +223,7 @@ ApplicationWindow {
             if (!list) return
             for (var i = 0; i < list.length; i++) {
                 var p = list[i]
-                if (p.has_sidechain === true) {
+                if (p.has_sidechain === true && p.sidechain_enabled === true) {
                     out.push({
                         location: location,
                         target: target,
@@ -1381,6 +1381,17 @@ ApplicationWindow {
                                 pluginListRoot.target,
                                 pluginRow.pluginData.slot,
                                 !pluginRow.pluginData.bypassed)
+                        }
+                        MenuItem {
+                            text: "Sidechain"
+                            visible: pluginRow.pluginData.has_sidechain === true
+                            checkable: true
+                            checked: pluginRow.pluginData.sidechain_enabled === true
+                            onTriggered: backend.setPluginSidechainEnabled(
+                                pluginListRoot.location,
+                                pluginListRoot.target,
+                                pluginRow.pluginData.slot,
+                                !(pluginRow.pluginData.sidechain_enabled === true))
                         }
                         MenuSeparator { }
                         MenuItem {
@@ -3532,65 +3543,61 @@ ApplicationWindow {
                                     }
                                 }
 
-                                Column {
+                                Label {
+                                    width: parent.width
                                     visible: root.sidechainDestinations().length > 0
-                                    Layout.preferredWidth: root.stripBody
-                                    spacing: 1
+                                    text: "sc"
+                                    color: root.mutedText
+                                    font.pixelSize: 8
+                                }
 
-                                    Label {
-                                        text: "sidechain"
-                                        color: root.mutedText
-                                        font.pixelSize: 8
-                                    }
+                                Repeater {
+                                    model: root.sidechainDestinations()
 
-                                    Repeater {
-                                        model: root.sidechainDestinations()
+                                    delegate: Column {
+                                        id: sidechainRow
+                                        property var dest: modelData
+                                        readonly property bool selfHost:
+                                            sidechainRow.dest.hostStripId === stripCard.stripData.id
+                                        width: parent.width
+                                        spacing: 1
 
-                                        delegate: Column {
-                                            id: sidechainRow
-                                            property var dest: modelData
-                                            readonly property bool selfHost:
-                                                sidechainRow.dest.hostStripId === stripCard.stripData.id
+                                        Label {
                                             width: parent.width
-                                            spacing: 1
+                                            text: "→ " + sidechainRow.dest.name
+                                                + " (" + sidechainRow.dest.hostName + ")"
+                                            elide: Text.ElideRight
+                                            color: sidechainRow.selfHost
+                                                ? root.mutedText : root.textColor
+                                            font.pixelSize: 8
+                                        }
 
-                                            Label {
-                                                width: parent.width
-                                                text: "→ " + sidechainRow.dest.name
-                                                    + " (" + sidechainRow.dest.hostName + ")"
-                                                elide: Text.ElideRight
-                                                color: sidechainRow.selfHost
-                                                    ? root.mutedText : root.textColor
-                                                font.pixelSize: 8
-                                            }
-
-                                            SendSlider {
-                                                width: parent.width
-                                                enabled: !sidechainRow.selfHost
-                                                value: root.sidechainGain(
-                                                    sidechainRow.dest.location,
-                                                    sidechainRow.dest.target,
-                                                    sidechainRow.dest.slot,
-                                                    stripCard.stripData.id)
-                                                preFader: root.sidechainPreFader(
-                                                    sidechainRow.dest.location,
-                                                    sidechainRow.dest.target,
-                                                    sidechainRow.dest.slot,
-                                                    stripCard.stripData.id)
-                                                formatValue: root.gainText
-                                                onMoved: (v) => backend.setSidechainSend(
-                                                    sidechainRow.dest.location,
-                                                    sidechainRow.dest.target,
-                                                    sidechainRow.dest.slot,
-                                                    stripCard.stripData.id,
-                                                    v)
-                                                onPreFaderToggled: (pre) => backend.setSidechainPreFader(
-                                                    sidechainRow.dest.location,
-                                                    sidechainRow.dest.target,
-                                                    sidechainRow.dest.slot,
-                                                    stripCard.stripData.id,
-                                                    pre)
-                                            }
+                                        SendSlider {
+                                            width: parent.width
+                                            enabled: !sidechainRow.selfHost
+                                            value: root.sidechainGain(
+                                                sidechainRow.dest.location,
+                                                sidechainRow.dest.target,
+                                                sidechainRow.dest.slot,
+                                                stripCard.stripData.id)
+                                            preFader: root.sidechainPreFader(
+                                                sidechainRow.dest.location,
+                                                sidechainRow.dest.target,
+                                                sidechainRow.dest.slot,
+                                                stripCard.stripData.id)
+                                            formatValue: root.gainText
+                                            onMoved: (v) => backend.setSidechainSend(
+                                                sidechainRow.dest.location,
+                                                sidechainRow.dest.target,
+                                                sidechainRow.dest.slot,
+                                                stripCard.stripData.id,
+                                                v)
+                                            onPreFaderToggled: (pre) => backend.setSidechainPreFader(
+                                                sidechainRow.dest.location,
+                                                sidechainRow.dest.target,
+                                                sidechainRow.dest.slot,
+                                                stripCard.stripData.id,
+                                                pre)
                                         }
                                     }
                                 }

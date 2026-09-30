@@ -51,6 +51,10 @@ pub struct PluginSlot {
     /// tap. Empty = silence.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub sidechain: Vec<SidechainSource>,
+    /// Whether this plugin's sidechain input is routed (off by default; some
+    /// plugins expose a sidechain that is not used).
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub sidechain_enabled: bool,
 }
 
 /// One strip feeding a plugin's sidechain, with its own level and tap.
@@ -95,6 +99,7 @@ impl PluginSlot {
             missing: false,
             midi_channel: None,
             sidechain: Vec::new(),
+            sidechain_enabled: false,
         }
     }
 }

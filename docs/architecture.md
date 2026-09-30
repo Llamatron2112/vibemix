@@ -285,10 +285,12 @@ wired to the strip/bus signal, extra input buses (e.g. a sidechain) are fed
 silence, and extra output buses get throwaway scratch, so a plugin's bus
 topology is preserved even though vibemix only routes the main bus.
 
-**Sidechain routing.** A plugin that reports an aux input becomes a **send
-destination**, shown on every strip like a bus send: each strip has a row with
-its own gain and pre/post tap (default pre-fader), and several strips can feed
-one sidechain at different levels. The sources are stored on the plugin
+**Sidechain routing.** A plugin that reports an aux input can have its
+sidechain **enabled** from its context menu (off by default — some plugins
+expose a sidechain they never use). Once enabled it becomes a **send
+destination**, shown (under a short `sc` label) on every strip like a bus send:
+each strip has a row with its own gain and pre/post tap (default pre-fader), and
+several strips can feed one sidechain at different levels. The sources are stored on the plugin
 (`PluginSlot.sidechain: Vec<SidechainSource>`, keyed by stable strip id, so they
 travel with the plugin), and summed into its first non-CV aux input instead of
 silence. The plugin's own strip row is shown but disabled (keeps strips
@@ -391,6 +393,7 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/plugin/move` | `int location, int target, int from, int to` |
 | `/vibemix/plugin/param` | `int location, int target, int slot, int param, float value` |
 | `/vibemix/plugin/bypass` | `int location, int target, int slot, int bypassed` |
+| `/vibemix/plugin/sidechain/enabled` | `int location, int target, int slot, int enabled` |
 | `/vibemix/plugin/sidechain/send` | `int location, int target, int slot, int strip, float gain` |
 | `/vibemix/plugin/sidechain/pre_fader` | `int location, int target, int slot, int strip, int pre` |
 | `/vibemix/plugin/ui` | `int location, int target, int slot` (open native UI window) |

@@ -125,11 +125,17 @@ pub enum ControlMessage {
         slot: u32,
         bypassed: bool,
     },
+    SetPluginSidechainEnabled {
+        location: u32,
+        target: u32,
+        slot: u32,
+        enabled: bool,
+    },
     SetPluginSidechain {
         location: u32,
         target: u32,
         slot: u32,
-        /// Source strip, or `-1` to clear.
+        /// Source strip.
         strip: i32,
         gain: f32,
     },
@@ -495,6 +501,20 @@ impl ControlMessage {
                     OscType::Int(*target as i32),
                     OscType::Int(*slot as i32),
                     OscType::Int(*bypassed as i32),
+                ],
+            },
+            SetPluginSidechainEnabled {
+                location,
+                target,
+                slot,
+                enabled,
+            } => OscMessage {
+                addr: addr::PLUGIN_SIDECHAIN_ENABLED.to_string(),
+                args: vec![
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*enabled as i32),
                 ],
             },
             SetPluginSidechain {
@@ -970,6 +990,12 @@ impl ControlMessage {
                 slot: int(args, 2)? as u32,
                 bypassed: int(args, 3)? != 0,
             }),
+            addr::PLUGIN_SIDECHAIN_ENABLED => Some(ControlMessage::SetPluginSidechainEnabled {
+                location: int(args, 0)? as u32,
+                target: int(args, 1)? as u32,
+                slot: int(args, 2)? as u32,
+                enabled: int(args, 3)? != 0,
+            }),
             addr::PLUGIN_SIDECHAIN_SEND => Some(ControlMessage::SetPluginSidechain {
                 location: int(args, 0)? as u32,
                 target: int(args, 1)? as u32,
@@ -1319,19 +1345,18 @@ mod tests {
             slot: 2,
             bypassed: true,
         });
+        roundtrip(ControlMessage::SetPluginSidechainEnabled {
+            location: 0,
+            target: 1,
+            slot: 0,
+            enabled: true,
+        });
         roundtrip(ControlMessage::SetPluginSidechain {
             location: 0,
             target: 1,
             slot: 0,
             strip: 3,
             gain: 0.5,
-        });
-        roundtrip(ControlMessage::SetPluginSidechain {
-            location: 0,
-            target: 1,
-            slot: 0,
-            strip: -1,
-            gain: 0.0,
         });
         roundtrip(ControlMessage::SetPluginSidechainPre {
             location: 2,

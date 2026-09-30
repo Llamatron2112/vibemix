@@ -27,6 +27,7 @@ pub const PLUGIN_REMOVE: &str = "/vibemix/plugin/remove";
 pub const PLUGIN_MOVE: &str = "/vibemix/plugin/move";
 pub const PLUGIN_PARAM: &str = "/vibemix/plugin/param";
 pub const PLUGIN_BYPASS: &str = "/vibemix/plugin/bypass";
+pub const PLUGIN_SIDECHAIN_ENABLED: &str = "/vibemix/plugin/sidechain/enabled";
 pub const PLUGIN_SIDECHAIN_SEND: &str = "/vibemix/plugin/sidechain/send";
 pub const PLUGIN_SIDECHAIN_PRE: &str = "/vibemix/plugin/sidechain/pre_fader";
 pub const PLUGIN_UI: &str = "/vibemix/plugin/ui";
