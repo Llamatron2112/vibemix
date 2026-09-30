@@ -85,7 +85,11 @@ impl<'a> SequenceWriter<'a> {
         // SAFETY: a sequence buffer is a header (size + type) followed by body.
         let bytes =
             unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
-        let size = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
+        let size = bytes
+            .get(0..4)
+            .and_then(|head| head.try_into().ok())
+            .map(u32::from_ne_bytes)
+            .unwrap_or(0) as usize;
         Self {
             bytes,
             size: size.max(SEQUENCE_BODY),
@@ -191,8 +195,9 @@ fn push_property(buf: &mut [u8], len: &mut usize, key: u32, value_type: u32, val
     }
 }
 
-/// A tiny reader used by tests (and the future MIDI output path).
-#[allow(dead_code)]
+/// A tiny reader used by the atom tests (a starting point for a future MIDI
+/// output path).
+#[cfg(test)]
 pub fn read_events(words: &[u64]) -> Vec<(i64, u32, Vec<u8>)> {
     let bytes =
         unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) };
