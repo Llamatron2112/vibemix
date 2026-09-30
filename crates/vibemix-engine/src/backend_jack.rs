@@ -2659,3 +2659,83 @@ mod tests {
         );
     }
 }
+
+#[cfg(test)]
+mod sidechain_feed_tests {
+    use super::*;
+
+    struct Recorder {
+        has: bool,
+        left: Vec<f32>,
+    }
+
+    impl PluginNode for Recorder {
+        fn input_buffer_mut(&mut self, _channel: usize) -> &mut [f32] {
+            &mut []
+        }
+        fn output_buffer(&self, _channel: usize) -> &[f32] {
+            &[]
+        }
+        fn control_count(&self) -> usize {
+            0
+        }
+        fn control_default(&self, _param: usize) -> f32 {
+            0.0
+        }
+        fn set_control(&mut self, _param: usize, _value: f32) {}
+        fn write_midi(&mut self, _events: &[MidiEvent]) {}
+        fn write_position(&mut self, _position: &vibemix_lv2::TimePosition) {}
+        fn run(&mut self, _frames: usize) {}
+        fn deliver_responses(&mut self) {}
+        fn outputs(&self) -> Option<Arc<SharedOutputs>> {
+            None
+        }
+        fn load_state(&mut self, _state: &str) {}
+        fn has_sidechain(&self) -> bool {
+            self.has
+        }
+        fn write_sidechain(&mut self, left: &[f32], _right: &[f32]) {
+            self.left = left.to_vec();
+        }
+    }
+
+    #[test]
+    fn sums_sources_with_gains_and_taps() {
+        let params = SharedParams::new(2, 1);
+        // Plugin on strip 0: source strip 0 pre-fader at 0.5, strip 1 post at 0.25.
+        params.set_sidechain_gain(0, 0, 0, 0, 0.5);
+        params.set_sidechain_pre(0, 0, 0, 0, true);
+        params.set_sidechain_gain(0, 0, 0, 1, 0.25);
+        params.set_sidechain_pre(0, 0, 0, 1, false);
+
+        let pre = vec![[vec![1.0f32; 4], vec![1.0; 4]], [vec![2.0; 4], vec![2.0; 4]]];
+        let post = vec![[vec![10.0f32; 4], vec![10.0; 4]], [vec![20.0; 4], vec![20.0; 4]]];
+        let zeros = vec![[vec![0.0f32; 4], vec![0.0; 4]], [vec![0.0; 4], vec![0.0; 4]]];
+        let silence = [vec![0.0f32; 4], vec![0.0; 4]];
+        let mut mix = [vec![0.0f32; 4], vec![0.0; 4]];
+
+        let mut recorder = Recorder {
+            has: true,
+            left: Vec::new(),
+        };
+        feed_sidechain(
+            &mut recorder,
+            false,
+            0,
+            0,
+            0,
+            false,
+            &params,
+            &pre,
+            &post,
+            &zeros,
+            &zeros,
+            &mut mix,
+            &silence,
+            4,
+        );
+
+        // 1.0 * 0.5 (pre) + 20.0 * 0.25 (post) = 5.5
+        assert!((recorder.left[0] - 5.5).abs() < 1e-4, "{:?}", recorder.left);
+    }
+}

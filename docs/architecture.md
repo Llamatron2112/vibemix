@@ -285,18 +285,21 @@ wired to the strip/bus signal, extra input buses (e.g. a sidechain) are fed
 silence, and extra output buses get throwaway scratch, so a plugin's bus
 topology is preserved even though vibemix only routes the main bus.
 
-**Sidechain routing.** A plugin slot may name a source bus
-(`PluginSlot.sidechain_bus`); the plugin's first non-CV aux input is then fed
-that bus's summed strip sends (`bus_accum`) instead of silence. Strips feed the
-bus with their ordinary send rows (per-strip gain and pre/post tap), so the
-master is not a valid source and no separate send UI is needed. To avoid the
-variable PipeWire quantum becoming an audible sidechain delay, the engine
-processes strips in a **topological order** (computed once per change) that
-runs a bus's contributing strips before the strips whose plugins consume it, so
-the sum is complete in the same block; strips left in a dependency cycle read
-the previous block's sum. The order is installed via an RT command and the old
-order is retired on the control thread. The VST3 editor's context menu offers
-"Sidechain input" for plugins that report an aux input.
+**Sidechain routing.** A plugin that reports an aux input becomes a **send
+destination**, shown on every strip like a bus send: each strip has a row with
+its own gain and pre/post tap (default pre-fader), and several strips can feed
+one sidechain at different levels. The sources are stored on the plugin
+(`PluginSlot.sidechain: Vec<SidechainSource>`, keyed by stable strip id, so they
+travel with the plugin), and summed into its first non-CV aux input instead of
+silence. The plugin's own strip row is shown but disabled (keeps strips
+aligned, avoids a feedback path).
+
+To avoid the variable PipeWire quantum becoming an audible sidechain delay, the
+engine processes strips in a **topological order** (recomputed per change) that
+runs a plugin's source strips before the strip that consumes them, so the tap
+is complete in the same block; strips left in a dependency cycle read the
+previous block's tap. The order is installed via an RT command and the old
+order is retired on the control thread.
 
 Not supported: Qt plugin UIs (and GTK4).
 
@@ -388,7 +391,8 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/plugin/move` | `int location, int target, int from, int to` |
 | `/vibemix/plugin/param` | `int location, int target, int slot, int param, float value` |
 | `/vibemix/plugin/bypass` | `int location, int target, int slot, int bypassed` |
-| `/vibemix/plugin/sidechain` | `int location, int target, int slot, int bus` (-1 clears) |
+| `/vibemix/plugin/sidechain/send` | `int location, int target, int slot, int strip, float gain` |
+| `/vibemix/plugin/sidechain/pre_fader` | `int location, int target, int slot, int strip, int pre` |
 | `/vibemix/plugin/ui` | `int location, int target, int slot` (open native UI window) |
 | `/vibemix/plugin/ui/close` | `int location, int target, int slot` |
 | `/vibemix/plugin/copy` | `int location, int target, int slot` |
