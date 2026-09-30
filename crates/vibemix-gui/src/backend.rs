@@ -76,6 +76,13 @@ struct View {
     connected: bool,
 }
 
+/// Locks the shared [`View`], recovering from a poisoned mutex. `View` is plain
+/// data, so a panic while it was locked leaves it usable; refusing to lock
+/// again (the default `expect` behaviour) would wedge the whole GUI.
+fn view_lock() -> std::sync::MutexGuard<'static, View> {
+    view().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
 fn view() -> &'static Mutex<View> {
     VIEW.get_or_init(|| {
         Mutex::new(View {
@@ -195,7 +202,7 @@ fn receive_loop(socket: UdpSocket) {
                     let (structure, values) = split_state(&json);
                     let (strip_ids, bus_ids) = extract_ids(&json);
                     let combined = format!("{structure}\n{values}");
-                    let mut guard = view().lock().expect("view lock");
+                    let mut guard = view_lock();
                     guard.strip_ids = strip_ids;
                     guard.bus_ids = bus_ids;
                     guard.structure_json = structure;
@@ -262,7 +269,7 @@ fn receive_loop(socket: UdpSocket) {
                     }
                 }
                 Some(ControlMessage::Catalog { json }) => {
-                    let mut guard = view().lock().expect("view lock");
+                    let mut guard = view_lock();
                     guard.catalog_json = json;
                     guard.connected = true;
                     drop(guard);
@@ -326,7 +333,7 @@ fn receive_loop(socket: UdpSocket) {
                     buses_l,
                     buses_r,
                 }) => {
-                    let mut guard = view().lock().expect("view lock");
+                    let mut guard = view_lock();
                     guard.strip_in_l = strips_in_l;
                     guard.strip_in_r = strips_in_r;
                     guard.strip_gain_l = strips_gain_l;
@@ -352,19 +359,19 @@ fn receive_loop(socket: UdpSocket) {
 }
 
 fn build_snapshot_json() -> String {
-    view().lock().expect("view lock").structure_json.clone()
+    view_lock().structure_json.clone()
 }
 
 fn build_values_json() -> String {
-    view().lock().expect("view lock").values_json.clone()
+    view_lock().values_json.clone()
 }
 
 fn build_catalog_json() -> String {
-    view().lock().expect("view lock").catalog_json.clone()
+    view_lock().catalog_json.clone()
 }
 
 fn build_meters_json() -> String {
-    let guard = view().lock().expect("view lock");
+    let guard = view_lock();
 
     let sample = |values: &[f32], index: usize| values.get(index).copied().unwrap_or(0.0);
 
@@ -420,7 +427,7 @@ fn build_meters_json() -> String {
 }
 
 fn is_connected() -> bool {
-    view().lock().expect("view lock").connected
+    view_lock().connected
 }
 
 fn extract_ids(json: &str) -> (Vec<u32>, Vec<u32>) {    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
