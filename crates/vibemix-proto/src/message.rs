@@ -1224,6 +1224,28 @@ mod tests {
     }
 
     #[test]
+    fn decode_tolerates_garbage() {
+        // Arbitrary bytes must never panic the decoder (it drives the engine
+        // from untrusted UDP input).
+        for len in 0..96u32 {
+            let bytes: Vec<u8> = (0..len).map(|i| (i.wrapping_mul(37) + 11) as u8).collect();
+            let _ = ControlMessage::decode(&bytes);
+        }
+        // Truncations of a valid message must also be safe.
+        let full = ControlMessage::SetPluginSidechainEnabled {
+            location: 1,
+            target: 2,
+            slot: 3,
+            enabled: true,
+        }
+        .encode()
+        .expect("encode");
+        for cut in 0..full.len() {
+            let _ = ControlMessage::decode(&full[..cut]);
+        }
+    }
+
+    #[test]
     fn roundtrip_scalar_params() {
         roundtrip(ControlMessage::SetStripGain {
             strip: 3,

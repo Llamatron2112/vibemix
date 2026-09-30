@@ -30,6 +30,24 @@ run-gui:
 scan-plugins:
     cargo run -p vibemix-engine -- --scan-plugins
 
+# Run the engine under VIBEMIX_RT_GUARD=1 for a few seconds: it aborts
+# (non-zero) if the audio thread allocates or frees. Needs PipeWire's pw-jack.
+rt-guard:
+    #!/usr/bin/env bash
+    set -euo pipefail
+    dir="$(mktemp -d)"
+    trap 'rm -rf "$dir"' EXIT
+    set +e
+    timeout 8 env VIBEMIX_CONFIG_DIR="$dir" VIBEMIX_RT_GUARD=1 \
+        pw-jack ./target/debug/vibemix-engine --osc-port 9931 >/dev/null 2>&1
+    status=$?
+    set -e
+    if [ "$status" -ne 124 ]; then
+        echo "rt-guard: engine exited early with $status (RT heap op or start failure)" >&2
+        exit 1
+    fi
+    echo "rt-guard: ok"
+
 release:
     cargo build --release --workspace
 

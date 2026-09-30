@@ -469,7 +469,16 @@ mod tests {
         model.strips[0]
             .plugins_post
             .push(PluginSlot::new(PluginId(0), "http://example.com/post"));
+        model.strips[0].plugins_post[0].sidechain_enabled = true;
+        model.strips[0].plugins_post[0]
+            .sidechain
+            .push(SidechainSource {
+                strip: StripId(0),
+                gain: Gain(0.6),
+                pre_fader: false,
+            });
         model.strips[0].sends[0].delay_ms = 12.5;
+        model.strips[0].sends[0].pre_fader = true;
         model.strips[0].connections = Some(StripConnections {
             in_l: vec!["system:capture_1".to_string(), "app:out_l".to_string()],
             in_r: vec!["system:capture_2".to_string()],
@@ -500,6 +509,15 @@ mod tests {
         assert_eq!(parsed.strips[0].midi_channel, Some(3));
         assert_eq!(parsed.buses[0].midi_channel, Some(5));
         assert_eq!(parsed.strips[0].sends[0].delay_ms, 12.5);
+        assert!(parsed.strips[0].sends[0].pre_fader);
+        assert!(parsed.strips[0].plugins_post[0].sidechain_enabled);
+        assert_eq!(parsed.strips[0].plugins_post[0].sidechain.len(), 1);
+        assert_eq!(
+            parsed.strips[0].plugins_post[0].sidechain[0].strip,
+            StripId(0)
+        );
+        assert_eq!(parsed.strips[0].plugins_post[0].sidechain[0].gain, Gain(0.6));
+        assert!(!parsed.strips[0].plugins_post[0].sidechain[0].pre_fader);
         assert_eq!(
             parsed.buses[0]
                 .connections
@@ -552,6 +570,10 @@ mod tests {
         let legacy = "id = 0\nuri = \"http://example.com/y\"\nbypassed = false\n";
         let parsed: PluginSlot = toml::from_str(legacy).expect("deserialize legacy");
         assert_eq!(parsed.format, PluginFormat::Lv2);
+        // Fields added later must default cleanly for older sessions.
+        assert!(parsed.sidechain.is_empty());
+        assert!(!parsed.sidechain_enabled);
+        assert_eq!(parsed.midi_channel, None);
     }
 
     #[test]
