@@ -90,9 +90,6 @@ pub struct Controller {
     host: Host,
     /// VST3 host (discovery + instantiation).
     vst3: vibemix_vst3::Host,
-    /// Previous lilv worlds, kept alive so plugin instances (and UIs) created
-    /// from them stay valid after a rescan swaps in a fresh `host`.
-    retired_hosts: Vec<Host>,
     plugins: Vec<PluginEntry>,
     catalog_json: String,
     health: HealthStore,
@@ -292,7 +289,6 @@ impl Controller {
             engine,
             host,
             vst3,
-            retired_hosts: Vec::new(),
             plugins,
             catalog_json,
             health,
@@ -1074,8 +1070,10 @@ impl Controller {
             },
             ControlMessage::RescanPlugins => {
                 self.capture_plugin_states();
-                let old = std::mem::replace(&mut self.host, Host::new());
-                self.retired_hosts.push(old);
+                // Replace the discovery world. Live instances hold their own
+                // `Arc<World>`, so dropping the old host here is safe; no
+                // retired-host list (which would grow without bound) is needed.
+                self.host = Host::new();
                 self.plugins = discover_catalog(&self.host, &self.vst3);
                 if self.plugins.is_empty() {
                     self.plugins = load_catalog();
@@ -1084,6 +1082,10 @@ impl Controller {
                 self.catalog_json = build_catalog(&self.plugins, &self.health);
                 save_catalog(&self.plugins);
                 let sample_rate = self.engine.sample_rate() as f64;
+                // Rebinding plugins recreates every instance, so any open editor
+                // (which holds the old instance handle) must be closed first or
+                // it would touch freed memory once the old graph is retired.
+                self.uis.clear();
                 if let Err(error) =
                     self.engine
                         .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, sample_rate)

@@ -122,13 +122,16 @@ pub struct PluginInfo {
 }
 
 pub struct Host {
-    world: World,
+    /// The lilv world, shared with every instance created from this host so the
+    /// instances keep it alive even after the host itself is dropped (e.g. on a
+    /// rescan). `lilv::Instance` does not reference its world.
+    world: Arc<World>,
     urid: &'static UridMap,
 }
 
 impl Host {
     pub fn new() -> Self {
-        let world = World::new();
+        let world = Arc::new(World::new());
         world.load_all();
         Self {
             world,
@@ -661,6 +664,7 @@ impl Host {
 
         Some(PluginInstance {
             active,
+            _world: Arc::clone(&self.world),
             audio_inputs,
             audio_outputs,
             main_input_count: classified.main_input_count,
@@ -785,6 +789,8 @@ unsafe fn instance_extension_data<T>(
 
 pub struct PluginInstance {
     active: ActiveInstance,
+    /// Keeps the lilv world alive for as long as this instance exists.
+    _world: Arc<World>,
     audio_inputs: Vec<usize>,
     audio_outputs: Vec<usize>,
     main_input_count: usize,
