@@ -6,6 +6,7 @@
 
 #include <atomic>
 #include <cstdlib>
+#include <limits>
 #include <cstring>
 #include <filesystem>
 #include <memory>
@@ -152,6 +153,10 @@ struct Hosted {
     std::mutex param_edits_mutex;
     std::vector<std::pair<int, float>> param_edits;
     std::atomic<int32> restart_flags {0};
+    // Cached parameter ids and last-sent values so an unchanged block does no
+    // `getParameterInfo`/automation work on the audio thread.
+    std::vector<ParamID> param_ids;
+    std::vector<float> last_param;
 
     void push_param_edit(int index, float value) {
         std::lock_guard<std::mutex> lock(param_edits_mutex);
@@ -298,6 +303,15 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     if (hosted->controller) {
         hosted->component_handler = new ComponentHandler(hosted);
         hosted->controller->setComponentHandler(hosted->component_handler);
+        // Cache parameter ids and last-sent values once (see `vst3_set_param`).
+        const int32 count = hosted->controller->getParameterCount();
+        hosted->param_ids.assign(count, kNoParamId);
+        hosted->last_param.assign(count, std::numeric_limits<float>::quiet_NaN());
+        for (int32 i = 0; i < count; ++i) {
+            ParameterInfo info {};
+            if (hosted->controller->getParameterInfo(i, info) == kResultOk)
+                hosted->param_ids[i] = info.id;
+        }
     }
     if (!hosted->component) {
         delete hosted;
@@ -503,11 +517,12 @@ int vst3_param_value_string(void* handle, int index, float normalized, char* out
 
 void vst3_set_param(void* handle, int index, float normalized) {
     auto* hosted = static_cast<Hosted*>(handle);
-    if (!hosted || !hosted->controller) return;
-    ParameterInfo info {};
-    if (hosted->controller->getParameterInfo(index, info) != kResultOk) return;
+    if (!hosted || index < 0 || index >= static_cast<int>(hosted->param_ids.size())) return;
+    const ParamID id = hosted->param_ids[index];
+    if (id == kNoParamId || hosted->last_param[index] == normalized) return;
+    hosted->last_param[index] = normalized;
     int32 queue_index = 0;
-    if (auto* queue = hosted->changes.addParameterData(info.id, queue_index))
+    if (auto* queue = hosted->changes.addParameterData(id, queue_index))
         queue->addPoint(0, normalized, queue_index);
 }
 

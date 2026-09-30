@@ -118,8 +118,9 @@ pub struct Controller {
     /// Last time a plugin-parameter edit echoed state to the UI.
     last_param_echo: Instant,
     /// Last installed sidechain strip order (recomputed each poll, pushed on change).
-    last_strip_order: Vec<usize>,
-    last_strip_delayed: Vec<Vec<Vec<bool>>>,
+    /// Hash of the sidechain routing; the topological strip order is only
+    /// recomputed when this changes.
+    last_routing_signature: u64,
 }
 
 /// An open plugin editor: an LV2 toolkit UI or a VST3 `IPlugView`.
@@ -313,8 +314,7 @@ impl Controller {
             edit_dirty: false,
             pending_learn: None,
             last_param_echo: Instant::now() - PARAM_ECHO_INTERVAL,
-            last_strip_order: Vec::new(),
-            last_strip_delayed: Vec::new(),
+            last_routing_signature: 0,
         };
         controller.ensure_model_vst3_controls();
         save_catalog(&controller.plugins);
@@ -380,15 +380,16 @@ impl Controller {
             self.pump_uis();
             let param_edits = self.drain_vst3_param_edits();
 
-            // Keep the sidechain-aware strip order up to date; push only on change.
-            let (order, delayed) = compute_strip_order(&self.model, self.params.strip_count());
-            if order != self.last_strip_order || delayed != self.last_strip_delayed {
-                match self.engine.set_strip_order(order.clone(), delayed.clone()) {
-                    Ok(()) => {
-                        self.last_strip_order = order;
-                        self.last_strip_delayed = delayed;
-                    }
-                    Err(error) => tracing::warn!(%error, "failed to install strip order"),
+            // Keep the sidechain-aware strip order up to date. The topological
+            // sort allocates, so only run it when the sidechain routing (the
+            // only input to the order) actually changes.
+            let signature = sidechain_signature(&self.model);
+            if signature != self.last_routing_signature {
+                self.last_routing_signature = signature;
+                let (order, delayed) =
+                    compute_strip_order(&self.model, self.params.strip_count());
+                if let Err(error) = self.engine.set_strip_order(order, delayed) {
+                    tracing::warn!(%error, "failed to install strip order");
                 }
             }
 
@@ -3358,6 +3359,23 @@ fn free_strip_slot(params: &SharedParams) -> Option<usize> {
 
 fn free_bus_slot(params: &SharedParams) -> Option<usize> {
     (0..params.bus_count()).find(|index| !params.bus_active(*index))
+}
+
+/// Cheap, allocation-free signature of the model's sidechain routing (the only
+/// input to [`compute_strip_order`]). Unequal signatures require a recompute;
+/// equal ones never do.
+fn sidechain_signature(model: &MixerModel) -> u64 {
+    let mut acc = 0u64;
+    for strip in &model.strips {
+        for plugin in strip.plugins.iter().chain(strip.plugins_post.iter()) {
+            for source in &plugin.sidechain {
+                let pair = (strip.id.0 as u64).wrapping_mul(0x9E37_79B9_7F4A_7C15)
+                    ^ (source.strip.0 as u64).wrapping_mul(0xC2B2_AE3D_27D4_EB4F);
+                acc = acc.wrapping_mul(31).wrapping_add(pair);
+            }
+        }
+    }
+    acc
 }
 
 /// Strip processing order that places sidechain source strips before the

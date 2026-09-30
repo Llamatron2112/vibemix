@@ -291,6 +291,9 @@ struct MixerGraph {
     strip_order: Vec<usize>,
     /// Per-slot cycle flags: delayed slots read last block's strip tap.
     strip_delayed: Vec<Vec<Vec<bool>>>,
+    /// Whether any slot is delayed; the per-block tap snapshot is only needed
+    /// then, which is rare (cycles).
+    sidechain_delayed_any: bool,
     garbage_order: Producer<RetiredOrder>,
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
@@ -457,6 +460,10 @@ impl MixerGraph {
                     }) {
                         std::mem::forget(old);
                     }
+                    self.sidechain_delayed_any = self
+                        .strip_delayed
+                        .iter()
+                        .any(|chains| chains.iter().any(|slots| slots.iter().any(|d| *d)));
                 }
             }
         }
@@ -788,17 +795,20 @@ impl MixerGraph {
             }
         }
 
-        // Snapshot the strip taps for delayed (cyclic) sidechain feeds next block.
-        for strip in 0..strip_count.min(self.strip_pre_snapshot.len()) {
-            let len = frames.min(self.strip_pre_snapshot[strip][0].len());
-            self.strip_pre_snapshot[strip][0][..len]
-                .copy_from_slice(&self.strip_pre_fader[strip][0][..len]);
-            self.strip_pre_snapshot[strip][1][..len]
-                .copy_from_slice(&self.strip_pre_fader[strip][1][..len]);
-            self.strip_post_snapshot[strip][0][..len]
-                .copy_from_slice(&self.strip_post_fader[strip][0][..len]);
-            self.strip_post_snapshot[strip][1][..len]
-                .copy_from_slice(&self.strip_post_fader[strip][1][..len]);
+        // Snapshot the strip taps for delayed (cyclic) sidechain feeds next
+        // block; skip the copy entirely unless a cycle exists (rare).
+        if self.sidechain_delayed_any {
+            for strip in 0..strip_count.min(self.strip_pre_snapshot.len()) {
+                let len = frames.min(self.strip_pre_snapshot[strip][0].len());
+                self.strip_pre_snapshot[strip][0][..len]
+                    .copy_from_slice(&self.strip_pre_fader[strip][0][..len]);
+                self.strip_pre_snapshot[strip][1][..len]
+                    .copy_from_slice(&self.strip_pre_fader[strip][1][..len]);
+                self.strip_post_snapshot[strip][0][..len]
+                    .copy_from_slice(&self.strip_post_fader[strip][0][..len]);
+                self.strip_post_snapshot[strip][1][..len]
+                    .copy_from_slice(&self.strip_post_fader[strip][1][..len]);
+            }
         }
     }
 
@@ -1225,6 +1235,7 @@ impl JackEngine {
                         .collect()
                 })
                 .collect(),
+            sidechain_delayed_any: false,
             garbage_order: garbage_order_producer,
             bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             bus_accum: (0..bus_count)
