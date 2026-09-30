@@ -535,13 +535,22 @@ void* vibemix_ui_open(const char* plugin_uri, const char* ui_uri, const char* ui
 
   ui->host = suil_host_new(suil_write, suil_index, NULL, NULL);
 
-  /* Pin the UI module resident and globally visible. Suil would otherwise
-     dlclose it when the UI is freed, unloading its toolkit dependencies
-     (GTK/GLib). Reloading them on a later open re-registers GObject types
-     ("cannot register existing type 'PangoFontMap'") and can hang or crash
-     the host, so keep the module loaded for the lifetime of the process. */
+  /* Pin the UI module resident. Suil would otherwise dlclose it when the UI is
+     freed, unloading its toolkit dependencies (GTK/GLib); reloading them on a
+     later open re-registers GObject types ("cannot register existing type
+     'PangoFontMap'") and can hang or crash the host, so keep the module loaded
+     for the lifetime of the process.
+
+     Keep it RTLD_LOCAL: the module is a plugin (for some, the DSP and the UI
+     share one .so, e.g. the JUCE-based CHOW plugins). Loading it RTLD_GLOBAL
+     would publish its symbols process-wide, so instantiating another plugin
+     could bind to this module's copy of shared libraries (JUCE, libstdc++,
+     ...) and crash. RTLD_NODELETE is what prevents the unload, not RTLD_GLOBAL. */
   if (binary_path && *binary_path) {
-    dlopen(binary_path, RTLD_NOW | RTLD_GLOBAL | RTLD_NODELETE);
+    if (!dlopen(binary_path, RTLD_NOW | RTLD_LOCAL | RTLD_NODELETE)) {
+      fprintf(stderr, "[vibemix-ui] could not pin UI binary %s: %s\n", binary_path,
+              dlerror());
+    }
   }
 
   /* For GTK UIs the container type matches the UI type (native hosting). */

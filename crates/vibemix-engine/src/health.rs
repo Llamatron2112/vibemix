@@ -233,21 +233,18 @@ impl Scan {
             .arg("--scan-plugins")
             .stdout(Stdio::piped())
             .stderr(Stdio::null());
+        // Own process group so `stop()` can kill the whole sweep. `process_group`
+        // is handled by posix_spawn, unlike a `pre_exec` (which forces fork).
+        command.process_group(0);
         if let Some(only) = only {
             for uri in only {
                 command.arg("--only").arg(uri);
             }
         }
-        // Safety: only affects the child. Run the sweep in its own process group
-        // (so it can be killed wholesale) and at a lower priority (so the audio
-        // thread and UI always win).
-        unsafe {
-            command.pre_exec(|| {
-                libc::setpgid(0, 0);
-                libc::setpriority(libc::PRIO_PROCESS, 0, 10);
-                Ok(())
-            });
-        }
+        // The sweep child puts itself in its own process group and lowers its
+        // priority at startup (see `smoke::scan_plugins`), so no `pre_exec` is
+        // needed. `pre_exec` would force `fork()` in the multithreaded engine,
+        // which can deadlock the child once plugin UIs have started threads.
         let Ok(mut child) = command.spawn() else {
             return false;
         };

@@ -143,6 +143,12 @@ pub enum ChildOutcome {
 /// set to the given URIs (`None` tests everything).
 pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
     disable_core_dumps();
+    // Low priority so the audio thread and UI always win. The parent puts the
+    // sweep in its own process group via `Command::process_group`, avoiding a
+    // `pre_exec` (which would force a fork in the multithreaded engine).
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
 
     let only: Option<std::collections::HashSet<String>> =
         only.map(|list| list.into_iter().collect());
@@ -153,9 +159,11 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
         .discover()
         .into_iter()
         .filter(|info| {
+            // Main inputs must be mono/stereo and match the outputs; extra
+            // inputs are sidechain.
             info.hostable
-                && ((info.audio_inputs.len() == 2 && info.audio_outputs.len() == 2)
-                    || (info.audio_inputs.len() == 1 && info.audio_outputs.len() == 1))
+                && ((info.main_input_count == 2 && info.audio_outputs.len() == 2)
+                    || (info.main_input_count == 1 && info.audio_outputs.len() == 1))
                 && in_only(&info.uri)
         })
         .map(|info| SmokeTarget::Lv2 {

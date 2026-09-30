@@ -1,7 +1,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
-use std::os::unix::process::{CommandExt, ExitStatusExt};
+use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -1508,13 +1508,11 @@ impl Controller {
         } else {
             command.stdout(Stdio::null()).stderr(Stdio::null());
         }
-        // Safety: only adjusts the child's resource limits.
-        unsafe {
-            command.pre_exec(|| {
-                crate::smoke::disable_core_dumps();
-                Ok(())
-            });
-        }
+        // The child disables its own core dumps (see the `run_smoke*` entry
+        // points), so no `pre_exec` is needed here. That matters: `pre_exec`
+        // forces `fork()` in the multithreaded engine (RT thread, health
+        // reader, plugin UI threads), which can deadlock the child while it
+        // holds a lock another thread took at fork time.
         let Ok(mut child) = command.spawn() else {
             return true;
         };

@@ -289,6 +289,8 @@ fn run_smoke_ui(uri: &str) -> ! {
     use std::ffi::c_void;
     use std::time::Duration;
 
+    smoke::disable_core_dumps();
+
     extern "C" fn no_write(_: *mut c_void, _: u32, _: u32, _: u32, _: *const c_void) {}
 
     let host = Host::new();
