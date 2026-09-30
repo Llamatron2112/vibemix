@@ -6,6 +6,28 @@ pub const MAX_PLUGINS: usize = 6;
 pub const MAX_PARAMS: usize = 64;
 /// Plugin insert chains per strip: 0 = pre-fader, 1 = post-fader.
 pub const PLUGIN_CHAINS: usize = 2;
+/// Sidechain sends a single plugin can have. Bounds the shared state to
+/// `O(plugins)` instead of `O(plugins × strips)`.
+pub const MAX_SIDECHAIN_SOURCES: usize = 16;
+
+/// One sidechain send: the source strip (`source + 1`, 0 = empty) with its
+/// gain and pre/post tap.
+#[derive(Debug)]
+struct SidechainSlot {
+    source: AtomicU32,
+    gain: AtomicU32,
+    pre: AtomicBool,
+}
+
+impl SidechainSlot {
+    fn new() -> Self {
+        Self {
+            source: AtomicU32::new(0),
+            gain: AtomicU32::new(0),
+            pre: AtomicBool::new(true),
+        }
+    }
+}
 
 #[derive(Debug)]
 pub struct SharedParams {
@@ -29,12 +51,9 @@ pub struct SharedParams {
     plugin_bypass: Vec<Vec<Vec<AtomicBool>>>,
     bus_plugin_params: Vec<Vec<Vec<AtomicU32>>>,
     bus_plugin_bypass: Vec<Vec<AtomicBool>>,
-    /// Sidechain sends: per plugin slot, per source strip, the send gain and
-    /// pre/post tap (`0.0` gain = inactive).
-    sidechain_gain: Vec<Vec<Vec<Vec<AtomicU32>>>>,
-    sidechain_pre: Vec<Vec<Vec<Vec<AtomicBool>>>>,
-    bus_sidechain_gain: Vec<Vec<Vec<AtomicU32>>>,
-    bus_sidechain_pre: Vec<Vec<Vec<AtomicBool>>>,
+    /// Sidechain sends per plugin slot, as a small fixed-size sparse list.
+    sidechain: Vec<Vec<Vec<[SidechainSlot; MAX_SIDECHAIN_SOURCES]>>>,
+    bus_sidechain: Vec<Vec<[SidechainSlot; MAX_SIDECHAIN_SOURCES]>>,
     state_pause: AtomicBool,
     state_ack: AtomicBool,
     beats_per_bar: AtomicU32,
@@ -86,35 +105,21 @@ impl SharedParams {
             bus_plugin_bypass: (0..bus_count)
                 .map(|_| (0..MAX_PLUGINS).map(|_| AtomicBool::new(false)).collect())
                 .collect(),
-            sidechain_gain: (0..strip_count)
+            sidechain: (0..strip_count)
                 .map(|_| {
                     (0..PLUGIN_CHAINS)
                         .map(|_| {
                             (0..MAX_PLUGINS)
-                                .map(|_| zero_vec(strip_count))
+                                .map(|_| std::array::from_fn(|_| SidechainSlot::new()))
                                 .collect()
                         })
                         .collect()
                 })
                 .collect(),
-            sidechain_pre: (0..strip_count)
-                .map(|_| {
-                    (0..PLUGIN_CHAINS)
-                        .map(|_| {
-                            (0..MAX_PLUGINS)
-                                .map(|_| (0..strip_count).map(|_| AtomicBool::new(true)).collect())
-                                .collect()
-                        })
-                        .collect()
-                })
-                .collect(),
-            bus_sidechain_gain: (0..bus_count)
-                .map(|_| (0..MAX_PLUGINS).map(|_| zero_vec(strip_count)).collect())
-                .collect(),
-            bus_sidechain_pre: (0..bus_count)
+            bus_sidechain: (0..bus_count)
                 .map(|_| {
                     (0..MAX_PLUGINS)
-                        .map(|_| (0..strip_count).map(|_| AtomicBool::new(true)).collect())
+                        .map(|_| std::array::from_fn(|_| SidechainSlot::new()))
                         .collect()
                 })
                 .collect(),
@@ -306,16 +311,26 @@ impl SharedParams {
         }
     }
 
-    /// Sidechain send gain for a plugin on `strip`/`chain`/`slot`, from
-    /// `source` (a strip id). `0.0` means no send.
-    pub fn sidechain_gain(&self, strip: usize, chain: usize, slot: usize, source: usize) -> f32 {
-        self.sidechain_gain
+    fn sidechain_slots(
+        &self,
+        strip: usize,
+        chain: usize,
+        slot: usize,
+    ) -> Option<&[SidechainSlot; MAX_SIDECHAIN_SOURCES]> {
+        self.sidechain
             .get(strip)
             .and_then(|chains| chains.get(chain))
             .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-            .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
-            .unwrap_or(0.0)
+    }
+
+    fn bus_sidechain_slots(
+        &self,
+        bus: usize,
+        slot: usize,
+    ) -> Option<&[SidechainSlot; MAX_SIDECHAIN_SOURCES]> {
+        self.bus_sidechain
+            .get(bus)
+            .and_then(|slots| slots.get(slot))
     }
 
     pub fn set_sidechain_gain(
@@ -326,35 +341,9 @@ impl SharedParams {
         source: usize,
         value: f32,
     ) {
-        if let Some(cell) = self
-            .sidechain_gain
-            .get(strip)
-            .and_then(|chains| chains.get(chain))
-            .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-        {
-            cell.store(value.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+        if let Some(slots) = self.sidechain_slots(strip, chain, slot) {
+            set_slot_gain(slots, source, value);
         }
-    }
-
-    /// Number of source strips a plugin's sidechain can draw from (for iteration).
-    pub fn sidechain_source_count(&self) -> usize {
-        self.sidechain_gain
-            .first()
-            .and_then(|chains| chains.first())
-            .and_then(|slots| slots.first())
-            .map(|sources| sources.len())
-            .unwrap_or(0)
-    }
-
-    pub fn sidechain_pre(&self, strip: usize, chain: usize, slot: usize, source: usize) -> bool {
-        self.sidechain_pre
-            .get(strip)
-            .and_then(|chains| chains.get(chain))
-            .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-            .map(|value| value.load(Ordering::Relaxed))
-            .unwrap_or(true)
     }
 
     pub fn set_sidechain_pre(
@@ -365,55 +354,57 @@ impl SharedParams {
         source: usize,
         value: bool,
     ) {
-        if let Some(cell) = self
-            .sidechain_pre
-            .get(strip)
-            .and_then(|chains| chains.get(chain))
-            .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-        {
-            cell.store(value, Ordering::Relaxed);
+        if let Some(slots) = self.sidechain_slots(strip, chain, slot) {
+            set_slot_pre(slots, source, value);
         }
     }
 
-    pub fn bus_sidechain_gain(&self, bus: usize, slot: usize, source: usize) -> f32 {
-        self.bus_sidechain_gain
-            .get(bus)
-            .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-            .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
-            .unwrap_or(0.0)
+    pub fn clear_sidechain(&self, strip: usize, chain: usize, slot: usize) {
+        if let Some(slots) = self.sidechain_slots(strip, chain, slot) {
+            for entry in slots {
+                entry.source.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    /// Calls `f(source_strip, gain, pre)` for each active sidechain send.
+    pub fn for_each_sidechain(
+        &self,
+        strip: usize,
+        chain: usize,
+        slot: usize,
+        f: impl FnMut(usize, f32, bool),
+    ) {
+        for_each_active(self.sidechain_slots(strip, chain, slot), f);
     }
 
     pub fn set_bus_sidechain_gain(&self, bus: usize, slot: usize, source: usize, value: f32) {
-        if let Some(cell) = self
-            .bus_sidechain_gain
-            .get(bus)
-            .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-        {
-            cell.store(value.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+        if let Some(slots) = self.bus_sidechain_slots(bus, slot) {
+            set_slot_gain(slots, source, value);
         }
-    }
-
-    pub fn bus_sidechain_pre(&self, bus: usize, slot: usize, source: usize) -> bool {
-        self.bus_sidechain_pre
-            .get(bus)
-            .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-            .map(|value| value.load(Ordering::Relaxed))
-            .unwrap_or(true)
     }
 
     pub fn set_bus_sidechain_pre(&self, bus: usize, slot: usize, source: usize, value: bool) {
-        if let Some(cell) = self
-            .bus_sidechain_pre
-            .get(bus)
-            .and_then(|slots| slots.get(slot))
-            .and_then(|sources| sources.get(source))
-        {
-            cell.store(value, Ordering::Relaxed);
+        if let Some(slots) = self.bus_sidechain_slots(bus, slot) {
+            set_slot_pre(slots, source, value);
         }
+    }
+
+    pub fn clear_bus_sidechain(&self, bus: usize, slot: usize) {
+        if let Some(slots) = self.bus_sidechain_slots(bus, slot) {
+            for entry in slots {
+                entry.source.store(0, Ordering::Relaxed);
+            }
+        }
+    }
+
+    pub fn for_each_bus_sidechain(
+        &self,
+        bus: usize,
+        slot: usize,
+        f: impl FnMut(usize, f32, bool),
+    ) {
+        for_each_active(self.bus_sidechain_slots(bus, slot), f);
     }
 
     pub fn bus_plugin_param(&self, bus: usize, slot: usize, param: usize) -> f32 {
@@ -721,6 +712,77 @@ fn fill(values: &[AtomicU32], out: &mut Vec<f32>) {
             .iter()
             .map(|value| f32::from_bits(value.load(Ordering::Relaxed))),
     );
+}
+
+fn set_slot_gain(slots: &[SidechainSlot; MAX_SIDECHAIN_SOURCES], source: usize, value: f32) {
+    let key = source as u32 + 1;
+    if let Some(entry) = slots
+        .iter()
+        .find(|entry| entry.source.load(Ordering::Relaxed) == key)
+    {
+        if value <= 1.0e-6 {
+            entry.source.store(0, Ordering::Relaxed);
+            entry.gain.store(0.0f32.to_bits(), Ordering::Relaxed);
+        } else {
+            entry
+                .gain
+                .store(value.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+        }
+        return;
+    }
+    if value <= 1.0e-6 {
+        return;
+    }
+    if let Some(entry) = slots
+        .iter()
+        .find(|entry| entry.source.load(Ordering::Relaxed) == 0)
+    {
+        entry
+            .gain
+            .store(value.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
+        entry.pre.store(true, Ordering::Relaxed);
+        entry.source.store(key, Ordering::Relaxed);
+    }
+}
+
+fn set_slot_pre(slots: &[SidechainSlot; MAX_SIDECHAIN_SOURCES], source: usize, value: bool) {
+    let key = source as u32 + 1;
+    if let Some(entry) = slots
+        .iter()
+        .find(|entry| entry.source.load(Ordering::Relaxed) == key)
+    {
+        entry.pre.store(value, Ordering::Relaxed);
+        return;
+    }
+    // Keep the flag on a not-yet-routed source so enabling the send later keeps it.
+    if let Some(entry) = slots
+        .iter()
+        .find(|entry| entry.source.load(Ordering::Relaxed) == 0)
+    {
+        entry.pre.store(value, Ordering::Relaxed);
+        entry.gain.store(0.0f32.to_bits(), Ordering::Relaxed);
+        entry.source.store(key, Ordering::Relaxed);
+    }
+}
+
+fn for_each_active(
+    slots: Option<&[SidechainSlot; MAX_SIDECHAIN_SOURCES]>,
+    mut f: impl FnMut(usize, f32, bool),
+) {
+    let Some(slots) = slots else {
+        return;
+    };
+    for entry in slots {
+        let source = entry.source.load(Ordering::Relaxed);
+        if source == 0 {
+            continue;
+        }
+        let gain = f32::from_bits(entry.gain.load(Ordering::Relaxed));
+        if gain <= 1.0e-6 {
+            continue;
+        }
+        f((source - 1) as usize, gain, entry.pre.load(Ordering::Relaxed));
+    }
 }
 
 fn store_pair(left_slots: &[AtomicU32], right_slots: &[AtomicU32], index: usize, left: f32, right: f32) {

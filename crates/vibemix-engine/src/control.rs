@@ -1400,7 +1400,7 @@ impl Controller {
                 }
             }
             ControlMessage::Clock { .. } => Actions::default(),
-            ControlMessage::Meters { .. } => Actions::default(),
+            ControlMessage::Meters(_) => Actions::default(),
         }
     }
 
@@ -1830,12 +1830,7 @@ impl Controller {
         };
 
         if let Some(chain) = strip_chain(location) {
-            for source in 0..self.params.sidechain_source_count() {
-                self.params
-                    .set_sidechain_gain(target as usize, chain, slot as usize, source, 0.0);
-                self.params
-                    .set_sidechain_pre(target as usize, chain, slot as usize, source, true);
-            }
+            self.params.clear_sidechain(target as usize, chain, slot as usize);
             if enabled {
                 for (source, gain, pre) in entries {
                     self.params
@@ -1845,12 +1840,7 @@ impl Controller {
                 }
             }
         } else {
-            for source in 0..self.params.sidechain_source_count() {
-                self.params
-                    .set_bus_sidechain_gain(target as usize, slot as usize, source, 0.0);
-                self.params
-                    .set_bus_sidechain_pre(target as usize, slot as usize, source, true);
-            }
+            self.params.clear_bus_sidechain(target as usize, slot as usize);
             if enabled {
                 for (source, gain, pre) in entries {
                     self.params
@@ -3505,10 +3495,7 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
         params.set_bus_send_gain(index, bus.send_gain.0);
         params.set_bus_return_gain(index, bus.return_gain.0);
         for (slot, plugin) in bus.plugins.iter().enumerate() {
-            for source in 0..params.sidechain_source_count() {
-                params.set_bus_sidechain_gain(index, slot, source, 0.0);
-                params.set_bus_sidechain_pre(index, slot, source, true);
-            }
+            params.clear_bus_sidechain(index, slot);
             if plugin.sidechain_enabled {
                 for entry in &plugin.sidechain {
                     let source = entry.strip.0 as usize;
@@ -3541,10 +3528,7 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
 
         for (chain, plugins) in [&strip.plugins, &strip.plugins_post].into_iter().enumerate() {
             for (slot, plugin) in plugins.iter().enumerate() {
-                for source in 0..params.sidechain_source_count() {
-                    params.set_sidechain_gain(index, chain, slot, source, 0.0);
-                    params.set_sidechain_pre(index, chain, slot, source, true);
-                }
+                params.clear_sidechain(index, chain, slot);
                 if plugin.sidechain_enabled {
                     for entry in &plugin.sidechain {
                         let source = entry.strip.0 as usize;

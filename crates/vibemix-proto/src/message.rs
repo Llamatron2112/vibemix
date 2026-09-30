@@ -3,9 +3,6 @@ use rosc::{OscMessage, OscPacket, OscType};
 use crate::address as addr;
 
 #[derive(Debug, Clone, PartialEq)]
-// `Meters` is the bulk streaming message and is intentionally much larger than
-// the other variants; the enum lives on the stack briefly per control message.
-#[allow(clippy::large_enum_variant)]
 pub enum ControlMessage {
     SetStripGain {
         strip: u32,
@@ -276,22 +273,28 @@ pub enum ControlMessage {
     MissingConnections {
         json: String,
     },
-    Meters {
-        strips_in_l: Vec<f32>,
-        strips_in_r: Vec<f32>,
-        strips_gain_l: Vec<f32>,
-        strips_gain_r: Vec<f32>,
-        strips_out_l: Vec<f32>,
-        strips_out_r: Vec<f32>,
-        buses_in_l: Vec<f32>,
-        buses_in_r: Vec<f32>,
-        buses_gain_l: Vec<f32>,
-        buses_gain_r: Vec<f32>,
-        buses_ret_l: Vec<f32>,
-        buses_ret_r: Vec<f32>,
-        buses_l: Vec<f32>,
-        buses_r: Vec<f32>,
-    },
+    /// Boxed: fourteen `Vec<f32>` make this the largest variant by far, and
+    /// boxing keeps `ControlMessage` itself small.
+    Meters(Box<MetersData>),
+}
+
+/// The fourteen meter taps carried by [`ControlMessage::Meters`].
+#[derive(Debug, Clone, PartialEq, Default)]
+pub struct MetersData {
+    pub strips_in_l: Vec<f32>,
+    pub strips_in_r: Vec<f32>,
+    pub strips_gain_l: Vec<f32>,
+    pub strips_gain_r: Vec<f32>,
+    pub strips_out_l: Vec<f32>,
+    pub strips_out_r: Vec<f32>,
+    pub buses_in_l: Vec<f32>,
+    pub buses_in_r: Vec<f32>,
+    pub buses_gain_l: Vec<f32>,
+    pub buses_gain_r: Vec<f32>,
+    pub buses_ret_l: Vec<f32>,
+    pub buses_ret_r: Vec<f32>,
+    pub buses_l: Vec<f32>,
+    pub buses_r: Vec<f32>,
 }
 
 impl ControlMessage {
@@ -799,47 +802,31 @@ impl ControlMessage {
                 addr: addr::CONNECTIONS_MISSING.to_string(),
                 args: vec![OscType::String(json.clone())],
             },
-            Meters {
-                strips_in_l,
-                strips_in_r,
-                strips_gain_l,
-                strips_gain_r,
-                strips_out_l,
-                strips_out_r,
-                buses_in_l,
-                buses_in_r,
-                buses_gain_l,
-                buses_gain_r,
-                buses_ret_l,
-                buses_ret_r,
-                buses_l,
-                buses_r,
-            } => {
-                let strip_count = strips_out_l.len();
-                let bus_count = buses_l.len();
-                let mut args =
-                    Vec::with_capacity(strip_count * 6 + bus_count * 8 + 2);
+            Meters(data) => {
+                let strip_count = data.strips_out_l.len();
+                let bus_count = data.buses_l.len();
+                let mut args = Vec::with_capacity(strip_count * 6 + bus_count * 8 + 2);
                 args.push(OscType::Int(strip_count as i32));
                 for run in [
-                    strips_in_l,
-                    strips_in_r,
-                    strips_gain_l,
-                    strips_gain_r,
-                    strips_out_l,
-                    strips_out_r,
+                    &data.strips_in_l,
+                    &data.strips_in_r,
+                    &data.strips_gain_l,
+                    &data.strips_gain_r,
+                    &data.strips_out_l,
+                    &data.strips_out_r,
                 ] {
                     args.extend(run.iter().map(|level| OscType::Float(*level)));
                 }
                 args.push(OscType::Int(bus_count as i32));
                 for run in [
-                    buses_in_l,
-                    buses_in_r,
-                    buses_gain_l,
-                    buses_gain_r,
-                    buses_ret_l,
-                    buses_ret_r,
-                    buses_l,
-                    buses_r,
+                    &data.buses_in_l,
+                    &data.buses_in_r,
+                    &data.buses_gain_l,
+                    &data.buses_gain_r,
+                    &data.buses_ret_l,
+                    &data.buses_ret_r,
+                    &data.buses_l,
+                    &data.buses_r,
                 ] {
                     args.extend(run.iter().map(|level| OscType::Float(*level)));
                 }
@@ -1147,7 +1134,7 @@ impl ControlMessage {
                 let buses_ret_r = float_run(args, bus_count_index + 1 + bus_count * 5, bus_count)?;
                 let buses_l = float_run(args, bus_count_index + 1 + bus_count * 6, bus_count)?;
                 let buses_r = float_run(args, bus_count_index + 1 + bus_count * 7, bus_count)?;
-                Some(ControlMessage::Meters {
+                Some(ControlMessage::Meters(Box::new(MetersData {
                     strips_in_l,
                     strips_in_r,
                     strips_gain_l,
@@ -1162,7 +1149,7 @@ impl ControlMessage {
                     buses_ret_r,
                     buses_l,
                     buses_r,
-                })
+                })))
             }
             _ => None,
         }
@@ -1284,15 +1271,10 @@ mod tests {
             ],
         );
         match ControlMessage::decode(&out) {
-            Some(ControlMessage::Meters {
-                strips_out_l,
-                buses_l,
-                buses_r,
-                ..
-            }) => {
-                assert_eq!(strips_out_l, strips[4]);
-                assert_eq!(buses_l, buses[6]);
-                assert_eq!(buses_r, buses[7]);
+            Some(ControlMessage::Meters(data)) => {
+                assert_eq!(data.strips_out_l, strips[4]);
+                assert_eq!(data.buses_l, buses[6]);
+                assert_eq!(data.buses_r, buses[7]);
             }
             other => panic!("unexpected decode: {other:?}"),
         }
@@ -1544,7 +1526,7 @@ mod tests {
 
     #[test]
     fn roundtrip_meters() {
-        roundtrip(ControlMessage::Meters {
+        roundtrip(ControlMessage::Meters(Box::new(MetersData {
             strips_in_l: vec![0.0, 0.5, 1.0],
             strips_in_r: vec![0.1, 0.6, 0.9],
             strips_gain_l: vec![0.2, 0.7, 1.1],
@@ -1559,7 +1541,7 @@ mod tests {
             buses_ret_r: vec![0.16, 0.27],
             buses_l: vec![0.25, 0.75],
             buses_r: vec![0.2, 0.7],
-        });
+        })));
     }
 
     #[test]

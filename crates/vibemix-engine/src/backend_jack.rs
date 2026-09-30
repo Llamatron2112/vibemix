@@ -2125,20 +2125,10 @@ fn feed_sidechain(
     mix[0][..frames].fill(0.0);
     mix[1][..frames].fill(0.0);
     let mut any = false;
-    for source in 0..params.sidechain_source_count() {
-        let gain = if is_bus {
-            params.bus_sidechain_gain(index, slot, source)
-        } else {
-            params.sidechain_gain(index, chain, slot, source)
-        };
-        if gain <= 1.0e-6 {
-            continue;
+    let mut gather = |source: usize, gain: f32, pre: bool| {
+        if source >= strip_pre.len() {
+            return;
         }
-        let pre = if is_bus {
-            params.bus_sidechain_pre(index, slot, source)
-        } else {
-            params.sidechain_pre(index, chain, slot, source)
-        };
         let tap = if delayed {
             if pre { &pre_snapshot[source] } else { &post_snapshot[source] }
         } else if pre {
@@ -2149,6 +2139,11 @@ fn feed_sidechain(
         dsp::add_scaled(&mut mix[0][..frames], &tap[0][..frames], gain);
         dsp::add_scaled(&mut mix[1][..frames], &tap[1][..frames], gain);
         any = true;
+    };
+    if is_bus {
+        params.for_each_bus_sidechain(index, slot, &mut gather);
+    } else {
+        params.for_each_sidechain(index, chain, slot, &mut gather);
     }
     let (left, right) = if any {
         (&mix[0], &mix[1])

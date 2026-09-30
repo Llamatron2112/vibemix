@@ -326,37 +326,22 @@ fn receive_loop(socket: UdpSocket) {
                         *guard = (locked, playing, bpm, beats, seconds, beats_per_bar);
                     }
                 }
-                Some(ControlMessage::Meters {
-                    strips_in_l,
-                    strips_in_r,
-                    strips_gain_l,
-                    strips_gain_r,
-                    strips_out_l,
-                    strips_out_r,
-                    buses_in_l,
-                    buses_in_r,
-                    buses_gain_l,
-                    buses_gain_r,
-                    buses_ret_l,
-                    buses_ret_r,
-                    buses_l,
-                    buses_r,
-                }) => {
+                Some(ControlMessage::Meters(data)) => {
                     let mut guard = view_lock();
-                    guard.strip_in_l = strips_in_l;
-                    guard.strip_in_r = strips_in_r;
-                    guard.strip_gain_l = strips_gain_l;
-                    guard.strip_gain_r = strips_gain_r;
-                    guard.strip_out_l = strips_out_l;
-                    guard.strip_out_r = strips_out_r;
-                    guard.bus_in_l = buses_in_l;
-                    guard.bus_in_r = buses_in_r;
-                    guard.bus_gain_l = buses_gain_l;
-                    guard.bus_gain_r = buses_gain_r;
-                    guard.bus_ret_l = buses_ret_l;
-                    guard.bus_ret_r = buses_ret_r;
-                    guard.bus_l = buses_l;
-                    guard.bus_r = buses_r;
+                    guard.strip_in_l = data.strips_in_l;
+                    guard.strip_in_r = data.strips_in_r;
+                    guard.strip_gain_l = data.strips_gain_l;
+                    guard.strip_gain_r = data.strips_gain_r;
+                    guard.strip_out_l = data.strips_out_l;
+                    guard.strip_out_r = data.strips_out_r;
+                    guard.bus_in_l = data.buses_in_l;
+                    guard.bus_in_r = data.buses_in_r;
+                    guard.bus_gain_l = data.buses_gain_l;
+                    guard.bus_gain_r = data.buses_gain_r;
+                    guard.bus_ret_l = data.buses_ret_l;
+                    guard.bus_ret_r = data.buses_ret_r;
+                    guard.bus_l = data.buses_l;
+                    guard.bus_r = data.buses_r;
                     guard.connected = true;
                     drop(guard);
                     METERS_REV.fetch_add(1, Ordering::Release);
