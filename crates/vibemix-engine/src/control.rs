@@ -3082,8 +3082,10 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
         .discover()
         .into_iter()
         .filter(|info| {
-            (info.audio_inputs.len() == 2 && info.audio_outputs.len() == 2)
-                || (info.audio_inputs.len() == 1 && info.audio_outputs.len() == 1)
+            // Main I/O must be mono or stereo; extra inputs are sidechain.
+            let main = info.main_input_count;
+            let outputs = info.audio_outputs.len();
+            (main == 2 && outputs == 2) || (main == 1 && outputs == 1)
         })
         .map(|info| {
             let unsupported = unsupported_required_feature(&info);
@@ -3093,7 +3095,7 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
                 name: info.name,
                 bundle: None,
                 has_ui: info.has_ui,
-                has_sidechain: false,
+                has_sidechain: info.audio_inputs.len() > info.main_input_count,
                 inputs: info.audio_inputs.len(),
                 outputs: info.audio_outputs.len(),
                 midi: !info.midi_inputs.is_empty(),

@@ -2369,7 +2369,8 @@ pub fn make_slot_plugin(
     max_block: usize,
     instance: PluginInstance,
 ) -> Option<SlotPlugin> {
-    match (instance.audio_input_count(), instance.audio_output_count()) {
+    // Extra audio inputs beyond the main pair are sidechain, not host shape.
+    match (instance.main_input_count(), instance.audio_output_count()) {
         (2, 2) => Some(SlotPlugin::Stereo(Box::new(instance) as Box<dyn PluginNode>)),
         (1, 1) => {
             let second = host.instantiate(uri, sample_rate, nominal_block, max_block)?;

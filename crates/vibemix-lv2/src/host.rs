@@ -64,6 +64,11 @@ const ATOM_BUFFER_BYTES: usize = 8192;
 /// size after writing, and atom-output plugins (e.g. meters.lv2) read it back
 /// as the buffer capacity on the next block.
 const OUTPUT_SEQUENCE_CAPACITY: u32 = (ATOM_BUFFER_BYTES - crate::atom::SEQUENCE_BODY) as u32;
+const CV_PORT: &str = "http://lv2plug.in/ns/lv2core#CVPort";
+const CONNECTION_OPTIONAL: &str = "http://lv2plug.in/ns/lv2core#connectionOptional";
+const PG_GROUP: &str = "http://lv2plug.in/ns/ext/port-groups#group";
+const PG_MAIN_INPUT: &str = "http://lv2plug.in/ns/ext/port-groups#mainInput";
+const PG_SIDE_CHAIN_OF: &str = "http://lv2plug.in/ns/ext/port-groups#sideChainOf";
 const LV2_TOGGLED: &str = "http://lv2plug.in/ns/lv2core#toggled";
 const LV2_INTEGER: &str = "http://lv2plug.in/ns/lv2core#integer";
 const LV2_PORT_PROPERTY: &str = "http://lv2plug.in/ns/lv2core#portProperty";
@@ -99,6 +104,10 @@ pub struct PluginInfo {
     pub name: String,
     pub audio_inputs: Vec<usize>,
     pub audio_outputs: Vec<usize>,
+    /// Of `audio_inputs`, how many are the main input(s); the rest are
+    /// sidechain inputs (mains are ordered first).
+    #[serde(default)]
+    pub main_input_count: usize,
     pub controls: Vec<ControlPort>,
     pub atom_inputs: Vec<usize>,
     pub atom_outputs: Vec<usize>,
@@ -258,12 +267,104 @@ impl Host {
                 classified.hostable = false;
             }
         }
+        self.split_main_sidechain(&mut classified, plugin);
+
         if let Some(uri) = plugin.uri().as_uri() {
             if is_blacklisted(uri) {
                 classified.hostable = false;
             }
         }
         classified
+    }
+
+    /// Orders `audio_inputs` as main channels first then sidechain channels and
+    /// records `main_input_count`. Detection is tiered, most specific first:
+    /// explicit `pg:sideChainOf`; else the `pg:mainInput` group (ungrouped
+    /// extras are sidechain, as with Calf); else "the first `outputs` inputs
+    /// are the main, ungrouped extras named/optional like a sidechain are
+    /// sidechain". Anything that cannot be classified confidently marks the
+    /// plugin unhostable rather than guessing (e.g. A/B testers, mixers).
+    fn split_main_sidechain(&self, classified: &mut Classified, plugin: &lilv::plugin::Plugin) {
+        if classified.audio_inputs.is_empty() {
+            return;
+        }
+        let cv_port = self.world.new_uri(CV_PORT);
+        let connection_optional = self.world.new_uri(CONNECTION_OPTIONAL);
+        let pg_group = self.world.new_uri(PG_GROUP);
+        let pg_main_input = self.world.new_uri(PG_MAIN_INPUT);
+        let pg_side_chain_of = self.world.new_uri(PG_SIDE_CHAIN_OF);
+
+        let main_groups: Vec<lilv::node::Node> = plugin.value(&pg_main_input).iter().collect();
+        let has_main_groups = !main_groups.is_empty();
+        let output_count = classified.audio_outputs.len();
+
+        // Per input: (index, explicit sidechain, in main group, grouped, hint).
+        let mut inputs: Vec<InputPort> = Vec::new();
+        for &index in &classified.audio_inputs {
+            let Some(port) = plugin.port_by_index(index) else {
+                continue;
+            };
+            if port.is_a(&cv_port) {
+                if !port.has_property(&connection_optional) {
+                    classified.hostable = false;
+                }
+                continue;
+            }
+            let groups: Vec<lilv::node::Node> = port.value(&pg_group).iter().collect();
+            let explicit = self
+                .world
+                .ask(Some(&port.node()), Some(&pg_side_chain_of), None)
+                || groups
+                    .iter()
+                    .any(|group| self.world.ask(Some(group), Some(&pg_side_chain_of), None));
+            let in_main = groups.iter().any(|group| main_groups.contains(group));
+            let hint = port_sidechain_hint(&port);
+            inputs.push(InputPort {
+                index,
+                explicit,
+                in_main,
+                grouped: !groups.is_empty(),
+                optional: port.has_property(&connection_optional),
+                hint,
+            });
+        }
+
+        let mut main = Vec::new();
+        let mut sidechain = Vec::new();
+        let mut ambiguous = false;
+        for (position, input) in inputs.iter().enumerate() {
+            if input.explicit {
+                sidechain.push(input.index);
+            } else if has_main_groups {
+                if input.in_main {
+                    main.push(input.index);
+                } else if !input.grouped {
+                    sidechain.push(input.index);
+                } else {
+                    ambiguous = true;
+                }
+            } else if !input.grouped {
+                if position < output_count {
+                    main.push(input.index);
+                } else if input.optional || input.hint {
+                    sidechain.push(input.index);
+                } else {
+                    ambiguous = true;
+                }
+            } else {
+                ambiguous = true;
+            }
+        }
+        if ambiguous {
+            // We cannot tell the main inputs from the extras: refuse rather
+            // than mislabel a non-sidechain input.
+            classified.hostable = false;
+            classified.main_input_count = 0;
+            return;
+        }
+        classified.main_input_count = main.len();
+        main.extend(sidechain);
+        classified.audio_inputs = main;
     }
 
     pub fn discover(&self) -> Vec<PluginInfo> {
@@ -280,6 +381,7 @@ impl Host {
                 name: plugin.name().as_str().unwrap_or_default().to_string(),
                 audio_inputs: classified.audio_inputs,
                 audio_outputs: classified.audio_outputs,
+                main_input_count: classified.main_input_count,
                 controls: classified.controls,
                 atom_inputs: classified.atom_inputs,
                 atom_outputs: classified.atom_outputs,
@@ -561,6 +663,7 @@ impl Host {
             active,
             audio_inputs,
             audio_outputs,
+            main_input_count: classified.main_input_count,
             controls,
             control_outputs,
             atom_inputs,
@@ -585,6 +688,7 @@ impl Host {
 struct Classified {
     audio_inputs: Vec<usize>,
     audio_outputs: Vec<usize>,
+    main_input_count: usize,
     controls: Vec<ControlPort>,
     control_outputs: Vec<usize>,
     atom_inputs: Vec<usize>,
@@ -609,6 +713,25 @@ impl Default for Host {
     fn default() -> Self {
         Self::new()
     }
+}
+
+/// Per-audio-input classification inputs used by [`Host::split_main_sidechain`].
+struct InputPort {
+    index: usize,
+    explicit: bool,
+    in_main: bool,
+    grouped: bool,
+    optional: bool,
+    hint: bool,
+}
+
+/// Whether a port's name or symbol suggests it is a sidechain input.
+fn port_sidechain_hint(port: &lilv::port::Port) -> bool {
+    [port.name(), port.symbol()].into_iter().flatten().any(|node| {
+        node.as_str()
+            .map(|text| text.to_ascii_lowercase().contains("sidechain"))
+            .unwrap_or(false)
+    })
 }
 
 fn port_name(port: &lilv::port::Port, index: usize) -> String {
@@ -664,6 +787,7 @@ pub struct PluginInstance {
     active: ActiveInstance,
     audio_inputs: Vec<usize>,
     audio_outputs: Vec<usize>,
+    main_input_count: usize,
     controls: Vec<ControlPort>,
     control_outputs: Vec<usize>,
     atom_inputs: Vec<usize>,
@@ -705,6 +829,41 @@ impl PluginInstance {
 
     pub fn audio_output_count(&self) -> usize {
         self.audio_outputs.len()
+    }
+
+    /// Number of main audio inputs (1 or 2); extra inputs are sidechain.
+    pub fn main_input_count(&self) -> usize {
+        self.main_input_count
+    }
+
+    pub fn has_sidechain(&self) -> bool {
+        self.audio_inputs.len() > self.main_input_count
+    }
+
+    /// Summed sidechain signal written into the (one or two) sidechain input
+    /// buffers, downmixing for a mono sidechain.
+    pub fn write_sidechain(&mut self, left: &[f32], right: &[f32]) {
+        let offset = self.main_input_count;
+        let channels = self.audio_inputs.len().saturating_sub(offset);
+        let frames = left.len().min(right.len());
+        match channels {
+            0 => {}
+            1 => {
+                let buffer = &mut self.input_buffers[offset];
+                let frames = frames.min(buffer.len());
+                for index in 0..frames {
+                    buffer[index] = 0.5 * (left[index] + right[index]);
+                }
+            }
+            _ => {
+                let (first, rest) = self.input_buffers.split_at_mut(offset + 1);
+                let left_buffer = &mut first[offset];
+                let right_buffer = &mut rest[0];
+                let frames = frames.min(left_buffer.len()).min(right_buffer.len());
+                left_buffer[..frames].copy_from_slice(&left[..frames]);
+                right_buffer[..frames].copy_from_slice(&right[..frames]);
+            }
+        }
     }
 
     pub fn input_buffer_mut(&mut self, channel: usize) -> &mut [f32] {

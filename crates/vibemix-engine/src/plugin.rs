@@ -81,6 +81,14 @@ impl PluginNode for vibemix_lv2::PluginInstance {
     fn load_state(&mut self, state: &str) {
         self.load_state(state)
     }
+
+    fn has_sidechain(&self) -> bool {
+        vibemix_lv2::PluginInstance::has_sidechain(self)
+    }
+
+    fn write_sidechain(&mut self, left: &[f32], right: &[f32]) {
+        vibemix_lv2::PluginInstance::write_sidechain(self, left, right);
+    }
 }
 
 impl PluginNode for vibemix_vst3::PluginInstance {

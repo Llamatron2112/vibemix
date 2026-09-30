@@ -147,8 +147,9 @@ fn sweepable(entry: &PluginEntry) -> bool {
         return false;
     }
     match entry.format {
+        // `inputs` counts sidechain inputs too; require at least the main pair.
         PluginFormat::Lv2 => {
-            (entry.inputs == 2 && entry.outputs == 2) || (entry.inputs == 1 && entry.outputs == 1)
+            (entry.outputs == 2 && entry.inputs >= 2) || (entry.outputs == 1 && entry.inputs >= 1)
         }
         PluginFormat::Vst3 => true,
     }

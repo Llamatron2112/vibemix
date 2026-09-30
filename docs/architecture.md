@@ -285,12 +285,18 @@ wired to the strip/bus signal, extra input buses (e.g. a sidechain) are fed
 silence, and extra output buses get throwaway scratch, so a plugin's bus
 topology is preserved even though vibemix only routes the main bus.
 
-**Sidechain routing.** A plugin that reports an aux input can have its
-sidechain **enabled** from its context menu (off by default — some plugins
-expose a sidechain they never use). Once enabled it becomes a **send
-destination**, shown (under a short `sc` label) on every strip like a bus send:
-each strip has a row with its own gain and pre/post tap (default pre-fader), and
-several strips can feed one sidechain at different levels. The sources are stored on the plugin
+**Sidechain routing.** Both formats expose sidechains: VST3 via aux input
+buses, LV2 via extra audio input ports. LV2 sidechain ports are found by tiered
+detection — explicit `pg:sideChainOf`, else the `pg:mainInput` group (ungrouped
+extras are sidechain, as in Calf), else the first `outputs` inputs are main and
+ungrouped extras that are optional or named like a sidechain are sidechain;
+plugins whose main/extras cannot be told apart (A/B testers, mixers) are
+refused. A plugin that has a sidechain can have it **enabled** from its context
+menu (off by default — some plugins expose a sidechain they never use). Once
+enabled it becomes a **send destination**, shown (under a short `sc` label) on
+every strip like a bus send: each strip has a row with its own gain and pre/post
+tap (default pre-fader), and several strips can feed one sidechain at different
+levels. The sources are stored on the plugin
 (`PluginSlot.sidechain: Vec<SidechainSource>`, keyed by stable strip id, so they
 travel with the plugin), and summed into its first non-CV aux input instead of
 silence. The plugin's own strip row is shown but disabled (keeps strips
