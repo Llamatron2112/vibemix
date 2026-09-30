@@ -482,6 +482,7 @@ fn build_plugins(
     location: u64,
     target: u64,
     params_values: &mut serde_json::Map<String, serde_json::Value>,
+    sidechain_values: &mut serde_json::Map<String, serde_json::Value>,
 ) -> Vec<serde_json::Value> {
     let mut structure = Vec::new();
     let Some(plugins) = plugins else {
@@ -494,6 +495,23 @@ fn build_plugins(
             .unwrap_or(0);
         let mut controls_structure = Vec::new();
         let mut controls_values = Vec::new();
+        let mut sidechain = serde_json::Map::new();
+        if let Some(sources) = plugin.get("sidechain").and_then(serde_json::Value::as_array) {
+            for source in sources {
+                if let Some(strip) = source.get("strip").and_then(serde_json::Value::as_u64) {
+                    sidechain.insert(
+                        strip.to_string(),
+                        serde_json::json!({
+                            "gain": source.get("gain").cloned().unwrap_or(serde_json::json!(0.0)),
+                            "pre_fader": source
+                                .get("pre_fader")
+                                .cloned()
+                                .unwrap_or(serde_json::json!(true)),
+                        }),
+                    );
+                }
+            }
+        }
 
         if let Some(controls) = plugin.get("controls").and_then(serde_json::Value::as_array) {
             for control in controls {
@@ -517,14 +535,12 @@ fn build_plugins(
             "bypassed": plugin.get("bypassed").cloned().unwrap_or(serde_json::json!(false)),
             "has_ui": plugin.get("has_ui").cloned().unwrap_or(serde_json::json!(false)),
             "has_sidechain": plugin.get("has_sidechain").cloned().unwrap_or(serde_json::json!(false)),
-            "sidechain_bus": plugin.get("sidechain_bus").cloned().unwrap_or(serde_json::Value::Null),
             "midi_channel": plugin.get("midi_channel").cloned().unwrap_or(serde_json::Value::Null),
             "controls": controls_structure,
         }));
-        params_values.insert(
-            format!("{location}-{target}-{slot}"),
-            serde_json::Value::Array(controls_values),
-        );
+        let key = format!("{location}-{target}-{slot}");
+        params_values.insert(key.clone(), serde_json::Value::Array(controls_values));
+        sidechain_values.insert(key, serde_json::Value::Object(sidechain));
     }
     structure
 }
@@ -535,6 +551,7 @@ fn split_state(json: &str) -> (String, String) {
     let mut strips_structure = Vec::new();
     let mut strips_values = serde_json::Map::new();
     let mut params_values = serde_json::Map::new();
+    let mut sidechain_values = serde_json::Map::new();
 
     if let Some(strips) = value.get("strips").and_then(serde_json::Value::as_array) {
         for strip in strips {
@@ -547,12 +564,14 @@ fn split_state(json: &str) -> (String, String) {
                 0,
                 id,
                 &mut params_values,
+                &mut sidechain_values,
             );
             let plugins_post_structure = build_plugins(
                 strip.get("plugins_post").and_then(serde_json::Value::as_array),
                 1,
                 id,
                 &mut params_values,
+                &mut sidechain_values,
             );
             // Send levels change continuously, so keep them in `values` (which
             // does not reset the strip/bus repeaters) rather than in the
@@ -620,6 +639,7 @@ fn split_state(json: &str) -> (String, String) {
                 2,
                 id,
                 &mut params_values,
+                &mut sidechain_values,
             );
             buses_structure.push(serde_json::json!({
                 "id": id,
@@ -654,6 +674,7 @@ fn split_state(json: &str) -> (String, String) {
         "strips": strips_values,
         "buses": buses_values,
         "params": params_values,
+        "sidechain": sidechain_values,
     })
     .to_string();
     (structure, values)
@@ -828,8 +849,12 @@ pub mod qobject {
         fn update_plugin_bypass(&self, location: i32, target: i32, slot: i32, bypassed: bool);
 
         #[qinvokable]
-        #[cxx_name = "setPluginSidechain"]
-        fn update_plugin_sidechain(&self, location: i32, target: i32, slot: i32, bus: i32);
+        #[cxx_name = "setSidechainSend"]
+        fn update_plugin_sidechain(&self, location: i32, target: i32, slot: i32, strip: i32, gain: f32);
+
+        #[qinvokable]
+        #[cxx_name = "setSidechainPreFader"]
+        fn update_plugin_sidechain_pre(&self, location: i32, target: i32, slot: i32, strip: i32, pre: bool);
 
         #[qinvokable]
         #[cxx_name = "openPluginUi"]
@@ -1374,13 +1399,39 @@ impl qobject::Backend {
         });
     }
 
-    pub fn update_plugin_sidechain(&self, location: i32, target: i32, slot: i32, bus: i32) {
-        note_action("plugin sidechain");
+    pub fn update_plugin_sidechain(
+        &self,
+        location: i32,
+        target: i32,
+        slot: i32,
+        strip: i32,
+        gain: f32,
+    ) {
+        note_action("sidechain send");
         send(ControlMessage::SetPluginSidechain {
             location: location as u32,
             target: target as u32,
             slot: slot as u32,
-            bus,
+            strip,
+            gain,
+        });
+    }
+
+    pub fn update_plugin_sidechain_pre(
+        &self,
+        location: i32,
+        target: i32,
+        slot: i32,
+        strip: i32,
+        pre: bool,
+    ) {
+        note_action("sidechain pre-fader");
+        send(ControlMessage::SetPluginSidechainPre {
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+            strip: strip as u32,
+            pre,
         });
     }
 

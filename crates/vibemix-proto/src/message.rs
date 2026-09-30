@@ -129,8 +129,16 @@ pub enum ControlMessage {
         location: u32,
         target: u32,
         slot: u32,
-        /// Source bus, or `-1` to clear.
-        bus: i32,
+        /// Source strip, or `-1` to clear.
+        strip: i32,
+        gain: f32,
+    },
+    SetPluginSidechainPre {
+        location: u32,
+        target: u32,
+        slot: u32,
+        strip: u32,
+        pre: bool,
     },
     OpenPluginUi {
         location: u32,
@@ -493,14 +501,32 @@ impl ControlMessage {
                 location,
                 target,
                 slot,
-                bus,
+                strip,
+                gain,
             } => OscMessage {
-                addr: addr::PLUGIN_SIDECHAIN.to_string(),
+                addr: addr::PLUGIN_SIDECHAIN_SEND.to_string(),
                 args: vec![
                     OscType::Int(*location as i32),
                     OscType::Int(*target as i32),
                     OscType::Int(*slot as i32),
-                    OscType::Int(*bus),
+                    OscType::Int(*strip),
+                    OscType::Float(*gain),
+                ],
+            },
+            SetPluginSidechainPre {
+                location,
+                target,
+                slot,
+                strip,
+                pre,
+            } => OscMessage {
+                addr: addr::PLUGIN_SIDECHAIN_PRE.to_string(),
+                args: vec![
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*strip as i32),
+                    OscType::Int(*pre as i32),
                 ],
             },
             OpenPluginUi {
@@ -944,11 +970,19 @@ impl ControlMessage {
                 slot: int(args, 2)? as u32,
                 bypassed: int(args, 3)? != 0,
             }),
-            addr::PLUGIN_SIDECHAIN => Some(ControlMessage::SetPluginSidechain {
+            addr::PLUGIN_SIDECHAIN_SEND => Some(ControlMessage::SetPluginSidechain {
                 location: int(args, 0)? as u32,
                 target: int(args, 1)? as u32,
                 slot: int(args, 2)? as u32,
-                bus: int(args, 3)?,
+                strip: int(args, 3)?,
+                gain: float(args, 4)?,
+            }),
+            addr::PLUGIN_SIDECHAIN_PRE => Some(ControlMessage::SetPluginSidechainPre {
+                location: int(args, 0)? as u32,
+                target: int(args, 1)? as u32,
+                slot: int(args, 2)? as u32,
+                strip: int(args, 3)? as u32,
+                pre: int(args, 4)? != 0,
             }),
             addr::PLUGIN_UI => Some(ControlMessage::OpenPluginUi {
                 location: int(args, 0)? as u32,
@@ -1289,13 +1323,22 @@ mod tests {
             location: 0,
             target: 1,
             slot: 0,
-            bus: 3,
+            strip: 3,
+            gain: 0.5,
         });
         roundtrip(ControlMessage::SetPluginSidechain {
             location: 0,
             target: 1,
             slot: 0,
-            bus: -1,
+            strip: -1,
+            gain: 0.0,
+        });
+        roundtrip(ControlMessage::SetPluginSidechainPre {
+            location: 2,
+            target: 1,
+            slot: 0,
+            strip: 3,
+            pre: true,
         });
         roundtrip(ControlMessage::OpenPluginUi {
             location: 1,

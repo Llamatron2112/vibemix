@@ -9,8 +9,8 @@ use std::time::{Duration, Instant};
 use vibemix_core::config::config_dir;
 use vibemix_core::ids::{BusId, StripId};
 use vibemix_core::model::{
-    Bus, MidiBinding, MidiTarget, MixerModel, PluginSlot, Send, Strip, WindowGeometry,
-    MAX_SEND_DELAY_MS,
+    Bus, MidiBinding, MidiTarget, MixerModel, PluginSlot, Send, SidechainSource, Strip,
+    WindowGeometry, MAX_SEND_DELAY_MS,
 };
 use crate::midi_map::target_from_code;
 use vibemix_core::model::PluginFormat;
@@ -793,7 +793,6 @@ impl Controller {
                 self.params.set_bus_active(bus as usize, false);
                 self.params.set_bus_return(bus as usize, false);
                 self.model.buses.retain(|entry| entry.id.0 != bus);
-                self.clear_sidechain_for_bus(bus);
                 self.engine.clear_bus_plugins(bus as usize).ok();
                 if let Err(error) = self.engine.remove_bus_ports(bus as usize) {
                     tracing::warn!(%error, bus, "failed to unregister bus ports");
@@ -928,37 +927,85 @@ impl Controller {
                 location,
                 target,
                 slot,
-                bus,
+                strip,
+                gain,
             } => {
-                // Bus 0 (master) is not a valid sidechain source.
-                let source = usize::try_from(bus)
-                    .ok()
-                    .filter(|value| *value > 0 && *value < self.model.buses.len())
-                    .map(|value| BusId(value as u32));
-                if let Some(chain) = strip_chain(location) {
-                    self.params.set_plugin_sidechain(
-                        target as usize,
-                        chain,
-                        slot as usize,
-                        source.map(|value| value.0 as usize),
-                    );
-                    if let Some(strip) = self.model.strip_mut(StripId(target)) {
-                        if let Some(plugin) =
-                            strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
+                let gain = gain.clamp(0.0, 4.0);
+                if let Ok(source) = usize::try_from(strip) {
+                    if source < self.model.strips.len() {
+                        let strip_id = StripId(source as u32);
+                        if let Some(chain) = strip_chain(location) {
+                            if let Some(plugin) = self
+                                .model
+                                .strip_mut(StripId(target))
+                                .and_then(|strip| {
+                                    strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
+                                })
+                            {
+                                set_sidechain_source(&mut plugin.sidechain, strip_id, gain);
+                            }
+                            self.params.set_sidechain_gain(
+                                target as usize,
+                                chain,
+                                slot as usize,
+                                source,
+                                gain,
+                            );
+                        } else if let Some(plugin) = self
+                            .model
+                            .bus_mut(BusId(target))
+                            .and_then(|bus| bus.plugins.get_mut(slot as usize))
                         {
-                            plugin.sidechain_bus = source;
+                            set_sidechain_source(&mut plugin.sidechain, strip_id, gain);
+                            self.params.set_bus_sidechain_gain(
+                                target as usize,
+                                slot as usize,
+                                source,
+                                gain,
+                            );
                         }
                     }
-                } else {
-                    self.params.set_bus_plugin_sidechain(
-                        target as usize,
-                        slot as usize,
-                        source.map(|value| value.0 as usize),
-                    );
-                    if let Some(bus) = self.model.bus_mut(BusId(target)) {
-                        if let Some(plugin) = bus.plugins.get_mut(slot as usize) {
-                            plugin.sidechain_bus = source;
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetPluginSidechainPre {
+                location,
+                target,
+                slot,
+                strip,
+                pre,
+            } => {
+                let source = strip as usize;
+                if source < self.model.strips.len() {
+                    let strip_id = StripId(strip);
+                    if let Some(chain) = strip_chain(location) {
+                        if let Some(plugin) = self
+                            .model
+                            .strip_mut(StripId(target))
+                            .and_then(|strip| {
+                                strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
+                            })
+                        {
+                            set_sidechain_pre(&mut plugin.sidechain, strip_id, pre);
                         }
+                        self.params.set_sidechain_pre(
+                            target as usize,
+                            chain,
+                            slot as usize,
+                            source,
+                            pre,
+                        );
+                    } else if let Some(plugin) = self
+                        .model
+                        .bus_mut(BusId(target))
+                        .and_then(|bus| bus.plugins.get_mut(slot as usize))
+                    {
+                        set_sidechain_pre(&mut plugin.sidechain, strip_id, pre);
+                        self.params
+                            .set_bus_sidechain_pre(target as usize, slot as usize, source, pre);
                     }
                 }
                 Actions {
@@ -1536,31 +1583,6 @@ impl Controller {
         }
         self.vst3_ui_safe.insert(class_id.to_string(), safe);
         safe
-    }
-
-    /// Clears any plugin sidechain that referenced the removed bus.
-    fn clear_sidechain_for_bus(&mut self, removed: u32) {
-        let target = Some(BusId(removed));
-        for strip in &mut self.model.strips {
-            let strip_id = strip.id.0 as usize;
-            for chain in 0..PLUGIN_CHAINS {
-                for (slot, plugin) in strip_plugin_list_mut(strip, chain).iter_mut().enumerate() {
-                    if plugin.sidechain_bus == target {
-                        plugin.sidechain_bus = None;
-                        self.params.set_plugin_sidechain(strip_id, chain, slot, None);
-                    }
-                }
-            }
-        }
-        for bus in &mut self.model.buses {
-            let bus_id = bus.id.0 as usize;
-            for (slot, plugin) in bus.plugins.iter_mut().enumerate() {
-                if plugin.sidechain_bus == target {
-                    plugin.sidechain_bus = None;
-                    self.params.set_bus_plugin_sidechain(bus_id, slot, None);
-                }
-            }
-        }
     }
 
     fn open_ui(&mut self, location: u32, target: u32, slot: u32) {
@@ -2799,9 +2821,15 @@ fn structure_eq(a: &MixerModel, b: &MixerModel) -> bool {
 
 fn plugin_lists_eq(a: &[PluginSlot], b: &[PluginSlot]) -> bool {
     a.len() == b.len()
-        && a.iter()
-            .zip(b)
-            .all(|(x, y)| x.uri == y.uri && x.state == y.state && x.sidechain_bus == y.sidechain_bus)
+        && a.iter().zip(b).all(|(x, y)| {
+            x.uri == y.uri && x.state == y.state && sidechain_strips(x) == sidechain_strips(y)
+        })
+}
+
+fn sidechain_strips(plugin: &PluginSlot) -> Vec<u32> {
+    let mut strips: Vec<u32> = plugin.sidechain.iter().map(|source| source.strip.0).collect();
+    strips.sort_unstable();
+    strips
 }
 
 fn sends_eq(a: &[Send], b: &[Send]) -> bool {
@@ -3119,6 +3147,17 @@ fn plugin_list_json<F: Fn(usize, usize) -> f32>(
                     })
                 })
                 .collect();
+            let sidechain: Vec<serde_json::Value> = plugin
+                .sidechain
+                .iter()
+                .map(|source| {
+                    serde_json::json!({
+                        "strip": source.strip.0,
+                        "gain": source.gain.0,
+                        "pre_fader": source.pre_fader,
+                    })
+                })
+                .collect();
             serde_json::json!({
                 "slot": slot,
                 "uri": plugin.uri,
@@ -3127,7 +3166,7 @@ fn plugin_list_json<F: Fn(usize, usize) -> f32>(
                 "missing": plugin.missing,
                 "has_ui": has_ui,
                 "has_sidechain": has_sidechain,
-                "sidechain_bus": plugin.sidechain_bus.map(|bus| bus.0),
+                "sidechain": sidechain,
                 "midi_channel": plugin.midi_channel,
                 "controls": control_list,
             })
@@ -3231,49 +3270,44 @@ fn free_bus_slot(params: &SharedParams) -> Option<usize> {
     (0..params.bus_count()).find(|index| !params.bus_active(*index))
 }
 
-/// Strip processing order that places sidechain contributors before the strips
-/// that consume their bus, so the bus's summed sends are complete when a
-/// consumer plugin runs (`strip_count` is the mixing capacity). Consumers left
-/// in a dependency cycle are flagged to read the previous block's bus sum.
+/// Strip processing order that places sidechain source strips before the
+/// strips whose plugins consume them, so the source tap is complete in the
+/// same block (`strip_count` is the mixing capacity). Consumers left in a
+/// dependency cycle are flagged to read the previous block's tap.
 fn compute_strip_order(model: &MixerModel, strip_count: usize) -> (Vec<usize>, Vec<Vec<Vec<bool>>>) {
     let mut delayed = vec![vec![vec![false; MAX_PLUGINS]; PLUGIN_CHAINS]; strip_count];
-    let bus_count = model.buses.len();
-    let mut contributors: Vec<HashSet<usize>> = vec![HashSet::new(); bus_count];
-    let mut consumers: Vec<Vec<(usize, usize, usize)>> = vec![Vec::new(); bus_count];
-
+    // Consumers: (consumer strip, chain, slot, source strips).
+    let mut consumers: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
+    let mut edges: HashSet<(usize, usize)> = HashSet::new();
     for strip in &model.strips {
         let sid = strip.id.0 as usize;
         if sid >= strip_count {
             continue;
         }
-        for send in &strip.sends {
-            let bus = send.bus.0 as usize;
-            if bus < bus_count {
-                contributors[bus].insert(sid);
-            }
-        }
         for (plugins, chain) in [(&strip.plugins, 0usize), (&strip.plugins_post, 1usize)] {
             for (slot, plugin) in plugins.iter().enumerate() {
-                if let Some(bus) = plugin.sidechain_bus {
-                    let bus = bus.0 as usize;
-                    if bus < bus_count && slot < MAX_PLUGINS {
-                        consumers[bus].push((sid, chain, slot));
+                if plugin.sidechain.is_empty() || slot >= MAX_PLUGINS {
+                    continue;
+                }
+                let sources: Vec<usize> = plugin
+                    .sidechain
+                    .iter()
+                    .map(|source| source.strip.0 as usize)
+                    .filter(|source| *source < strip_count)
+                    .collect();
+                if sources.is_empty() {
+                    continue;
+                }
+                for &source in &sources {
+                    if source != sid {
+                        edges.insert((source, sid));
                     }
                 }
+                consumers.push((sid, chain, slot, sources));
             }
         }
     }
 
-    let mut edges: HashSet<(usize, usize)> = HashSet::new();
-    for bus in 0..bus_count {
-        for &source in &contributors[bus] {
-            for &(destination, _, _) in &consumers[bus] {
-                if source != destination {
-                    edges.insert((source, destination));
-                }
-            }
-        }
-    }
     let mut adjacency: Vec<Vec<usize>> = vec![Vec::new(); strip_count];
     let mut indegree = vec![0usize; strip_count];
     for &(source, destination) in &edges {
@@ -3313,17 +3347,9 @@ fn compute_strip_order(model: &MixerModel, strip_count: usize) -> (Vec<usize>, V
             position[sid] = pos;
         }
     }
-    for bus in 0..bus_count {
-        for &(destination, chain, slot) in &consumers[bus] {
-            if destination >= strip_count {
-                continue;
-            }
-            let needs_delay = contributors[bus]
-                .iter()
-                .any(|&source| position[source] >= position[destination]);
-            if needs_delay {
-                delayed[destination][chain][slot] = true;
-            }
+    for (sid, chain, slot, sources) in &consumers {
+        if sources.iter().any(|&source| position[source] >= position[*sid]) {
+            delayed[*sid][*chain][*slot] = true;
         }
     }
     (order, delayed)
@@ -3353,7 +3379,15 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
         params.set_bus_send_gain(index, bus.send_gain.0);
         params.set_bus_return_gain(index, bus.return_gain.0);
         for (slot, plugin) in bus.plugins.iter().enumerate() {
-            params.set_bus_plugin_sidechain(index, slot, plugin.sidechain_bus.map(|b| b.0 as usize));
+            for source in 0..params.sidechain_source_count() {
+                params.set_bus_sidechain_gain(index, slot, source, 0.0);
+                params.set_bus_sidechain_pre(index, slot, source, true);
+            }
+            for entry in &plugin.sidechain {
+                let source = entry.strip.0 as usize;
+                params.set_bus_sidechain_gain(index, slot, source, entry.gain.0);
+                params.set_bus_sidechain_pre(index, slot, source, entry.pre_fader);
+            }
         }
     }
 
@@ -3379,24 +3413,40 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
 
         for (chain, plugins) in [&strip.plugins, &strip.plugins_post].into_iter().enumerate() {
             for (slot, plugin) in plugins.iter().enumerate() {
-                params.set_plugin_sidechain(
-                    index,
-                    chain,
-                    slot,
-                    plugin.sidechain_bus.map(|b| b.0 as usize),
-                );
+                for source in 0..params.sidechain_source_count() {
+                    params.set_sidechain_gain(index, chain, slot, source, 0.0);
+                    params.set_sidechain_pre(index, chain, slot, source, true);
+                }
+                for entry in &plugin.sidechain {
+                    let source = entry.strip.0 as usize;
+                    params.set_sidechain_gain(index, chain, slot, source, entry.gain.0);
+                    params.set_sidechain_pre(index, chain, slot, source, entry.pre_fader);
+                }
             }
         }
     }
 }
 
-/// Clears a plugin's sidechain if it points at the master or a missing bus.
-fn clear_invalid_sidechain(plugin: &mut PluginSlot, bus_count: usize) {
-    if let Some(bus) = plugin.sidechain_bus {
-        let id = bus.0 as usize;
-        if id == 0 || id >= bus_count {
-            plugin.sidechain_bus = None;
-        }
+/// Sets a plugin's sidechain send gain for `strip`, creating the entry if
+/// needed (kept at gain 0 so its pre/post choice survives).
+fn set_sidechain_source(list: &mut Vec<SidechainSource>, strip: StripId, gain: f32) {
+    if let Some(entry) = list.iter_mut().find(|entry| entry.strip == strip) {
+        entry.gain = Gain(gain);
+    } else {
+        let mut entry = SidechainSource::new(strip);
+        entry.gain = Gain(gain);
+        list.push(entry);
+    }
+}
+
+fn set_sidechain_pre(list: &mut Vec<SidechainSource>, strip: StripId, pre: bool) {
+    if let Some(entry) = list.iter_mut().find(|entry| entry.strip == strip) {
+        entry.pre_fader = pre;
+    } else {
+        let mut entry = SidechainSource::new(strip);
+        entry.gain = Gain(0.0);
+        entry.pre_fader = pre;
+        list.push(entry);
     }
 }
 
@@ -3408,13 +3458,13 @@ pub fn clamp_to_capacity(model: &mut MixerModel, strips: usize, buses: usize) {
         strip.plugins.truncate(MAX_PLUGINS);
         strip.plugins_post.truncate(MAX_PLUGINS);
         for plugin in strip.plugins.iter_mut().chain(strip.plugins_post.iter_mut()) {
-            clear_invalid_sidechain(plugin, buses);
+            plugin.sidechain.retain(|source| (source.strip.0 as usize) < strips);
         }
     }
     for bus in &mut model.buses {
         bus.plugins.truncate(MAX_PLUGINS);
         for plugin in bus.plugins.iter_mut() {
-            clear_invalid_sidechain(plugin, buses);
+            plugin.sidechain.retain(|source| (source.strip.0 as usize) < strips);
         }
         if bus.id.0 == 0 {
             bus.return_inputs = false;
@@ -3454,25 +3504,19 @@ fn load_session(path: &str) -> Result<MixerModel, String> {
 #[cfg(test)]
 mod sidechain_order_tests {
     use super::*;
-    use vibemix_core::ids::{BusId, PluginId, StripId};
-    use vibemix_core::model::{Bus, PluginSlot, Send, Strip};
+    use vibemix_core::ids::{PluginId, StripId};
+    use vibemix_core::model::{PluginSlot, Strip};
 
     fn model_with_sidechain(self_cycle: bool) -> MixerModel {
         let mut model = MixerModel::default_minimal();
-        model.buses.push(Bus::new(BusId(1), "sc"));
-        let mut strip_b = Strip::new(StripId(1), "b");
-        // Strip 1 feeds the sidechain bus.
-        strip_b.sends.push(Send::new(BusId(1)));
-        model.strips.push(strip_b);
+        model.strips.push(Strip::new(StripId(1), "b"));
 
-        // Strip 0's plugin consumes the sidechain bus.
+        // Strip 0's plugin takes its sidechain from strip 1.
         let mut plugin = PluginSlot::new(PluginId(0), "x");
-        plugin.sidechain_bus = Some(BusId(1));
+        plugin
+            .sidechain
+            .push(SidechainSource::new(if self_cycle { StripId(0) } else { StripId(1) }));
         model.strips[0].plugins.push(plugin);
-        if self_cycle {
-            // Strip 0 also feeds the bus -> its own send isn't available yet.
-            model.strips[0].sends.push(Send::new(BusId(1)));
-        }
         model
     }
 
@@ -3480,7 +3524,7 @@ mod sidechain_order_tests {
     fn contributors_run_before_consumers() {
         let model = model_with_sidechain(false);
         let (order, delayed) = compute_strip_order(&model, 2);
-        assert_eq!(order, vec![1, 0], "contributor strip 1 must precede consumer strip 0");
+        assert_eq!(order, vec![1, 0], "source strip 1 must precede consumer strip 0");
         assert!(delayed.iter().all(|c| c.iter().all(|s| s.iter().all(|d| !d))));
     }
 

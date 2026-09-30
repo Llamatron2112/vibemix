@@ -274,17 +274,23 @@ struct MixerGraph {
     sample_rate: f32,
     strip_scratch: [Vec<f32>; 2],
     /// Per-strip pre-fader tap (after the pre-fader insert chain, before the
-    /// fader/pan), used by pre-fader sends.
+    /// fader/pan), used by pre-fader sends and sidechains.
     strip_pre_fader: Vec<[Vec<f32>; 2]>,
+    /// Per-strip post-fader tap (after the post-fader insert chain), used by
+    /// post-fader sends and sidechains.
+    strip_post_fader: Vec<[Vec<f32>; 2]>,
+    /// Previous block's strip taps, for delayed (cyclic) sidechain feeds.
+    strip_pre_snapshot: Vec<[Vec<f32>; 2]>,
+    strip_post_snapshot: Vec<[Vec<f32>; 2]>,
     send_scratch: [Vec<f32>; 2],
+    /// Summed sidechain signal fed to a plugin this block.
+    sidechain_mix: [Vec<f32>; 2],
     /// Silence fed to a plugin's sidechain input when nothing is routed.
     sidechain_silence: [Vec<f32>; 2],
     /// Order strips are processed in (sidechain contributors before consumers).
     strip_order: Vec<usize>,
-    /// Per-slot cycle flags: delayed slots read last block's bus sum.
+    /// Per-slot cycle flags: delayed slots read last block's strip tap.
     strip_delayed: Vec<Vec<Vec<bool>>>,
-    /// Last block's bus sums, for delayed (cyclic) sidechain feeds.
-    sidechain_snapshot: Vec<[Vec<f32>; 2]>,
     garbage_order: Producer<RetiredOrder>,
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
@@ -493,10 +499,17 @@ impl MixerGraph {
                     }
                     feed_sidechain(
                         &mut **instance,
-                        self.params.plugin_sidechain(index, chain, slot),
+                        false,
+                        index,
+                        chain,
+                        slot,
                         self.strip_delayed[index][chain][slot],
-                        &self.bus_accum,
-                        &self.sidechain_snapshot,
+                        &self.params,
+                        &self.strip_pre_fader,
+                        &self.strip_post_fader,
+                        &self.strip_pre_snapshot,
+                        &self.strip_post_snapshot,
+                        &mut self.sidechain_mix,
                         &self.sidechain_silence,
                         frames,
                     );
@@ -518,10 +531,17 @@ impl MixerGraph {
                         }
                         feed_sidechain(
                             &mut **instance,
-                            self.params.plugin_sidechain(index, chain, slot),
+                            false,
+                            index,
+                            chain,
+                            slot,
                             self.strip_delayed[index][chain][slot],
-                            &self.bus_accum,
-                            &self.sidechain_snapshot,
+                            &self.params,
+                            &self.strip_pre_fader,
+                            &self.strip_post_fader,
+                            &self.strip_pre_snapshot,
+                            &self.strip_post_snapshot,
+                            &mut self.sidechain_mix,
                             &self.sidechain_silence,
                             frames,
                         );
@@ -572,10 +592,17 @@ impl MixerGraph {
                     }
                     feed_sidechain(
                         &mut **instance,
-                        self.params.bus_plugin_sidechain(bus, slot),
+                        true,
+                        bus,
+                        0,
+                        slot,
                         false,
-                        &self.bus_accum,
-                        &self.sidechain_snapshot,
+                        &self.params,
+                        &self.strip_pre_fader,
+                        &self.strip_post_fader,
+                        &self.strip_pre_snapshot,
+                        &self.strip_post_snapshot,
+                        &mut self.sidechain_mix,
                         &self.sidechain_silence,
                         frames,
                     );
@@ -597,10 +624,17 @@ impl MixerGraph {
                         }
                         feed_sidechain(
                             &mut **instance,
-                            self.params.bus_plugin_sidechain(bus, slot),
+                            true,
+                            bus,
+                            0,
+                            slot,
                             false,
-                            &self.bus_accum,
-                            &self.sidechain_snapshot,
+                            &self.params,
+                            &self.strip_pre_fader,
+                            &self.strip_post_fader,
+                            &self.strip_pre_snapshot,
+                            &self.strip_post_snapshot,
+                            &mut self.sidechain_mix,
                             &self.sidechain_silence,
                             frames,
                         );
@@ -695,6 +729,12 @@ impl MixerGraph {
                 self.run_plugins(index, 1, frames);
             }
 
+            // Post-fader tap (the same point a post-fader send uses).
+            self.strip_post_fader[index][0][..frames]
+                .copy_from_slice(&self.strip_scratch[0][..frames]);
+            self.strip_post_fader[index][1][..frames]
+                .copy_from_slice(&self.strip_scratch[1][..frames]);
+
             let strip_peak_l = dsp::peak(&self.strip_scratch[0][..frames]);
             let strip_peak_r = dsp::peak(&self.strip_scratch[1][..frames]);
             self.meters.store_strip_out(index, strip_peak_l, strip_peak_r);
@@ -748,13 +788,17 @@ impl MixerGraph {
             }
         }
 
-        // Snapshot the bus sums for delayed (cyclic) sidechain feeds next block.
-        for bus in 0..bus_count.min(self.sidechain_snapshot.len()) {
-            let len = frames.min(self.sidechain_snapshot[bus][0].len());
-            self.sidechain_snapshot[bus][0][..len]
-                .copy_from_slice(&self.bus_accum[bus][0][..len]);
-            self.sidechain_snapshot[bus][1][..len]
-                .copy_from_slice(&self.bus_accum[bus][1][..len]);
+        // Snapshot the strip taps for delayed (cyclic) sidechain feeds next block.
+        for strip in 0..strip_count.min(self.strip_pre_snapshot.len()) {
+            let len = frames.min(self.strip_pre_snapshot[strip][0].len());
+            self.strip_pre_snapshot[strip][0][..len]
+                .copy_from_slice(&self.strip_pre_fader[strip][0][..len]);
+            self.strip_pre_snapshot[strip][1][..len]
+                .copy_from_slice(&self.strip_pre_fader[strip][1][..len]);
+            self.strip_post_snapshot[strip][0][..len]
+                .copy_from_slice(&self.strip_post_fader[strip][0][..len]);
+            self.strip_post_snapshot[strip][1][..len]
+                .copy_from_slice(&self.strip_post_fader[strip][1][..len]);
         }
     }
 
@@ -1161,7 +1205,17 @@ impl JackEngine {
             strip_pre_fader: (0..strip_count)
                 .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
                 .collect(),
+            strip_post_fader: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            strip_pre_snapshot: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            strip_post_snapshot: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
             send_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            sidechain_mix: [vec![0.0; capacity], vec![0.0; capacity]],
             sidechain_silence: [vec![0.0; capacity], vec![0.0; capacity]],
             strip_order: (0..strip_count).collect(),
             strip_delayed: (0..strip_count)
@@ -1170,9 +1224,6 @@ impl JackEngine {
                         .map(|_| (0..MAX_PLUGINS).map(|_| false).collect())
                         .collect()
                 })
-                .collect(),
-            sidechain_snapshot: (0..bus_count)
-                .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
                 .collect(),
             garbage_order: garbage_order_producer,
             bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
@@ -2038,25 +2089,60 @@ fn set_bus_controls(
     }
 }
 
-/// Feeds a plugin's sidechain input from the given source bus (or silence).
-/// Delayed (cyclic) slots read the previous block's bus sum.
+/// Sums a plugin's per-strip sidechain sends into `mix` and feeds the plugin's
+/// sidechain input. Delayed (cyclic) slots read the previous block's taps.
 #[allow(clippy::too_many_arguments)]
 fn feed_sidechain(
     instance: &mut dyn PluginNode,
-    source: Option<usize>,
+    is_bus: bool,
+    index: usize,
+    chain: usize,
+    slot: usize,
     delayed: bool,
-    bus_accum: &[[Vec<f32>; 2]],
-    snapshot: &[[Vec<f32>; 2]],
+    params: &SharedParams,
+    strip_pre: &[[Vec<f32>; 2]],
+    strip_post: &[[Vec<f32>; 2]],
+    pre_snapshot: &[[Vec<f32>; 2]],
+    post_snapshot: &[[Vec<f32>; 2]],
+    mix: &mut [Vec<f32>; 2],
     silence: &[Vec<f32>; 2],
     frames: usize,
 ) {
     if !instance.has_sidechain() {
         return;
     }
-    let accum = if delayed { snapshot } else { bus_accum };
-    let (left, right) = match source {
-        Some(bus) if bus < accum.len() => (&accum[bus][0], &accum[bus][1]),
-        _ => (&silence[0], &silence[1]),
+    mix[0][..frames].fill(0.0);
+    mix[1][..frames].fill(0.0);
+    let mut any = false;
+    for source in 0..params.sidechain_source_count() {
+        let gain = if is_bus {
+            params.bus_sidechain_gain(index, slot, source)
+        } else {
+            params.sidechain_gain(index, chain, slot, source)
+        };
+        if gain <= 1.0e-6 {
+            continue;
+        }
+        let pre = if is_bus {
+            params.bus_sidechain_pre(index, slot, source)
+        } else {
+            params.sidechain_pre(index, chain, slot, source)
+        };
+        let tap = if delayed {
+            if pre { &pre_snapshot[source] } else { &post_snapshot[source] }
+        } else if pre {
+            &strip_pre[source]
+        } else {
+            &strip_post[source]
+        };
+        dsp::add_scaled(&mut mix[0][..frames], &tap[0][..frames], gain);
+        dsp::add_scaled(&mut mix[1][..frames], &tap[1][..frames], gain);
+        any = true;
+    }
+    let (left, right) = if any {
+        (&mix[0], &mix[1])
+    } else {
+        (&silence[0], &silence[1])
     };
     instance.write_sidechain(&left[..frames], &right[..frames]);
 }

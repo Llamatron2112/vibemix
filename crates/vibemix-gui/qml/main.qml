@@ -216,6 +216,49 @@ ApplicationWindow {
         if (!entry || !entry.send_pre) return false
         return entry.send_pre[busId] === true
     }
+    // Every sidechain-capable plugin, as a send destination on each strip.
+    function sidechainDestinations() {
+        var out = []
+        function addAll(list, location, target, hostName, hostStripId) {
+            if (!list) return
+            for (var i = 0; i < list.length; i++) {
+                var p = list[i]
+                if (p.has_sidechain === true) {
+                    out.push({
+                        location: location,
+                        target: target,
+                        slot: p.slot,
+                        name: p.name,
+                        hostName: hostName,
+                        hostStripId: hostStripId
+                    })
+                }
+            }
+        }
+        for (var s = 0; s < mix.strips.length; s++) {
+            var strip = mix.strips[s]
+            addAll(strip.plugins, 0, strip.id, strip.name, strip.id)
+            addAll(strip.plugins_post, 1, strip.id, strip.name, strip.id)
+        }
+        for (var b = 0; b < mix.buses.length; b++) {
+            var bus = mix.buses[b]
+            addAll(bus.plugins, 2, bus.id, bus.name, -1)
+        }
+        return out
+    }
+    function sidechainEntry(location, target, slot, stripId) {
+        if (!values.sidechain) return undefined
+        var map = values.sidechain[location + "-" + target + "-" + slot]
+        return map ? map[stripId] : undefined
+    }
+    function sidechainGain(location, target, slot, stripId) {
+        var entry = root.sidechainEntry(location, target, slot, stripId)
+        return entry && entry.gain !== undefined ? entry.gain : 0
+    }
+    function sidechainPreFader(location, target, slot, stripId) {
+        var entry = root.sidechainEntry(location, target, slot, stripId)
+        return entry ? entry.pre_fader !== false : true
+    }
     function pluginFailed(entry) {
         return entry.status === "failed" || entry.status === "unsupported"
     }
@@ -1338,36 +1381,6 @@ ApplicationWindow {
                                 pluginListRoot.target,
                                 pluginRow.pluginData.slot,
                                 !pluginRow.pluginData.bypassed)
-                        }
-                        Menu {
-                            title: "Sidechain input"
-                            enabled: pluginRow.pluginData.has_sidechain === true
-                            visible: pluginRow.pluginData.has_sidechain === true
-                            MenuItem {
-                                text: "None"
-                                checkable: true
-                                checked: pluginRow.pluginData.sidechain_bus === null
-                                    || pluginRow.pluginData.sidechain_bus === undefined
-                                onTriggered: backend.setPluginSidechain(
-                                    pluginListRoot.location,
-                                    pluginListRoot.target,
-                                    pluginRow.pluginData.slot,
-                                    -1)
-                            }
-                            Repeater {
-                                model: mix.buses
-                                MenuItem {
-                                    visible: modelData.id !== 0
-                                    text: modelData.name
-                                    checkable: true
-                                    checked: pluginRow.pluginData.sidechain_bus === modelData.id
-                                    onTriggered: backend.setPluginSidechain(
-                                        pluginListRoot.location,
-                                        pluginListRoot.target,
-                                        pluginRow.pluginData.slot,
-                                        modelData.id)
-                                }
-                            }
                         }
                         MenuSeparator { }
                         MenuItem {
@@ -3515,6 +3528,69 @@ ApplicationWindow {
                                                 stripCard.stripData.id,
                                                 sendRow.busData.id,
                                                 pre)
+                                        }
+                                    }
+                                }
+
+                                Column {
+                                    visible: root.sidechainDestinations().length > 0
+                                    Layout.preferredWidth: root.stripBody
+                                    spacing: 1
+
+                                    Label {
+                                        text: "sidechain"
+                                        color: root.mutedText
+                                        font.pixelSize: 8
+                                    }
+
+                                    Repeater {
+                                        model: root.sidechainDestinations()
+
+                                        delegate: Column {
+                                            id: sidechainRow
+                                            property var dest: modelData
+                                            readonly property bool selfHost:
+                                                sidechainRow.dest.hostStripId === stripCard.stripData.id
+                                            width: parent.width
+                                            spacing: 1
+
+                                            Label {
+                                                width: parent.width
+                                                text: "→ " + sidechainRow.dest.name
+                                                    + " (" + sidechainRow.dest.hostName + ")"
+                                                elide: Text.ElideRight
+                                                color: sidechainRow.selfHost
+                                                    ? root.mutedText : root.textColor
+                                                font.pixelSize: 8
+                                            }
+
+                                            SendSlider {
+                                                width: parent.width
+                                                enabled: !sidechainRow.selfHost
+                                                value: root.sidechainGain(
+                                                    sidechainRow.dest.location,
+                                                    sidechainRow.dest.target,
+                                                    sidechainRow.dest.slot,
+                                                    stripCard.stripData.id)
+                                                preFader: root.sidechainPreFader(
+                                                    sidechainRow.dest.location,
+                                                    sidechainRow.dest.target,
+                                                    sidechainRow.dest.slot,
+                                                    stripCard.stripData.id)
+                                                formatValue: root.gainText
+                                                onMoved: (v) => backend.setSidechainSend(
+                                                    sidechainRow.dest.location,
+                                                    sidechainRow.dest.target,
+                                                    sidechainRow.dest.slot,
+                                                    stripCard.stripData.id,
+                                                    v)
+                                                onPreFaderToggled: (pre) => backend.setSidechainPreFader(
+                                                    sidechainRow.dest.location,
+                                                    sidechainRow.dest.target,
+                                                    sidechainRow.dest.slot,
+                                                    stripCard.stripData.id,
+                                                    pre)
+                                            }
                                         }
                                     }
                                 }

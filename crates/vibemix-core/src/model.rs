@@ -46,14 +46,39 @@ pub struct PluginSlot {
     /// `None` means any channel (omni).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub midi_channel: Option<u8>,
-    /// Bus whose summed strip sends feed this plugin's sidechain input. The
-    /// master (bus 0) is not a valid source. `None` = no sidechain.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub sidechain_bus: Option<BusId>,
+    /// Strips whose signals feed this plugin's sidechain input (VST3 aux
+    /// input). Each entry behaves like a send: per-strip gain and pre/post
+    /// tap. Empty = silence.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub sidechain: Vec<SidechainSource>,
+}
+
+/// One strip feeding a plugin's sidechain, with its own level and tap.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SidechainSource {
+    pub strip: StripId,
+    #[serde(default = "default_gain")]
+    pub gain: Gain,
+    #[serde(default)]
+    pub pre_fader: bool,
+}
+
+impl SidechainSource {
+    pub fn new(strip: StripId) -> Self {
+        Self {
+            strip,
+            gain: Gain::UNITY,
+            pre_fader: true,
+        }
+    }
 }
 
 fn is_false(value: &bool) -> bool {
     !*value
+}
+
+fn default_gain() -> Gain {
+    Gain::UNITY
 }
 
 impl PluginSlot {
@@ -69,7 +94,7 @@ impl PluginSlot {
             bypassed: false,
             missing: false,
             midi_channel: None,
-            sidechain_bus: None,
+            sidechain: Vec::new(),
         }
     }
 }
