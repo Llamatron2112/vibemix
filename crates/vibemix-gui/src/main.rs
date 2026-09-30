@@ -31,7 +31,10 @@ fn main() {
         .ok()
         .and_then(|value| value.parse().ok())
         .unwrap_or(9000);
-    backend::init(port);
+    if let Err(error) = backend::init(port) {
+        eprintln!("vibemix-gui: {error}");
+        std::process::exit(1);
+    }
 
     let mut app = QGuiApplication::new();
     let mut engine = QQmlApplicationEngine::new();

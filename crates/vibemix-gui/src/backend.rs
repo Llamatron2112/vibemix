@@ -161,17 +161,22 @@ fn note_recent(path: &str) {
     save_recent();
 }
 
-pub fn init(engine_port: u16) {
-    let socket = UdpSocket::bind("127.0.0.1:0").expect("bind osc client");
+pub fn init(engine_port: u16) -> Result<(), String> {
+    let socket = UdpSocket::bind("127.0.0.1:0")
+        .map_err(|error| format!("could not open the control socket: {error}"))?;
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
-        .expect("set read timeout");
+        .map_err(|error| format!("could not set the socket timeout: {error}"))?;
 
     let address = format!("127.0.0.1:{engine_port}");
-    let engine_address: SocketAddr = address.parse().expect("parse engine address");
+    let engine_address: SocketAddr = address
+        .parse()
+        .map_err(|error| format!("invalid engine address {address}: {error}"))?;
     let _ = ENGINE_ADDR.set(engine_address);
 
-    let receiver = socket.try_clone().expect("clone socket");
+    let receiver = socket
+        .try_clone()
+        .map_err(|error| format!("could not clone the control socket: {error}"))?;
     let _ = SOCKET.set(socket);
 
     load_recent();
@@ -183,6 +188,7 @@ pub fn init(engine_port: u16) {
     }
     std::thread::spawn(move || receive_loop(receiver));
     send(ControlMessage::QueryState);
+    Ok(())
 }
 
 fn send(message: ControlMessage) {
@@ -199,8 +205,11 @@ fn receive_loop(socket: UdpSocket) {
         if let Ok((length, _)) = socket.recv_from(&mut buffer) {
             match ControlMessage::decode(&buffer[..length]) {
                 Some(ControlMessage::State { json }) => {
-                    let (structure, values) = split_state(&json);
-                    let (strip_ids, bus_ids) = extract_ids(&json);
+                    // Parse the snapshot once and feed every consumer from it.
+                    let value: serde_json::Value =
+                        serde_json::from_str(&json).unwrap_or(serde_json::Value::Null);
+                    let (structure, values) = split_state(&value);
+                    let (strip_ids, bus_ids) = extract_ids(&value);
                     let combined = format!("{structure}\n{values}");
                     let mut guard = view_lock();
                     guard.strip_ids = strip_ids;
@@ -226,7 +235,7 @@ fn receive_loop(socket: UdpSocket) {
                         }
                     }
 
-                    if let Some(window) = window_from_state(&json) {
+                    if let Some(window) = window_from_state(&value) {
                         let changed = LAST_WINDOW
                             .lock()
                             .map(|last| *last != Some(window))
@@ -241,10 +250,10 @@ fn receive_loop(socket: UdpSocket) {
                         }
                     }
 
-                    if let Some(rate) = sample_rate_from_state(&json) {
+                    if let Some(rate) = sample_rate_from_state(&value) {
                         SAMPLE_RATE.store(rate, Ordering::SeqCst);
                     }
-                    if let Some(xruns) = xruns_from_state(&json) {
+                    if let Some(xruns) = xruns_from_state(&value) {
                         XRUNS.store(xruns, Ordering::SeqCst);
                     }
                 }
@@ -430,10 +439,7 @@ fn is_connected() -> bool {
     view_lock().connected
 }
 
-fn extract_ids(json: &str) -> (Vec<u32>, Vec<u32>) {    let Ok(value) = serde_json::from_str::<serde_json::Value>(json) else {
-        return (Vec::new(), Vec::new());
-    };
-
+fn extract_ids(value: &serde_json::Value) -> (Vec<u32>, Vec<u32>) {
     let collect = |key: &str| -> Vec<u32> {
         value
             .get(key)
@@ -451,8 +457,7 @@ fn extract_ids(json: &str) -> (Vec<u32>, Vec<u32>) {    let Ok(value) = serde_js
     (collect("strips"), collect("buses"))
 }
 
-fn window_from_state(json: &str) -> Option<(i32, i32, bool)> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+fn window_from_state(value: &serde_json::Value) -> Option<(i32, i32, bool)> {
     let window = value.get("window")?;
     if window.is_null() {
         return None;
@@ -469,8 +474,7 @@ fn window_from_state(json: &str) -> Option<(i32, i32, bool)> {
     Some((width, height, maximized))
 }
 
-fn sample_rate_from_state(json: &str) -> Option<u32> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+fn sample_rate_from_state(value: &serde_json::Value) -> Option<u32> {
     let rate = value.get("sample_rate")?.as_u64()?;
     if rate == 0 {
         return None;
@@ -478,8 +482,7 @@ fn sample_rate_from_state(json: &str) -> Option<u32> {
     Some(rate as u32)
 }
 
-fn xruns_from_state(json: &str) -> Option<u32> {
-    let value: serde_json::Value = serde_json::from_str(json).ok()?;
+fn xruns_from_state(value: &serde_json::Value) -> Option<u32> {
     let xruns = value.get("xruns")?.as_u64()?;
     Some(xruns.min(u32::MAX as u64) as u32)
 }
@@ -553,9 +556,7 @@ fn build_plugins(
     structure
 }
 
-fn split_state(json: &str) -> (String, String) {
-    let value: serde_json::Value = serde_json::from_str(json).unwrap_or(serde_json::Value::Null);
-
+fn split_state(value: &serde_json::Value) -> (String, String) {
     let mut strips_structure = Vec::new();
     let mut strips_values = serde_json::Map::new();
     let mut params_values = serde_json::Map::new();
@@ -1676,14 +1677,15 @@ mod tests {
     #[test]
     fn extracts_ids_from_snapshot() {
         let json = r#"{"strips":[{"id":0,"name":"ch 1","plugins":[]},{"id":2}],"buses":[{"id":0}]}"#;
-        let (strips, buses) = extract_ids(json);
+        let value: serde_json::Value = serde_json::from_str(json).expect("parse");
+        let (strips, buses) = extract_ids(&value);
         assert_eq!(strips, vec![0, 2]);
         assert_eq!(buses, vec![0]);
     }
 
     #[test]
-    fn bad_json_yields_empty_ids() {
-        let (strips, buses) = extract_ids("not json");
+    fn null_snapshot_yields_empty_ids() {
+        let (strips, buses) = extract_ids(&serde_json::Value::Null);
         assert!(strips.is_empty());
         assert!(buses.is_empty());
     }
