@@ -3543,14 +3543,6 @@ ApplicationWindow {
                                     }
                                 }
 
-                                Label {
-                                    width: parent.width
-                                    visible: root.sidechainDestinations().length > 0
-                                    text: "sc"
-                                    color: root.mutedText
-                                    font.pixelSize: 8
-                                }
-
                                 Repeater {
                                     model: root.sidechainDestinations()
 
@@ -3562,14 +3554,31 @@ ApplicationWindow {
                                         width: parent.width
                                         spacing: 1
 
-                                        Label {
+                                        RowLayout {
                                             width: parent.width
-                                            text: "→ " + sidechainRow.dest.name
-                                                + " (" + sidechainRow.dest.hostName + ")"
-                                            elide: Text.ElideRight
-                                            color: sidechainRow.selfHost
-                                                ? root.mutedText : root.textColor
-                                            font.pixelSize: 8
+                                            spacing: 2
+
+                                            Label {
+                                                text: "sc"
+                                                color: root.mutedText
+                                                font.pixelSize: 8
+                                            }
+
+                                            Label {
+                                                id: sidechainLabel
+                                                Layout.fillWidth: true
+                                                text: sidechainRow.dest.name
+                                                    + " (" + sidechainRow.dest.hostName + ")"
+                                                elide: Text.ElideRight
+                                                color: sidechainRow.selfHost
+                                                    ? root.mutedText : root.textColor
+                                                font.pixelSize: 8
+
+                                                HoverHandler { id: sidechainHover }
+                                                ToolTip.visible: sidechainHover.hovered
+                                                ToolTip.text: sidechainLabel.text
+                                                ToolTip.delay: 350
+                                            }
                                         }
 
                                         SendSlider {
