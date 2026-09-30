@@ -22,7 +22,9 @@ use crate::backend_jack::{instantiate_slot, JackEngine};
 use crate::catalog::{ControlInfo, PluginEntry};
 use crate::dsp;
 use crate::health::{HealthStore, Scan, ScanEvent, Status};
-use crate::params::{SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS};
+use crate::params::{
+    MeterLevels, SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
+};
 
 const PLUGIN_LOC_STRIP_PRE: u32 = 0;
 const PLUGIN_LOC_STRIP_POST: u32 = 1;
@@ -121,6 +123,9 @@ pub struct Controller {
     /// Hash of the sidechain routing; the topological strip order is only
     /// recomputed when this changes.
     last_routing_signature: u64,
+    /// Reused meter snapshot and OSC packet buffers (no per-frame allocation).
+    meter_levels: MeterLevels,
+    meter_bytes: Vec<u8>,
 }
 
 /// An open plugin editor: an LV2 toolkit UI or a VST3 `IPlugView`.
@@ -315,6 +320,8 @@ impl Controller {
             pending_learn: None,
             last_param_echo: Instant::now() - PARAM_ECHO_INTERVAL,
             last_routing_signature: 0,
+            meter_levels: MeterLevels::default(),
+            meter_bytes: Vec::new(),
         };
         controller.ensure_model_vst3_controls();
         save_catalog(&controller.plugins);
@@ -466,26 +473,31 @@ impl Controller {
                 self.send_edit_state(address);
             }
 
-            let levels = self.meters.levels();
-            let message = ControlMessage::Meters {
-                strips_in_l: levels.strips_in_l,
-                strips_in_r: levels.strips_in_r,
-                strips_gain_l: levels.strips_gain_l,
-                strips_gain_r: levels.strips_gain_r,
-                strips_out_l: levels.strips_out_l,
-                strips_out_r: levels.strips_out_r,
-                buses_in_l: levels.buses_in_l,
-                buses_in_r: levels.buses_in_r,
-                buses_gain_l: levels.buses_gain_l,
-                buses_gain_r: levels.buses_gain_r,
-                buses_ret_l: levels.buses_ret_l,
-                buses_ret_r: levels.buses_ret_r,
-                buses_l: levels.buses_l,
-                buses_r: levels.buses_r,
-            };
-            if let Ok(bytes) = message.encode() {
-                let _ = self.socket.send_to(&bytes, address);
-            }
+            // Encode meters straight into a reused packet buffer (no per-frame
+            // `MeterLevels`/`ControlMessage` allocations).
+            self.meters.levels_into(&mut self.meter_levels);
+            vibemix_proto::encode_meters(
+                &mut self.meter_bytes,
+                [
+                    &self.meter_levels.strips_in_l,
+                    &self.meter_levels.strips_in_r,
+                    &self.meter_levels.strips_gain_l,
+                    &self.meter_levels.strips_gain_r,
+                    &self.meter_levels.strips_out_l,
+                    &self.meter_levels.strips_out_r,
+                ],
+                [
+                    &self.meter_levels.buses_in_l,
+                    &self.meter_levels.buses_in_r,
+                    &self.meter_levels.buses_gain_l,
+                    &self.meter_levels.buses_gain_r,
+                    &self.meter_levels.buses_ret_l,
+                    &self.meter_levels.buses_ret_r,
+                    &self.meter_levels.buses_l,
+                    &self.meter_levels.buses_r,
+                ],
+            );
+            let _ = self.socket.send_to(&self.meter_bytes, address);
 
             let clock = self
                 .engine
@@ -1745,6 +1757,12 @@ impl Controller {
 
     /// Mirrors a host-driven parameter change into the plugin's native UI, so
     /// the UI's own controls follow edits made in the vibemix editor.
+    /// Mirrors a host-driven parameter change into the plugin's open editor.
+    ///
+    /// Runs on the control/UI thread, never the audio thread. For VST3 this
+    /// calls `IEditController::setParamNormalized`, which the spec sanctions
+    /// from the UI thread (the processor is driven separately by the parameter
+    /// queue in `set_controls`); plugins are required to make that reentrant.
     fn reflect_param_to_ui(&self, location: u32, target: u32, slot: u32, param: u32, value: f32) {
         let Some(ui) = self.uis.get(&(location, target, slot)) else {
             return;

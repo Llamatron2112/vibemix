@@ -1213,6 +1213,47 @@ fn string(args: &[OscType], index: usize) -> Option<String> {
     }
 }
 
+/// Writes the standard OSC framing for a `/vibemix/meters` packet into `out`
+/// (cleared first): six strip taps then eight bus taps. This bypasses the
+/// `ControlMessage::Meters` value, avoiding a per-frame allocation of fourteen
+/// `Vec<f32>` plus the typetag list on the engine's control loop.
+pub fn encode_meters(out: &mut Vec<u8>, strips: [&[f32]; 6], buses: [&[f32]; 8]) {
+    out.clear();
+    push_osc_string(out, addr::METERS);
+    let strip_count = strips[0].len();
+    let bus_count = buses[0].len();
+    let mut tags = String::with_capacity(3 + strip_count * 6 + bus_count * 8);
+    tags.push_str(",i");
+    for _ in 0..strip_count * 6 {
+        tags.push('f');
+    }
+    tags.push('i');
+    for _ in 0..bus_count * 8 {
+        tags.push('f');
+    }
+    push_osc_string(out, &tags);
+    out.extend_from_slice(&(strip_count as i32).to_be_bytes());
+    for run in strips {
+        for value in run {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+    out.extend_from_slice(&(bus_count as i32).to_be_bytes());
+    for run in buses {
+        for value in run {
+            out.extend_from_slice(&value.to_be_bytes());
+        }
+    }
+}
+
+fn push_osc_string(out: &mut Vec<u8>, text: &str) {
+    out.extend_from_slice(text.as_bytes());
+    out.push(0);
+    while out.len() % 4 != 0 {
+        out.push(0);
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1221,6 +1262,40 @@ mod tests {
         let bytes = message.encode().expect("encode");
         let decoded = ControlMessage::decode(&bytes).expect("decode");
         assert_eq!(message, decoded);
+    }
+
+    #[test]
+    fn encode_meters_matches_decode() {
+        let strips: Vec<Vec<f32>> = (0..6)
+            .map(|run| (0..3).map(|i| (run * 10 + i) as f32).collect())
+            .collect();
+        let buses: Vec<Vec<f32>> = (0..8)
+            .map(|run| (0..3).map(|i| (run * 10 + i) as f32 + 0.5).collect())
+            .collect();
+        let mut out = Vec::new();
+        encode_meters(
+            &mut out,
+            [
+                &strips[0], &strips[1], &strips[2], &strips[3], &strips[4], &strips[5],
+            ],
+            [
+                &buses[0], &buses[1], &buses[2], &buses[3], &buses[4], &buses[5], &buses[6],
+                &buses[7],
+            ],
+        );
+        match ControlMessage::decode(&out) {
+            Some(ControlMessage::Meters {
+                strips_out_l,
+                buses_l,
+                buses_r,
+                ..
+            }) => {
+                assert_eq!(strips_out_l, strips[4]);
+                assert_eq!(buses_l, buses[6]);
+                assert_eq!(buses_r, buses[7]);
+            }
+            other => panic!("unexpected decode: {other:?}"),
+        }
     }
 
     #[test]

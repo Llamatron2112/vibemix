@@ -787,7 +787,10 @@ int vst3_view_wants_close(void* handle) {
     return (self && self->wants_close) ? 1 : 0;
 }
 
-/// Mirrors a host-driven parameter change into the plugin's editor.
+/// Mirrors a host-driven parameter change into the plugin's editor. Called from
+/// the control/UI thread (never the audio thread); `setParamNormalized` is a
+/// controller-side, UI-thread call per the VST3 spec, while the processor is
+/// driven by the parameter queue in `vst3_run`.
 void vst3_view_set_param(void* handle, int index, float value) {
     auto* self = static_cast<VibemixVst3View*>(handle);
     if (!self || !self->controller) return;

@@ -628,6 +628,7 @@ pub struct SharedMeters {
 
 /// A snapshot of every meter, grouped by tap point. Strip values are indexed by
 /// strip id; bus values by bus id.
+#[derive(Default)]
 pub struct MeterLevels {
     pub strips_in_l: Vec<f32>,
     pub strips_in_r: Vec<f32>,
@@ -693,24 +694,33 @@ impl SharedMeters {
         store_pair(&self.bus_l, &self.bus_r, bus, left, right);
     }
 
-    pub fn levels(&self) -> MeterLevels {
-        MeterLevels {
-            strips_in_l: collect(&self.strip_in_l),
-            strips_in_r: collect(&self.strip_in_r),
-            strips_gain_l: collect(&self.strip_gain_l),
-            strips_gain_r: collect(&self.strip_gain_r),
-            strips_out_l: collect(&self.strip_out_l),
-            strips_out_r: collect(&self.strip_out_r),
-            buses_in_l: collect(&self.bus_in_l),
-            buses_in_r: collect(&self.bus_in_r),
-            buses_gain_l: collect(&self.bus_gain_l),
-            buses_gain_r: collect(&self.bus_gain_r),
-            buses_ret_l: collect(&self.bus_ret_l),
-            buses_ret_r: collect(&self.bus_ret_r),
-            buses_l: collect(&self.bus_l),
-            buses_r: collect(&self.bus_r),
-        }
+    /// Refills `out` with the current meter values, reusing its buffers (so a
+    /// per-frame snapshot costs no allocations).
+    pub fn levels_into(&self, out: &mut MeterLevels) {
+        fill(&self.strip_in_l, &mut out.strips_in_l);
+        fill(&self.strip_in_r, &mut out.strips_in_r);
+        fill(&self.strip_gain_l, &mut out.strips_gain_l);
+        fill(&self.strip_gain_r, &mut out.strips_gain_r);
+        fill(&self.strip_out_l, &mut out.strips_out_l);
+        fill(&self.strip_out_r, &mut out.strips_out_r);
+        fill(&self.bus_in_l, &mut out.buses_in_l);
+        fill(&self.bus_in_r, &mut out.buses_in_r);
+        fill(&self.bus_gain_l, &mut out.buses_gain_l);
+        fill(&self.bus_gain_r, &mut out.buses_gain_r);
+        fill(&self.bus_ret_l, &mut out.buses_ret_l);
+        fill(&self.bus_ret_r, &mut out.buses_ret_r);
+        fill(&self.bus_l, &mut out.buses_l);
+        fill(&self.bus_r, &mut out.buses_r);
     }
+}
+
+fn fill(values: &[AtomicU32], out: &mut Vec<f32>) {
+    out.clear();
+    out.extend(
+        values
+            .iter()
+            .map(|value| f32::from_bits(value.load(Ordering::Relaxed))),
+    );
 }
 
 fn store_pair(left_slots: &[AtomicU32], right_slots: &[AtomicU32], index: usize, left: f32, right: f32) {
@@ -720,13 +730,6 @@ fn store_pair(left_slots: &[AtomicU32], right_slots: &[AtomicU32], index: usize,
     if let Some(slot) = right_slots.get(index) {
         slot.store(right.to_bits(), Ordering::Relaxed);
     }
-}
-
-fn collect(values: &[AtomicU32]) -> Vec<f32> {
-    values
-        .iter()
-        .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
-        .collect()
 }
 
 fn gain_vec(count: usize) -> Vec<AtomicU32> {
