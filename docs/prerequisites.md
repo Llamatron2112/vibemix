@@ -92,6 +92,8 @@ Environment variables:
 - `VIBEMIX_GTK` — force the GTK major version used to host plugin UIs:
   `gtk2`, `gtk3`, or unset/`auto` (pick the version that has hostable UIs). GTK2
   and GTK3 cannot coexist in one process, so only one is ever used.
+- `VIBEMIX_UI_LOCAL=1` — host LV2 editors in the engine process instead of the
+  out-of-process UI host (debugging/verification; may cause xruns).
 - `VIBEMIX_RT_GUARD=1` — abort (debug) on any heap operation on the audio thread.
 
 ## Optional runtime dependencies (packaging)

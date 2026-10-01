@@ -9,6 +9,7 @@ mod params;
 mod plugin;
 mod rt_guard;
 mod smoke;
+mod ui_service;
 
 use std::sync::Arc;
 
@@ -73,6 +74,10 @@ struct Args {
     /// Restrict `--scan-plugins` to this URI (repeatable).
     #[arg(long, hide = true)]
     only: Vec<String>,
+
+    /// Serve LV2 editor windows out of process (internal): `--ui-host <socket>`.
+    #[arg(long, hide = true, value_name = "SOCKET")]
+    ui_host: Option<String>,
 }
 
 fn main() -> Result<()> {
@@ -88,6 +93,16 @@ fn main() -> Result<()> {
         rt_guard::enable();
     }
 
+    if let Some(path) = args.ui_host.as_deref() {
+        let code = match vibemix_lv2::ui_server::run_ui_host(path) {
+            Ok(()) => 0,
+            Err(error) => {
+                eprintln!("[vibemix-ui-host] {error}");
+                1
+            }
+        };
+        std::process::exit(code);
+    }
     if let Some(uri) = args.smoke.as_deref() {
         run_smoke(uri);
     }
@@ -176,6 +191,7 @@ fn run_smoke_vst3(bundle: &str, class_id: &str) -> ! {
 
 fn run_smoke_vst3_ui(bundle: &str, class_id: &str) -> ! {
     smoke::disable_core_dumps();
+    smoke::lower_priority();
     std::process::exit(smoke::smoke_plugin_vst3_ui(bundle, class_id));
 }
 
@@ -290,6 +306,7 @@ fn run_smoke_ui(uri: &str) -> ! {
     use std::time::Duration;
 
     smoke::disable_core_dumps();
+    smoke::lower_priority();
 
     extern "C" fn no_write(_: *mut c_void, _: u32, _: u32, _: u32, _: *const c_void) {}
 

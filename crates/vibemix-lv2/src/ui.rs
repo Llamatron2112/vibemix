@@ -24,6 +24,18 @@ impl UiKind {
             UiKind::Gtk3 => GTK3_UI_TYPE,
         }
     }
+
+    pub fn from_ui_type(ui_type: &str) -> Option<Self> {
+        if ui_type == X11_UI_TYPE {
+            Some(UiKind::X11)
+        } else if ui_type == GTK2_UI_TYPE {
+            Some(UiKind::Gtk2)
+        } else if ui_type == GTK3_UI_TYPE {
+            Some(UiKind::Gtk3)
+        } else {
+            None
+        }
+    }
 }
 
 pub type PortWrite = extern "C" fn(*mut c_void, u32, u32, u32, *const c_void);
@@ -55,6 +67,7 @@ extern "C" {
         bundle_cap: c_int,
         binary: *mut c_char,
         binary_cap: c_int,
+        requires_instance_access: *mut c_int,
     ) -> c_int;
 
     fn vibemix_ui_open(
@@ -90,12 +103,21 @@ pub fn init() {
     unsafe { vibemix_ui_init() };
 }
 
+/// The GTK major version chosen at runtime: 0 (none), 2 or 3. Used to tell the
+/// out-of-process UI host which toolkit to load.
+pub fn gtk_version() -> c_int {
+    unsafe { vibemix_gtk_version() }
+}
+
 #[derive(Debug, Clone)]
 pub struct UiCandidate {
     pub ui_uri: String,
     pub bundle: String,
     pub binary: String,
     pub kind: UiKind,
+    /// The chosen UI reads the DSP instance directly, so it can only be hosted
+    /// in the engine process (not the out-of-process UI host).
+    pub requires_instance_access: bool,
 }
 
 fn find_ui_of_type(plugin_uri: &str, want: &str, kind: UiKind) -> Option<UiCandidate> {
@@ -105,6 +127,7 @@ fn find_ui_of_type(plugin_uri: &str, want: &str, kind: UiKind) -> Option<UiCandi
     let mut ui_uri = [0 as c_char; 2048];
     let mut bundle = [0 as c_char; 2048];
     let mut binary = [0 as c_char; 2048];
+    let mut requires_instance_access: c_int = 0;
 
     let found = unsafe {
         vibemix_ui_find(
@@ -116,6 +139,7 @@ fn find_ui_of_type(plugin_uri: &str, want: &str, kind: UiKind) -> Option<UiCandi
             bundle.len() as c_int,
             binary.as_mut_ptr(),
             binary.len() as c_int,
+            &mut requires_instance_access,
         )
     };
     if found == 0 {
@@ -133,6 +157,7 @@ fn find_ui_of_type(plugin_uri: &str, want: &str, kind: UiKind) -> Option<UiCandi
         bundle: to_string(&bundle),
         binary: to_string(&binary),
         kind,
+        requires_instance_access: requires_instance_access != 0,
     })
 }
 

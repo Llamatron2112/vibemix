@@ -34,6 +34,14 @@ pub fn disable_core_dumps() {
     }
 }
 
+/// Lowers this (throwaway smoke) process's priority so a heavy child cannot
+/// compete with the audio thread for CPU.
+pub fn lower_priority() {
+    unsafe {
+        libc::setpriority(libc::PRIO_PROCESS, 0, 10);
+    }
+}
+
 /// Instantiates `uri` and runs a few blocks of DC input. Returns the smoke exit
 /// code ([`SMOKE_OK`] / [`SMOKE_INSTANTIATE_FAILED`]).
 pub fn smoke_plugin(host: &Host, uri: &str) -> i32 {

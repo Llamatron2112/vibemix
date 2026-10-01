@@ -3,7 +3,7 @@ use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::process::ExitStatusExt;
 use std::process::{Command, Stdio};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use vibemix_core::config::config_dir;
@@ -15,7 +15,9 @@ use vibemix_core::model::{
 use crate::midi_map::target_from_code;
 use vibemix_core::model::PluginFormat;
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
-use vibemix_lv2::{find_ui, Host, SharedOutputs, UiCandidate, UiWindow};
+use vibemix_lv2::{find_ui, Host, SharedOutputs, UiCandidate, UiMessage, UiWindow};
+
+use crate::ui_service::UiService;
 use vibemix_proto::ControlMessage;
 
 use crate::backend_jack::{instantiate_slot, JackEngine};
@@ -92,6 +94,8 @@ pub struct Controller {
     host: Host,
     /// VST3 host (discovery + instantiation).
     vst3: vibemix_vst3::Host,
+    /// Out-of-process LV2 UI host (spawned lazily on the first remote open).
+    ui_service: UiService,
     plugins: Vec<PluginEntry>,
     catalog_json: String,
     health: HealthStore,
@@ -103,9 +107,11 @@ pub struct Controller {
     smoke_bad: HashSet<String>,
     uis: HashMap<(u32, u32, u32), OpenUi>,
     ui_cache: HashMap<String, Option<UiCandidate>>,
-    ui_safe: HashMap<String, bool>,
-    /// Per-class VST3 editor smoke results.
-    vst3_ui_safe: HashMap<String, bool>,
+    /// LV2 editor smoke verdicts, keyed by plugin URI. Populated ahead of the
+    /// first open by a background thread so the click never spawns the child.
+    ui_safe: Arc<Mutex<HashMap<String, bool>>>,
+    /// Per-class VST3 editor smoke verdicts, filled the same way.
+    vst3_ui_safe: Arc<Mutex<HashMap<String, bool>>>,
     missing_report: Option<String>,
     pending_session: Option<(bool, String, String)>,
     sample_rate: u32,
@@ -128,9 +134,16 @@ pub struct Controller {
     meter_bytes: Vec<u8>,
 }
 
-/// An open plugin editor: an LV2 toolkit UI or a VST3 `IPlugView`.
+/// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
+/// UI host) or a VST3 `IPlugView`.
 enum OpenUi {
-    Lv2 {
+    /// LV2 editor hosted in the out-of-process UI host, keyed by host id.
+    Lv2Remote {
+        id: u32,
+        context: Box<UiWriteCtx>,
+    },
+    /// LV2 editor hosted in-process (instance-access UIs, or `VIBEMIX_UI_LOCAL`).
+    Lv2Local {
         window: UiWindow,
         context: Box<UiWriteCtx>,
     },
@@ -141,24 +154,16 @@ enum OpenUi {
     },
 }
 
-impl OpenUi {
-    fn pump(&mut self) {
-        match self {
-            OpenUi::Lv2 { window, context } => {
-                window.pump();
-                context.forward_outputs(window);
-            }
-            OpenUi::Vst3 { view, .. } => view.pump(),
-        }
-    }
-
-    fn wants_close(&self) -> bool {
-        match self {
-            OpenUi::Lv2 { window, .. } => window.wants_close(),
-            OpenUi::Vst3 { view, .. } => view.wants_close(),
-        }
-    }
+/// A port value to deliver to an editor (`ui:portEvent`).
+struct OutputEvent {
+    port: u32,
+    format: u32,
+    /// Set for atom payloads; remapped to the host's URID out of process.
+    type_uri: Option<String>,
+    bytes: Vec<u8>,
 }
+
+
 
 struct UiWriteCtx {
     location: u32,
@@ -180,15 +185,16 @@ impl Drop for UiWriteCtx {
 }
 
 impl UiWriteCtx {
-    /// Forwards the plugin's output port values to its native UI (host ->
-    /// `ui:portEvent`), so meters/analysers animate even for plugins that do
-    /// not read their DSP ports directly via `instance-access`.
-    fn forward_outputs(&mut self, window: &UiWindow) {
+    /// Collects the plugin's output port values that changed since the last call
+    /// (host -> `ui:portEvent`), so meters/analysers animate even for plugins
+    /// that do not read their DSP ports directly via `instance-access`.
+    fn collect_outputs(&mut self) -> Vec<OutputEvent> {
+        let mut events = Vec::new();
         let Some(outputs) = &self.outputs else {
-            return;
+            return events;
         };
         if !outputs.is_active() {
-            return;
+            return events;
         }
 
         let controls = outputs.control_port_count();
@@ -201,13 +207,12 @@ impl UiWriteCtx {
                 continue;
             }
             self.last_control[index] = Some(bits);
-            let value = f32::from_bits(bits);
-            window.port_event(
-                outputs.control_port(index),
-                std::mem::size_of::<f32>() as u32,
-                0,
-                &value.to_ne_bytes(),
-            );
+            events.push(OutputEvent {
+                port: outputs.control_port(index),
+                format: 0,
+                type_uri: None,
+                bytes: f32::from_bits(bits).to_ne_bytes().to_vec(),
+            });
         }
 
         let atoms = outputs.atom_port_count();
@@ -221,9 +226,16 @@ impl UiWriteCtx {
             }
             if let Some((bytes, format)) = outputs.read_atom(index) {
                 self.last_atom_seq[index] = seq;
-                window.port_event(outputs.atom_port(index), bytes.len() as u32, format, &bytes);
+                let type_uri = vibemix_lv2::urid::UridMap::shared().unmap(format);
+                events.push(OutputEvent {
+                    port: outputs.atom_port(index),
+                    format,
+                    type_uri,
+                    bytes: bytes.to_vec(),
+                });
             }
         }
+        events
     }
 }
 
@@ -295,6 +307,7 @@ impl Controller {
             engine,
             host,
             vst3,
+            ui_service: UiService::new(),
             plugins,
             catalog_json,
             health,
@@ -305,8 +318,8 @@ impl Controller {
             smoke_bad: HashSet::new(),
             uis: HashMap::new(),
             ui_cache: HashMap::new(),
-            ui_safe: HashMap::new(),
-            vst3_ui_safe: HashMap::new(),
+            ui_safe: Arc::new(Mutex::new(HashMap::new())),
+            vst3_ui_safe: Arc::new(Mutex::new(HashMap::new())),
             missing_report,
             pending_session: None,
             sample_rate,
@@ -1044,7 +1057,10 @@ impl Controller {
                 target,
                 slot,
             } => {
-                self.uis.remove(&(location, target, slot));
+                if let Some(OpenUi::Lv2Remote { id, .. }) = self.uis.remove(&(location, target, slot))
+                {
+                    self.ui_service.close(id);
+                }
                 Actions::default()
             }
             ControlMessage::CopyPlugin {
@@ -1579,22 +1595,24 @@ impl Controller {
     }
 
     fn ui_is_safe(&mut self, uri: &str) -> bool {
-        if let Some(safe) = self.ui_safe.get(uri) {
-            return *safe;
+        if let Some(safe) = ui_safe_map(&self.ui_safe).get(uri).copied() {
+            return safe;
         }
+        // Fallback for a plugin whose background smoke has not finished (e.g. a
+        // session restore, which does not go through `insert_plugin_slot`).
         let safe = ui_smoke_ok(&["--smoke-ui", uri], Duration::from_secs(10));
         if !safe {
             tracing::warn!(%uri, "plugin UI failed smoke test; not opening");
         }
-        self.ui_safe.insert(uri.to_string(), safe);
+        ui_safe_map(&self.ui_safe).insert(uri.to_string(), safe);
         safe
     }
 
     /// Runs the VST3 editor headlessly in a child so a crashing editor is
     /// refused rather than taking the engine down.
     fn vst3_ui_is_safe(&mut self, bundle: &str, class_id: &str) -> bool {
-        if let Some(safe) = self.vst3_ui_safe.get(class_id) {
-            return *safe;
+        if let Some(safe) = ui_safe_map(&self.vst3_ui_safe).get(class_id).copied() {
+            return safe;
         }
         let safe = ui_smoke_ok(
             &["--smoke-vst3-ui", bundle, class_id],
@@ -1603,8 +1621,57 @@ impl Controller {
         if !safe {
             tracing::warn!(%class_id, "VST3 editor failed smoke test; not opening");
         }
-        self.vst3_ui_safe.insert(class_id.to_string(), safe);
+        ui_safe_map(&self.vst3_ui_safe).insert(class_id.to_string(), safe);
         safe
+    }
+
+    /// Starts the editor safety smoke for a newly inserted plugin in a
+    /// background thread, so the first "show UI" click finds the verdict cached
+    /// instead of spawning a heavy child on the control path while audio runs.
+    fn schedule_ui_smoke(&self, format: PluginFormat, uri: &str, bundle: Option<&str>) {
+        let has_ui = self
+            .plugins
+            .iter()
+            .find(|entry| entry.id == uri)
+            .map(|entry| entry.has_ui)
+            .unwrap_or(true);
+        if !has_ui {
+            return;
+        }
+        match format {
+            PluginFormat::Vst3 => {
+                let Some(bundle) = bundle else {
+                    return;
+                };
+                if ui_safe_map(&self.vst3_ui_safe).contains_key(uri) {
+                    return;
+                }
+                spawn_ui_smoke(
+                    Arc::clone(&self.vst3_ui_safe),
+                    uri.to_string(),
+                    vec![
+                        "--smoke-vst3-ui".to_string(),
+                        bundle.to_string(),
+                        uri.to_string(),
+                    ],
+                );
+            }
+            PluginFormat::Lv2 => {
+                // Only in-process (instance-access) editors need the smoke; the
+                // out-of-process host isolates them already.
+                let needs_local = find_ui(uri)
+                    .map(|candidate| candidate.requires_instance_access)
+                    .unwrap_or(false);
+                if !needs_local || ui_safe_map(&self.ui_safe).contains_key(uri) {
+                    return;
+                }
+                spawn_ui_smoke(
+                    Arc::clone(&self.ui_safe),
+                    uri.to_string(),
+                    vec!["--smoke-ui".to_string(), uri.to_string()],
+                );
+            }
+        }
     }
 
     fn open_ui(&mut self, location: u32, target: u32, slot: u32) {
@@ -1684,13 +1751,6 @@ impl Controller {
         } else {
             self.engine.bus_plugin_handle(target as usize, slot as usize)
         };
-        let Some(handle) = handle else {
-            return;
-        };
-
-        if !self.ui_is_safe(&uri) {
-            return;
-        }
 
         let candidate = self
             .ui_cache
@@ -1698,7 +1758,7 @@ impl Controller {
             .or_insert_with(|| find_ui(&uri))
             .clone();
         let Some(candidate) = candidate else {
-            tracing::warn!(%uri, "no hostable X11 UI");
+            tracing::warn!(%uri, "no hostable plugin UI");
             return;
         };
 
@@ -1732,6 +1792,33 @@ impl Controller {
             last_atom_seq: Vec::new(),
         });
 
+        // Prefer hosting the editor out of process, so constructing a toolkit UI
+        // cannot stall the engine's data-loop. UIs that read the instance
+        // directly (`instance-access`), and explicit local requests, use the
+        // in-process path.
+        let force_local = std::env::var_os("VIBEMIX_UI_LOCAL").is_some();
+        if !force_local && !candidate.requires_instance_access {
+            let id = self.ui_service.alloc_id();
+            if self
+                .ui_service
+                .open(id, &candidate, &uri, &title, 1.0, 30.0)
+            {
+                if let Some(outputs) = &context.outputs {
+                    outputs.set_active(true);
+                }
+                tracing::info!(location, target, slot, %uri, "opened plugin UI (out of process)");
+                self.uis.insert(key, OpenUi::Lv2Remote { id, context });
+                return;
+            }
+            tracing::warn!(%uri, "UI host failed; falling back in-process");
+        }
+
+        let Some(handle) = handle else {
+            return;
+        };
+        if !self.ui_is_safe(&uri) {
+            return;
+        }
         let Some(window) = (unsafe {
             self.host.open_ui(
                 &uri,
@@ -1752,7 +1839,7 @@ impl Controller {
         }
 
         tracing::info!(location, target, slot, %uri, "opened plugin UI");
-        self.uis.insert(key, OpenUi::Lv2 { window, context });
+        self.uis.insert(key, OpenUi::Lv2Local { window, context });
     }
 
     /// Mirrors a host-driven parameter change into the plugin's native UI, so
@@ -1763,27 +1850,39 @@ impl Controller {
     /// calls `IEditController::setParamNormalized`, which the spec sanctions
     /// from the UI thread (the processor is driven separately by the parameter
     /// queue in `set_controls`); plugins are required to make that reentrant.
-    fn reflect_param_to_ui(&self, location: u32, target: u32, slot: u32, param: u32, value: f32) {
-        let Some(ui) = self.uis.get(&(location, target, slot)) else {
-            return;
-        };
-        match ui {
-            OpenUi::Lv2 { window, context } => {
-                let Some((port, _)) = context
+    fn reflect_param_to_ui(&mut self, location: u32, target: u32, slot: u32, param: u32, value: f32) {
+        let mut remote = None;
+        let mut local = None;
+        if let Some(ui) = self.uis.get(&(location, target, slot)) {
+            let find = |context: &UiWriteCtx| {
+                context
                     .ports
                     .iter()
                     .find(|(_, mapped)| *mapped == param as usize)
-                else {
+                    .map(|(port, _)| *port)
+            };
+            match ui {
+                OpenUi::Lv2Remote { id, context } => {
+                    if let Some(port) = find(context) {
+                        remote = Some((*id, port));
+                    }
+                }
+                OpenUi::Lv2Local { window, context } => {
+                    if let Some(port) = find(context) {
+                        local = Some((port, window));
+                    }
+                }
+                OpenUi::Vst3 { view, .. } => {
+                    view.set_param(param as usize, value);
                     return;
-                };
-                window.port_event(
-                    *port,
-                    std::mem::size_of::<f32>() as u32,
-                    0,
-                    &value.to_ne_bytes(),
-                );
+                }
             }
-            OpenUi::Vst3 { view, .. } => view.set_param(param as usize, value),
+        }
+        if let Some((id, port)) = remote {
+            self.ui_service
+                .send_port_event(id, port, 0, None, value.to_ne_bytes().to_vec());
+        } else if let Some((port, window)) = local {
+            window.port_event(port, std::mem::size_of::<f32>() as u32, 0, &value.to_ne_bytes());
         }
     }
 
@@ -1894,15 +1993,112 @@ impl Controller {
     }
 
     fn pump_uis(&mut self) {
+        self.poll_ui_host();
+
         let mut closed = Vec::new();
-        for (key, ui) in self.uis.iter_mut() {
-            ui.pump();
-            if ui.wants_close() {
-                closed.push(*key);
+        {
+            let Controller { uis, ui_service, .. } = self;
+            for (key, ui) in uis.iter_mut() {
+                match ui {
+                    OpenUi::Lv2Remote { id, context } => {
+                        // The UI host pumps its own windows; the engine only
+                        // forwards output snapshots.
+                        for event in context.collect_outputs() {
+                            ui_service.send_port_event(
+                                *id,
+                                event.port,
+                                event.format,
+                                event.type_uri,
+                                event.bytes,
+                            );
+                        }
+                    }
+                    OpenUi::Lv2Local { window, context } => {
+                        window.pump();
+                        for event in context.collect_outputs() {
+                            window.port_event(
+                                event.port,
+                                event.bytes.len() as u32,
+                                event.format,
+                                &event.bytes,
+                            );
+                        }
+                        if window.wants_close() {
+                            closed.push(*key);
+                        }
+                    }
+                    OpenUi::Vst3 { view, .. } => {
+                        view.pump();
+                        if view.wants_close() {
+                            closed.push(*key);
+                        }
+                    }
+                }
             }
         }
         for key in closed {
             self.uis.remove(&key);
+        }
+    }
+
+    /// Applies messages from the out-of-process UI host: parameter edits and
+    /// window-close requests.
+    fn poll_ui_host(&mut self) {
+        for message in self.ui_service.recv() {
+            match message {
+                UiMessage::Write {
+                    id,
+                    port,
+                    format,
+                    bytes,
+                } => {
+                    if format != 0 || bytes.len() != 4 {
+                        continue;
+                    }
+                    let value = f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                    self.apply_remote_ui_write(id, port, value);
+                }
+                UiMessage::CloseRequest { id } => {
+                    let key = self.uis.iter().find_map(|(key, ui)| match ui {
+                        OpenUi::Lv2Remote { id: ui_id, .. } if *ui_id == id => Some(*key),
+                        _ => None,
+                    });
+                    if let Some(key) = key {
+                        self.uis.remove(&key);
+                    }
+                }
+                UiMessage::Title { .. } | UiMessage::Opened { .. } | UiMessage::OpenFailed { .. } => {}
+                UiMessage::Open { .. } | UiMessage::PortEvent { .. } | UiMessage::Close { .. }
+                | UiMessage::Shutdown => {}
+            }
+        }
+    }
+
+    /// Folds a control-port edit made in a remote editor into the shared
+    /// parameter state (the remote equivalent of `ui_port_write`).
+    fn apply_remote_ui_write(&mut self, id: u32, port: u32, value: f32) {
+        let mut found = None;
+        for (key, ui) in self.uis.iter() {
+            if let OpenUi::Lv2Remote { id: ui_id, context } = ui {
+                if *ui_id == id {
+                    found = context
+                        .ports
+                        .iter()
+                        .find(|(mapped, _)| *mapped == port)
+                        .map(|(_, param)| (*key, *param));
+                    break;
+                }
+            }
+        }
+        let Some(((location, target, slot), param)) = found else {
+            return;
+        };
+        if let Some(chain) = strip_chain(location) {
+            self.params
+                .set_plugin_param(target as usize, chain, slot as usize, param, value);
+        } else {
+            self.params
+                .set_bus_plugin_param(target as usize, slot as usize, param, value);
         }
     }
 
@@ -2143,6 +2339,9 @@ impl Controller {
         plugin.id = plugin_id(slot);
         plugin.missing = false;
         let uri = plugin.uri.clone();
+        // Kick off the editor safety smoke in the background (before the plugin
+        // is moved into the model) so the first "show UI" click is cheap.
+        let ui_smoke = (plugin.format, plugin.uri.clone(), plugin.bundle.clone());
         let params = std::mem::take(&mut plugin.params);
 
         if let Some(chain) = strip_chain(location) {
@@ -2183,6 +2382,7 @@ impl Controller {
             }
         }
 
+        self.schedule_ui_smoke(ui_smoke.0, &ui_smoke.1, ui_smoke.2.as_deref());
         tracing::info!(location, target, slot, uri = %uri, "inserted plugin");
         true
     }
@@ -3084,6 +3284,30 @@ fn ui_smoke_ok(args: &[&str], timeout: Duration) -> bool {
             Err(_) => return true,
         }
     }
+}
+
+/// Locks an editor-smoke verdict map, recovering from a poisoned mutex (a
+/// background smoke thread should never panic, but a lock must not take the
+/// control loop down).
+fn ui_safe_map(
+    map: &Mutex<HashMap<String, bool>>,
+) -> std::sync::MutexGuard<'_, HashMap<String, bool>> {
+    map.lock().unwrap_or_else(|poison| poison.into_inner())
+}
+
+/// Runs an editor smoke test in a detached background thread and records the
+/// verdict, keyed by `key`.
+fn spawn_ui_smoke(map: Arc<Mutex<HashMap<String, bool>>>, key: String, args: Vec<String>) {
+    let _ = std::thread::Builder::new()
+        .name("ui-smoke".to_string())
+        .spawn(move || {
+            let refs: Vec<&str> = args.iter().map(String::as_str).collect();
+            let safe = ui_smoke_ok(&refs, Duration::from_secs(10));
+            if !safe {
+                tracing::warn!(plugin = %key, "plugin UI failed smoke test; not opening");
+            }
+            ui_safe_map(&map).insert(key, safe);
+        });
 }
 
 fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> {

@@ -227,6 +227,10 @@ int vibemix_gtk_version(void) {
       g_gtk_version = 3;
       return g_gtk_version;
     }
+    if (!strcmp(env, "0") || !strcmp(env, "none") || !strcmp(env, "off")) {
+      g_gtk_version = 0;
+      return g_gtk_version;
+    }
   }
 
   int n2 = count_uis_of_type(LV2_UI__GtkUI);
@@ -315,10 +319,40 @@ int vibemix_ui_supported(const char* host_type, const char* ui_type) {
   return (int)suil_ui_supported(host_type, ui_type);
 }
 
+/* Whether a UI declares `lv2:requiredFeature instance-access`. Such a UI reads
+   the DSP instance directly and can only be hosted in the engine process. */
+static int ui_requires_instance_access(LilvWorld* world, const LilvUI* ui) {
+  static const char* REQUIRED = "http://lv2plug.in/ns/lv2core#requiredFeature";
+  static const char* INSTANCE = "http://lv2plug.in/ns/ext/instance-access";
+  LilvNode* predicate = lilv_new_uri(world, REQUIRED);
+  LilvNode* wanted = lilv_new_uri(world, INSTANCE);
+  LilvNodes* nodes = lilv_world_find_nodes(world, lilv_ui_get_uri(ui), predicate, NULL);
+  int requires = 0;
+  if (nodes) {
+    LILV_FOREACH(nodes, nit, nodes) {
+      if (lilv_node_equals(lilv_nodes_get(nodes, nit), wanted)) {
+        requires = 1;
+        break;
+      }
+    }
+    lilv_nodes_free(nodes);
+  }
+  lilv_node_free(predicate);
+  lilv_node_free(wanted);
+  return requires;
+}
+
+/* Finds a hostable UI of `want_type`. Prefers a UI that does not require
+   `instance-access` (so it can be hosted out of process); only falls back to an
+   instance-access UI when it is the only option. Reports which kind was chosen
+   via `requires_instance_access`. */
 int vibemix_ui_find(const char* plugin_uri, const char* want_type, char* ui_uri,
                     int ui_uri_cap, char* bundle, int bundle_cap, char* binary,
-                    int binary_cap) {
+                    int binary_cap, int* requires_instance_access) {
   LilvWorld* world = ensure_world();
+  if (requires_instance_access) {
+    *requires_instance_access = 0;
+  }
 
   LilvNode* pnode = lilv_new_uri(world, plugin_uri);
   const LilvPlugin* plugin =
@@ -329,36 +363,45 @@ int vibemix_ui_find(const char* plugin_uri, const char* want_type, char* ui_uri,
   }
 
   int found = 0;
+  int found_requires = 0;
   LilvUIs* uis = lilv_plugin_get_uis(plugin);
   LILV_FOREACH(uis, it, uis) {
     const LilvUI* ui = lilv_uis_get(uis, it);
+    int supported = 0;
     const LilvNodes* classes = lilv_ui_get_classes(ui);
     LILV_FOREACH(nodes, cit, classes) {
       const char* cls = lilv_node_as_uri(lilv_nodes_get(classes, cit));
-      if (!suil_ui_supported(want_type, cls)) {
-        continue;
+      if (suil_ui_supported(want_type, cls)) {
+        supported = 1;
+        break;
       }
-      char* bundle_path =
-          lilv_file_uri_parse(lilv_node_as_uri(lilv_ui_get_bundle_uri(ui)), NULL);
-      char* binary_path =
-          lilv_file_uri_parse(lilv_node_as_uri(lilv_ui_get_binary_uri(ui)), NULL);
-      if (binary_path && access(binary_path, R_OK) == 0) {
+    }
+    if (!supported) {
+      continue;
+    }
+    char* bundle_path =
+        lilv_file_uri_parse(lilv_node_as_uri(lilv_ui_get_bundle_uri(ui)), NULL);
+    char* binary_path =
+        lilv_file_uri_parse(lilv_node_as_uri(lilv_ui_get_binary_uri(ui)), NULL);
+    if (binary_path && access(binary_path, R_OK) == 0) {
+      int requires = ui_requires_instance_access(world, ui);
+      /* Keep the first candidate, but replace it if it needs instance-access
+         and this one does not. */
+      if (!found || (found_requires && !requires)) {
         snprintf(ui_uri, ui_uri_cap, "%s", lilv_node_as_uri(lilv_ui_get_uri(ui)));
         snprintf(bundle, bundle_cap, "%s", bundle_path ? bundle_path : "");
         snprintf(binary, binary_cap, "%s", binary_path);
         found = 1;
-      }
-      lilv_free(bundle_path);
-      lilv_free(binary_path);
-      if (found) {
-        break;
+        found_requires = requires;
       }
     }
-    if (found) {
-      break;
-    }
+    lilv_free(bundle_path);
+    lilv_free(binary_path);
   }
   lilv_uis_free(uis);
+  if (found && requires_instance_access) {
+    *requires_instance_access = found_requires;
+  }
   return found;
 }
 

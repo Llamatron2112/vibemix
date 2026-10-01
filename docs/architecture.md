@@ -220,13 +220,25 @@ when the plugin is instantiated. Save runs under a brief cooperative pause so
 the plugin's `save()` never races the RT callback, and `state:mapPath` is
 provided so file-path state (e.g. convolution IRs) round-trips.
 
-Native plugin UIs: the engine hosts plugin UIs in their own floating windows
-via `suil` (no embedding into the QML window). X11 UIs (LSP, x42, …) appear
-through XWayland; GTK2/GTK3 UIs (e.g. Calf) are hosted in a `GtkWindow`. The
-engine owns the windows because LV2 UIs need same-process instance access, and
-pumps them in its control loop. Open/close from the GUI "UI" button
-(`/vibemix/plugin/ui` and `/vibemix/plugin/ui/close`). A plugin offering both
-X11 and GTK is hosted as X11 (preferred).
+Native plugin UIs: editors are hosted in their own floating windows via `suil`
+(no embedding into the QML window). X11 UIs (LSP, x42, …) appear through
+XWayland; GTK2/GTK3 UIs (e.g. Calf) are hosted in a `GtkWindow`. Open/close from
+the GUI "UI" button (`/vibemix/plugin/ui` and `/vibemix/plugin/ui/close`). A
+plugin offering both X11 and GTK is hosted as X11 (preferred).
+
+LV2 editors are hosted **out of process** by default: the engine spawns
+`vibemix-engine --ui-host <socket>` (one shared host) and talks to it over a
+Unix socket (`vibemix-lv2::ui_ipc`). The host runs the same `ui_host.c` window
+code; the engine forwards output values (`ui:portEvent`) and the host forwards
+parameter edits. This matters because the PipeWire data-loop runs **inside the
+engine process**, so constructing a toolkit UI there stalls the data-loop and
+causes xruns; in the host process it cannot. A UI that declares
+`lv2:requiredFeature instance-access` reads the DSP instance directly and cannot
+be remoted, so it (and every UI when `VIBEMIX_UI_LOCAL=1`) falls back to
+in-process hosting, which keeps the subprocess smoke-test gate below. The host
+is spawned lazily on the first remote open, hosts any number of windows, and is
+shut down (or exits on socket EOF) with the engine; a host crash drops its
+windows without affecting audio.
 
 GTK is an **optional runtime dependency**, loaded with `dlopen()` and skipped
 when absent, so the engine runs on a system with no GTK at all. GTK2 and GTK3
@@ -261,11 +273,11 @@ seqlock for atom payloads); publishing is gated on a per-instance "UI open"
 flag, so the audio thread does no extra work when no UI is open. Host-driven
 parameter edits are mirrored back into the native UI the same way.
 
-Because UIs must run in-process, opening one is still gated by a short
-subprocess smoke test as a safety net: a UI that crashes or hangs is refused
-rather than taking the engine down. The smoke test runs headless (the window is
-never mapped) and also exercises the output-forwarding path, so it produces no
-visible flash.
+In-process (fallback) UIs are gated by a short subprocess smoke test as a safety
+net: a UI that crashes or hangs is refused rather than taking the engine down.
+The smoke test runs headless (the window is never mapped) and also exercises the
+output-forwarding path, so it produces no visible flash. Out-of-process UIs need
+no smoke — the separate process already isolates them.
 
 VST3 editors are hosted separately: the plugin's `IPlugView` is embedded into a
 raw X11 window (`kPlatformTypeX11EmbedWindowID`) created per editor, with a
