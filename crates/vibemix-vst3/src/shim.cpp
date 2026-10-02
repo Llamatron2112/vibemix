@@ -5,12 +5,14 @@
 #include <X11/Xatom.h>
 
 #include <atomic>
+#include <chrono>
 #include <cstdlib>
 #include <limits>
 #include <cstring>
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <poll.h>
 #include <string>
 #include <vector>
 
@@ -187,20 +189,54 @@ tresult ComponentHandler::restartComponent(int32 flags) {
 
 struct VibemixVst3View;
 
-/// The frame JUCE (and others) call to resize/close the editor window.
-class PlugFrame : public IPlugFrame {
+/// The frame plugins call to resize/close the editor window. It also implements
+/// `IRunLoop` (timers + file-descriptor event handlers), which DPF-based plugins
+/// (e.g. Dragonfly) query on the frame and require before attaching.
+class PlugFrame : public IPlugFrame, public Linux::IRunLoop {
 public:
     explicit PlugFrame(VibemixVst3View* owner) : owner(owner) {}
 
     tresult PLUGIN_API resizeView(IPlugView* view, ViewRect* newSize) override;
 
+    tresult PLUGIN_API registerEventHandler(Linux::IEventHandler* handler,
+                                            Linux::FileDescriptor fd) override;
+    tresult PLUGIN_API unregisterEventHandler(Linux::IEventHandler* handler) override;
+    tresult PLUGIN_API registerTimer(Linux::ITimerHandler* handler,
+                                     Linux::TimerInterval milliseconds) override;
+    tresult PLUGIN_API unregisterTimer(Linux::ITimerHandler* handler) override;
+
+    /// Runs due timers and services registered descriptors. Called from the
+    /// control loop (`vst3_view_pump`), never the audio thread.
+    void pump();
+
     DECLARE_FUNKNOWN_METHODS
 
 private:
+    struct Timer {
+        IPtr<Linux::ITimerHandler> handler;
+        uint64 interval_ms;
+        std::chrono::steady_clock::time_point next;
+    };
+    struct EventHandler {
+        IPtr<Linux::IEventHandler> handler;
+        Linux::FileDescriptor fd;
+    };
     VibemixVst3View* owner;
+    std::vector<Timer> timers;
+    std::vector<EventHandler> event_handlers;
 };
 
-IMPLEMENT_FUNKNOWN_METHODS(PlugFrame, IPlugFrame, IPlugFrame::iid)
+IMPLEMENT_REFCOUNT(PlugFrame)
+
+// The frame exposes both `IPlugFrame` and `IRunLoop`; each plugin queries the
+// one it needs.
+tresult PLUGIN_API PlugFrame::queryInterface(const TUID _iid, void** obj) {
+    QUERY_INTERFACE(_iid, obj, FUnknown::iid, PlugFrame)
+    QUERY_INTERFACE(_iid, obj, IPlugFrame::iid, IPlugFrame)
+    QUERY_INTERFACE(_iid, obj, Linux::IRunLoop::iid, Linux::IRunLoop)
+    *obj = nullptr;
+    return kNoInterface;
+}
 
 struct VibemixVst3View {
     IPtr<IEditController> controller;
@@ -220,6 +256,74 @@ tresult PlugFrame::resizeView(IPlugView*, ViewRect* newSize) {
         XFlush(owner->dpy);
     }
     return kResultTrue;
+}
+
+tresult PLUGIN_API PlugFrame::registerTimer(Linux::ITimerHandler* handler,
+                                            Linux::TimerInterval milliseconds) {
+    if (!handler) return kInvalidArgument;
+    const uint64 interval = milliseconds > 0 ? milliseconds : 16;
+    timers.push_back({IPtr<Linux::ITimerHandler>(handler), interval,
+                      std::chrono::steady_clock::now() +
+                          std::chrono::milliseconds(interval)});
+    return kResultOk;
+}
+
+tresult PLUGIN_API PlugFrame::unregisterTimer(Linux::ITimerHandler* handler) {
+    for (auto it = timers.begin(); it != timers.end(); ++it) {
+        if (it->handler.get() == handler) {
+            timers.erase(it);
+            break;
+        }
+    }
+    return kResultOk;
+}
+
+tresult PLUGIN_API PlugFrame::registerEventHandler(Linux::IEventHandler* handler,
+                                                   Linux::FileDescriptor fd) {
+    if (!handler) return kInvalidArgument;
+    event_handlers.push_back({IPtr<Linux::IEventHandler>(handler), fd});
+    return kResultOk;
+}
+
+tresult PLUGIN_API PlugFrame::unregisterEventHandler(Linux::IEventHandler* handler) {
+    for (auto it = event_handlers.begin(); it != event_handlers.end(); ++it) {
+        if (it->handler.get() == handler) {
+            event_handlers.erase(it);
+            break;
+        }
+    }
+    return kResultOk;
+}
+
+void PlugFrame::pump() {
+    const auto now = std::chrono::steady_clock::now();
+    // Snapshot the handlers before invoking them: a callback may register or
+    // unregister timers, which would invalidate the vector iterators.
+    std::vector<IPtr<Linux::ITimerHandler>> due;
+    for (auto& timer : timers) {
+        if (now >= timer.next) {
+            timer.next = now + std::chrono::milliseconds(timer.interval_ms);
+            due.push_back(timer.handler);
+        }
+    }
+    for (auto& handler : due) {
+        if (handler) handler->onTimer();
+    }
+
+    if (!event_handlers.empty()) {
+        std::vector<pollfd> descriptors;
+        descriptors.reserve(event_handlers.size());
+        for (const auto& entry : event_handlers) {
+            descriptors.push_back({entry.fd, POLLIN, 0});
+        }
+        if (poll(descriptors.data(), descriptors.size(), 0) > 0) {
+            for (size_t i = 0; i < descriptors.size(); ++i) {
+                if (descriptors[i].revents != 0 && event_handlers[i].handler) {
+                    event_handlers[i].handler->onFDIsSet(event_handlers[i].fd);
+                }
+            }
+        }
+    }
 }
 
 } // namespace
@@ -771,7 +875,11 @@ int vst3_smoke_editor(void* instance) {
 /// Processes pending X events; a WM_DELETE_WINDOW sets the close flag.
 void vst3_view_pump(void* handle) {
     auto* self = static_cast<VibemixVst3View*>(handle);
-    if (!self || !self->dpy) return;
+    if (!self) return;
+    // Drive the plugin's IRunLoop (timers/fd handlers). DPF plugins use the
+    // timer for their idle/repaint pass.
+    if (self->frame) self->frame->pump();
+    if (!self->dpy) return;
     while (XPending(self->dpy) > 0) {
         XEvent event;
         XNextEvent(self->dpy, &event);
