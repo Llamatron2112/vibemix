@@ -1521,6 +1521,10 @@ ApplicationWindow {
             id: dragHandler
             target: null
             xAxis.enabled: false
+            // Start moving as soon as the pointer moves: without this, Qt waits
+            // for the platform drag distance (~10px), leaving a dead zone before
+            // the value reacts.
+            dragThreshold: 0
             grabPermissions: PointerHandler.TakeOverForbidden
             onActiveChanged: {
                 if (dragHandler.active) {
@@ -2051,6 +2055,7 @@ ApplicationWindow {
             id: knobDrag
             target: null
             xAxis.enabled: false
+            dragThreshold: 0
             grabPermissions: PointerHandler.TakeOverForbidden
             onActiveChanged: {
                 if (knobDrag.active) {
