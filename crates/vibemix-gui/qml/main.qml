@@ -1327,7 +1327,9 @@ ApplicationWindow {
                         : "transparent"
 
                     ToolTip.visible: pluginMouse.containsMouse
-                    ToolTip.text: pluginRow.pluginData.name
+                    ToolTip.text: pluginRow.pluginData.missing
+                        ? pluginRow.pluginData.name + " (missing)"
+                        : pluginRow.pluginData.name
                     ToolTip.delay: 350
 
                     Label {

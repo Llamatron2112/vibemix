@@ -528,6 +528,7 @@ fn build_plugins(
             "uri": plugin.get("uri").cloned().unwrap_or(serde_json::json!("")),
             "name": plugin.get("name").cloned().unwrap_or(serde_json::json!("")),
             "bypassed": plugin.get("bypassed").cloned().unwrap_or(serde_json::json!(false)),
+            "missing": plugin.get("missing").cloned().unwrap_or(serde_json::json!(false)),
             "has_ui": plugin.get("has_ui").cloned().unwrap_or(serde_json::json!(false)),
             "has_sidechain": plugin.get("has_sidechain").cloned().unwrap_or(serde_json::json!(false)),
             "sidechain_enabled": plugin.get("sidechain_enabled").cloned().unwrap_or(serde_json::json!(false)),
@@ -1657,7 +1658,18 @@ impl qobject::Backend {
 
 #[cfg(test)]
 mod tests {
-    use super::extract_ids;
+    use super::{extract_ids, split_state};
+
+    #[test]
+    fn forwards_missing_plugin_flag() {
+        let json = r#"{"strips":[{"id":0,"plugins":[{"slot":0,"uri":"u","name":"Gone","bypassed":false,"missing":true}],"plugins_post":[]}],"buses":[]}"#;
+        let value: serde_json::Value = serde_json::from_str(json).expect("parse");
+        let (structure, _values) = split_state(&value);
+        assert!(
+            structure.contains(r#""missing":true"#),
+            "structure should carry the missing flag: {structure}"
+        );
+    }
 
     #[test]
     fn extracts_ids_from_snapshot() {

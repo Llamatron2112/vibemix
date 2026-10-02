@@ -2440,7 +2440,28 @@ impl Controller {
         Some(plugin)
     }
 
+    /// Whether the plugin at `slot` could not be loaded (uninstalled / failed).
+    fn plugin_missing(&self, location: u32, target: u32, slot: u32) -> bool {
+        if let Some(chain) = strip_chain(location) {
+            self.model
+                .strip(StripId(target))
+                .and_then(|strip| strip_plugin_list(strip, chain).get(slot as usize))
+                .map(|plugin| plugin.missing)
+                .unwrap_or(false)
+        } else {
+            self.model
+                .bus(BusId(target))
+                .and_then(|bus| bus.plugins.get(slot as usize))
+                .map(|plugin| plugin.missing)
+                .unwrap_or(false)
+        }
+    }
+
     fn copy_plugin(&mut self, location: u32, target: u32, slot: u32) -> bool {
+        if self.plugin_missing(location, target, slot) {
+            tracing::warn!(location, target, slot, "refusing to copy a missing plugin");
+            return false;
+        }
         match self.capture_slot_state(location, target, slot) {
             Some(copied) => {
                 self.clipboard = Some(PluginClipboard {
@@ -2467,6 +2488,10 @@ impl Controller {
             tracing::warn!("paste with empty clipboard");
             return false;
         };
+        if clipboard.slot.missing {
+            tracing::warn!("refusing to paste a missing plugin");
+            return false;
+        }
         self.insert_plugin_slot(location, target, clipboard.slot)
     }
 
@@ -3871,5 +3896,14 @@ mod sidechain_order_tests {
         let model = model_with_sidechain(true);
         let (_, delayed) = compute_strip_order(&model, 2);
         assert!(delayed[0][0][0], "self-sidechain consumer must be delayed");
+    }
+
+    #[test]
+    fn missing_plugin_is_flagged_in_state() {
+        let mut plugin = PluginSlot::new(PluginId(0), "http://example.com/gone");
+        plugin.missing = true;
+        let list = plugin_list_json(&[plugin], &[], |_, _| 0.0);
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0]["missing"], serde_json::json!(true));
     }
 }
