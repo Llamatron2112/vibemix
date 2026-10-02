@@ -346,7 +346,14 @@ char* vst3_scan(const char* dir) {
             if (path.extension() != ".vst3") continue;
             std::string error;
             auto module = Hosting::Module::create(path.string(), error);
-            if (!module) continue;
+            if (!module) {
+                // A bundle that cannot be loaded is skipped. Report why, so a
+                // broken install (unresolved symbols, missing shared library)
+                // shows up instead of silently vanishing from the catalog.
+                std::fprintf(stderr, "[vst3] cannot load %s: %s\n", path.string().c_str(),
+                             error.c_str());
+                continue;
+            }
             auto factory = module->getFactory();
             for (const auto& ci : factory.classInfos()) {
                 if (ci.category() != kVstAudioEffectClass) continue;
@@ -372,7 +379,12 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     if (!bundle) return nullptr;
     std::string error;
     auto module = Hosting::Module::create(bundle, error);
-    if (!module) return nullptr;
+    if (!module) {
+        if (std::getenv("VIBEMIX_VST3_DEBUG")) {
+            std::fprintf(stderr, "[vst3] module create failed: %s\n", error.c_str());
+        }
+        return nullptr;
+    }
     auto factory = module->getFactory();
 
     bool have = false;
@@ -393,12 +405,23 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
             break;
         }
     }
-    if (!have) return nullptr;
+    if (!have) {
+        if (std::getenv("VIBEMIX_VST3_DEBUG")) {
+            const auto& infos = factory.classInfos();
+            std::fprintf(stderr, "[vst3] no audio effect class (total %zu)\n", infos.size());
+            for (const auto& ci : infos) {
+                std::fprintf(stderr, "[vst3] class '%s' category '%s'\n", ci.name().c_str(),
+                             ci.category().c_str());
+            }
+        }
+        return nullptr;
+    }
 
     auto* hosted = new Hosted(module, factory);
     PluginContextFactory::instance().setPluginContext(&hosted->host_app);
     hosted->provider = std::make_unique<PlugProvider>(factory, chosen);
     if (!hosted->provider->initialize()) {
+        if (std::getenv("VIBEMIX_VST3_DEBUG")) std::fprintf(stderr, "[vst3] provider initialize failed\n");
         delete hosted;
         return nullptr;
     }
@@ -418,12 +441,14 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
         }
     }
     if (!hosted->component) {
+        if (std::getenv("VIBEMIX_VST3_DEBUG")) std::fprintf(stderr, "[vst3] component is null\n");
         delete hosted;
         return nullptr;
     }
     hosted->component->queryInterface(IAudioProcessor::iid,
                                       reinterpret_cast<void**>(&hosted->processor));
     if (!hosted->processor) {
+        if (std::getenv("VIBEMIX_VST3_DEBUG")) std::fprintf(stderr, "[vst3] processor is null\n");
         delete hosted;
         return nullptr;
     }
