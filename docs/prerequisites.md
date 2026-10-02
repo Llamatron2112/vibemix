@@ -135,6 +135,8 @@ pw-metadata -n settings 0 clock.force-quantum 0   # reset to auto
 | `sord-devel` | `sord` |
 | `sratom-devel` | `sratom` |
 | `suil-devel` | `suil` |
+| `mesa-libGL-devel` | `libglvnd` |
+| `libX11-devel` | `libx11` |
 | `pipewire-jack-audio-connection-kit-devel` | `pipewire-jack` |
 | `lld` | `lld` |
 
