@@ -109,11 +109,6 @@ ApplicationWindow {
         copy[id] = next
         meterSource = copy
     }
-    function peakDb(id, source) {
-        var left = root.stripLevel(id, source, 0)
-        var right = root.stripLevel(id, source, 1)
-        return 20 * Math.log10(Math.max(left, right, 1.0e-6))
-    }
     function busLevel(id, source, channel) {
         var entry = levels.buses[id]
         if (!entry) return 0
@@ -131,12 +126,6 @@ ApplicationWindow {
         copy[id] = next
         busMeterSource = copy
     }
-    function busPeakDb(id, source) {
-        var left = root.busLevel(id, source, 0)
-        var right = root.busLevel(id, source, 1)
-        return 20 * Math.log10(Math.max(left, right, 1.0e-6))
-    }
-    function formatDb(db) { return Math.max(db, -60).toFixed(1) }
     function gainText(gain) {
         if (gain <= 1.0e-4) return "-inf dB"
         var db = 20 * Math.log10(gain)
@@ -3420,14 +3409,6 @@ ApplicationWindow {
                                         levelR: root.stripLevel(stripCard.stripData.id, stripMeter.source, 1)
                                     }
 
-                                    Label {
-                                        text: root.formatDb(root.peakDb(stripCard.stripData.id, stripMeter.source))
-                                        color: root.mutedText
-                                        font.pixelSize: 8
-                                        font.family: "monospace"
-                                        Layout.alignment: Qt.AlignHCenter
-                                    }
-
                                     FlatButton {
                                         text: root.meterSourceLabel(stripCard.stripData.id)
                                         implicitHeight: 18
@@ -3794,11 +3775,6 @@ ApplicationWindow {
                                         onMoved: (value) => backend.setBusGain(busCard.busData.id, value)
                                     }
 
-                                    Item {
-                                        Layout.preferredWidth: 1
-                                        Layout.preferredHeight: busMeterValue.implicitHeight
-                                    }
-
                                     ToggleChip {
                                         text: "M"
                                         implicitWidth: 18
@@ -3822,15 +3798,6 @@ ApplicationWindow {
                                         Layout.alignment: Qt.AlignHCenter
                                         levelL: root.busLevel(busCard.busData.id, busMeter.source, 0)
                                         levelR: root.busLevel(busCard.busData.id, busMeter.source, 1)
-                                    }
-
-                                    Label {
-                                        id: busMeterValue
-                                        text: root.formatDb(root.busPeakDb(busCard.busData.id, busMeter.source))
-                                        color: root.mutedText
-                                        font.pixelSize: 8
-                                        font.family: "monospace"
-                                        Layout.alignment: Qt.AlignHCenter
                                     }
 
                                     FlatButton {
