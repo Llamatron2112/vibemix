@@ -32,8 +32,8 @@ static XRUNS: AtomicU32 = AtomicU32::new(0);
 static CLIPBOARD: Mutex<(bool, u32, String)> = Mutex::new((false, 0, String::new()));
 static EDIT_STATE: Mutex<(u32, u32, String, String)> =
     Mutex::new((0, 0, String::new(), String::new()));
-type ClockState = (bool, bool, f32, f32, f32, f32);
-static CLOCK: Mutex<ClockState> = Mutex::new((false, false, 120.0, 0.0, 0.0, 4.0));
+type ClockState = (bool, bool, f32, f32, f32, f32, f32, u32);
+static CLOCK: Mutex<ClockState> = Mutex::new((false, false, 120.0, 0.0, 0.0, 4.0, 0.0, 0));
 
 // Revision counters so the 30 Hz poll only clones/re-serialises the large
 // payloads (structure, values, catalog, meters) when they actually changed.
@@ -321,9 +321,20 @@ fn receive_loop(socket: UdpSocket) {
                     beats,
                     seconds,
                     beats_per_bar,
+                    jitter_bpm,
+                    glitches,
                 }) => {
                     if let Ok(mut guard) = CLOCK.lock() {
-                        *guard = (locked, playing, bpm, beats, seconds, beats_per_bar);
+                        *guard = (
+                            locked,
+                            playing,
+                            bpm,
+                            beats,
+                            seconds,
+                            beats_per_bar,
+                            jitter_bpm,
+                            glitches,
+                        );
                     }
                 }
                 Some(ControlMessage::Meters(data)) => {
@@ -1011,7 +1022,7 @@ impl Default for BackendRust {
             redo_depth: 0,
             undo_label: QString::from(""),
             redo_label: QString::from(""),
-            clock: QString::from("{\"locked\":false,\"playing\":false,\"bpm\":120,\"beats\":0,\"seconds\":0,\"beats_per_bar\":4}"),
+            clock: QString::from("{\"locked\":false,\"playing\":false,\"bpm\":120,\"beats\":0,\"seconds\":0,\"beats_per_bar\":4,\"jitter_bpm\":0,\"glitches\":0}"),
             catalog_ready: false,
             scan_running: false,
             scan_done: 0,
@@ -1130,7 +1141,9 @@ impl qobject::Backend {
             self.as_mut().set_redo_label(QString::from(edit.3.as_str()));
         }
         if let Ok(clock) = CLOCK.lock() {
-            let snapshot = (clock.0, clock.1, clock.2, clock.3, clock.4, clock.5);
+            let snapshot = (
+                clock.0, clock.1, clock.2, clock.3, clock.4, clock.5, clock.6, clock.7,
+            );
             let changed = LAST_CLOCK
                 .lock()
                 .map(|last| *last != Some(snapshot))
@@ -1143,6 +1156,8 @@ impl qobject::Backend {
                     "beats": clock.3,
                     "seconds": clock.4,
                     "beats_per_bar": clock.5,
+                    "jitter_bpm": clock.6,
+                    "glitches": clock.7,
                 })
                 .to_string();
                 self.as_mut().set_clock(QString::from(json.as_str()));

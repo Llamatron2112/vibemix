@@ -287,6 +287,9 @@ pub struct TransportUi {
     /// Host-tempo (BPM) readout in the transport bar.
     #[serde(default = "default_true")]
     pub bpm: bool,
+    /// MIDI clock stability (tempo jitter + glitches) readout.
+    #[serde(default = "default_true")]
+    pub stability: bool,
     #[serde(default)]
     pub time: bool,
     #[serde(default)]
@@ -311,6 +314,7 @@ impl Default for TransportUi {
         Self {
             beats: true,
             bpm: true,
+            stability: true,
             time: false,
             loop_indicator: false,
             loop_bars: false,

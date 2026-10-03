@@ -520,7 +520,9 @@ CC; a matching `MidiOut` (feedback) is deferred.
   **Time computing method = Tempo**).
 - **Transport:** `0xFA` Start (reset position), `0xFB` Continue (resume), `0xFC`
   Stop (hold position), optional `0xF2` Song Position; a "locked" state with a
-  timeout when clock stops.
+  timeout when clock stops. Inter-pulse intervals are kept in a short window to
+  publish tempo jitter (std-dev of the instantaneous BPM) and a glitch count
+  (missed or extra pulses).
 - **Control surface:** incoming CC is matched against a per-session binding table
   (fixed, lock-free, applied on the audio thread) and drives strip fader (gain),
   pan, mute, solo, bus fader (gain), bus mute, send gain/delay, and plugin
@@ -528,11 +530,14 @@ CC; a matching `MidiOut` (feedback) is deferred.
   are consumed (others are forwarded to plugins), and bindings are learnable and
   saved in the session.
 - **UI:** the top status bar shows an always-on host-BPM readout (dimmed until
-  the clock locks), and has a right-click menu to toggle counters (beats:bars
-  since start, minutes:seconds, loop indicator) and open a small loop-settings
-  popup (unit beats/bars, value, beats-per-bar). The engine publishes
-  `{ locked, playing, bpm, beats_since_start, seconds_since_start }` at meter
-  rate; counter/loop settings live in the session.
+  the clock locks) and a colour-coded clock-stability readout (tempo jitter in
+  ±BPM plus a count of glitchy pulses); both are toggled from a right-click
+  menu, which also toggles the beats:bars and minutes:seconds counters and
+  opens a small loop-settings popup (unit beats/bars, value, beats-per-bar).
+  In beats mode the loop indicator groups its cells by bar with a wider gap
+  between bars. The engine publishes `{ locked, playing, bpm, beats_since_start,
+  seconds_since_start, jitter_bpm, glitches }` at meter rate; counter/loop
+  settings live in the session.
 - **Channels:** each strip and bus owns an optional MIDI channel ("any", or
   1-16) set from the bindings grid; its fader/pan/mute/solo/send bindings
   listen on that channel (several strips may share one, and mixer bindings

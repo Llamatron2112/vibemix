@@ -523,6 +523,8 @@ impl Controller {
                 beats: clock.beats as f32,
                 seconds: clock.seconds as f32,
                 beats_per_bar: self.params.beats_per_bar(),
+                jitter_bpm: clock.jitter_bpm,
+                glitches: clock.glitches,
             };
             if let Ok(bytes) = message.encode() {
                 let _ = self.socket.send_to(&bytes, address);

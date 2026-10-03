@@ -939,6 +939,8 @@ pub struct SharedClock {
     bpm: AtomicU32,
     beats: AtomicU64,
     frames: AtomicU64,
+    jitter_bpm: AtomicU32,
+    glitches: AtomicU32,
 }
 
 #[derive(Clone, Copy, Default)]
@@ -948,6 +950,8 @@ pub struct ClockSnapshot {
     pub bpm: f32,
     pub beats: f64,
     pub seconds: f64,
+    pub jitter_bpm: f32,
+    pub glitches: u32,
 }
 
 impl SharedClock {
@@ -958,15 +962,19 @@ impl SharedClock {
             bpm: AtomicU32::new(120.0f32.to_bits()),
             beats: AtomicU64::new(0f64.to_bits()),
             frames: AtomicU64::new(0),
+            jitter_bpm: AtomicU32::new(0.0f32.to_bits()),
+            glitches: AtomicU32::new(0),
         }
     }
 
-    pub fn publish(&self, locked: bool, playing: bool, bpm: f32, beats: f64, frames: u64) {
-        self.locked.store(locked, Ordering::Relaxed);
-        self.playing.store(playing, Ordering::Relaxed);
-        self.bpm.store(bpm.to_bits(), Ordering::Relaxed);
-        self.beats.store(beats.to_bits(), Ordering::Relaxed);
-        self.frames.store(frames, Ordering::Relaxed);
+    pub fn publish(&self, clock: &crate::midi::Clock) {
+        self.locked.store(clock.locked, Ordering::Relaxed);
+        self.playing.store(clock.playing, Ordering::Relaxed);
+        self.bpm.store(clock.bpm.to_bits(), Ordering::Relaxed);
+        self.beats.store(clock.beats.to_bits(), Ordering::Relaxed);
+        self.frames.store(clock.frames_since_start, Ordering::Relaxed);
+        self.jitter_bpm.store(clock.jitter_bpm.to_bits(), Ordering::Relaxed);
+        self.glitches.store(clock.glitches, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self, sample_rate: f32) -> ClockSnapshot {
@@ -981,6 +989,8 @@ impl SharedClock {
             } else {
                 0.0
             },
+            jitter_bpm: f32::from_bits(self.jitter_bpm.load(Ordering::Relaxed)),
+            glitches: self.glitches.load(Ordering::Relaxed),
         }
     }
 }

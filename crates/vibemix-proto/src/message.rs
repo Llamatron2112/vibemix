@@ -217,6 +217,8 @@ pub enum ControlMessage {
         beats: f32,
         seconds: f32,
         beats_per_bar: f32,
+        jitter_bpm: f32,
+        glitches: u32,
     },
     SetBeatsPerBar {
         value: f32,
@@ -682,6 +684,8 @@ impl ControlMessage {
                 beats,
                 seconds,
                 beats_per_bar,
+                jitter_bpm,
+                glitches,
             } => OscMessage {
                 addr: addr::CLOCK.to_string(),
                 args: vec![
@@ -691,6 +695,8 @@ impl ControlMessage {
                     OscType::Float(*beats),
                     OscType::Float(*seconds),
                     OscType::Float(*beats_per_bar),
+                    OscType::Float(*jitter_bpm),
+                    OscType::Int(*glitches as i32),
                 ],
             },
             SetBeatsPerBar { value } => OscMessage {
@@ -1060,6 +1066,8 @@ impl ControlMessage {
                 beats: float(args, 3)?,
                 seconds: float(args, 4)?,
                 beats_per_bar: float(args, 5)?,
+                jitter_bpm: float(args, 6)?,
+                glitches: int(args, 7)?.max(0) as u32,
             }),
             addr::CLOCK_BEATS_PER_BAR => Some(ControlMessage::SetBeatsPerBar {
                 value: float(args, 0)?,
@@ -1521,6 +1529,20 @@ mod tests {
     fn roundtrip_state_snapshot() {
         roundtrip(ControlMessage::State {
             json: "{\"name\":\"test\"}".to_string(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_clock() {
+        roundtrip(ControlMessage::Clock {
+            locked: true,
+            playing: true,
+            bpm: 140.5,
+            beats: 12.25,
+            seconds: 3.5,
+            beats_per_bar: 4.0,
+            jitter_bpm: 0.37,
+            glitches: 2,
         });
     }
 

@@ -963,13 +963,7 @@ impl ProcessHandler for MixerGraph {
         self.clock.set_sample_rate(self.sample_rate);
         self.clock.process_block(self.midi.as_slice(), frames);
         self.position = self.clock.position();
-        self.shared_clock.publish(
-            self.clock.locked,
-            self.clock.playing,
-            self.clock.bpm,
-            self.clock.beats,
-            self.clock.frames_since_start,
-        );
+        self.shared_clock.publish(&self.clock);
 
         // When MIDI sync is off, drop system realtime/transport messages so
         // plugins don't receive clock (notes/CC are still forwarded).

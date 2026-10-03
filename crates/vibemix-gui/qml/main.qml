@@ -276,12 +276,13 @@ ApplicationWindow {
 
     function transportUi() {
         var t = mix.transport_ui
-        return t ? t : ({ beats: true, bpm: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8 })
+        return t ? t : ({ beats: true, bpm: true, stability: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8 })
     }
     function setTransportUi(patch) {
         var t = root.transportUi()
         var next = {
-            beats: t.beats, bpm: t.bpm, time: t.time, loop_indicator: t.loop_indicator,
+            beats: t.beats, bpm: t.bpm, stability: t.stability, time: t.time,
+            loop_indicator: t.loop_indicator,
             loop_bars: t.loop_bars, loop_length: t.loop_length
         }
         for (var k in patch) next[k] = patch[k]
@@ -291,6 +292,35 @@ ApplicationWindow {
     function beatsPerBar() {
         var bpb = root.clockInfo().beats_per_bar
         return bpb > 0 ? bpb : 4
+    }
+    // Number of beats in a bar, as an integer, for grouping the loop indicator.
+    function loopBeatsPerBar() {
+        return Math.max(1, Math.round(root.beatsPerBar()))
+    }
+    // MIDI clock stability: tempo jitter (std-dev of instantaneous BPM) and the
+    // number of glitchy (missed/extra) pulses in the recent window.
+    function stabilityText() {
+        var c = root.clockInfo()
+        if (!c.locked) return "±— BPM"
+        var jitter = (c.jitter_bpm !== undefined) ? c.jitter_bpm : 0
+        var glitches = (c.glitches !== undefined) ? c.glitches : 0
+        var text = "±" + Number(jitter).toFixed(2) + " BPM"
+        if (glitches > 0) text += " · " + glitches + (glitches === 1 ? " glitch" : " glitches")
+        return text
+    }
+    function stabilityColor() {
+        var c = root.clockInfo()
+        if (!c.locked) return root.mutedText
+        var jitter = (c.jitter_bpm !== undefined) ? c.jitter_bpm : 0
+        var glitches = (c.glitches !== undefined) ? c.glitches : 0
+        if (glitches > 0 || jitter >= 5.0) return "#e53935"
+        if (jitter >= 2.0) return "#f9a825"
+        return "#43a047"
+    }
+    function stabilityTooltip() {
+        var c = root.clockInfo()
+        if (!c.locked) return "waiting for MIDI clock"
+        return "MIDI clock tempo jitter and glitchy (missed/extra) pulses over the last ~4 beats"
     }
     function beatCounter() {
         var c = root.clockInfo()
@@ -611,6 +641,20 @@ ApplicationWindow {
                     }
 
                     Label {
+                        id: stabilityReadout
+                        visible: root.transportUi().stability && backend.clock.length > 0
+                        text: root.stabilityText()
+                        color: root.stabilityColor()
+                        font.pixelSize: 11
+                        font.family: "monospace"
+
+                        HoverHandler { id: stabilityHover }
+                        ToolTip.visible: stabilityHover.hovered
+                        ToolTip.text: root.stabilityTooltip()
+                        ToolTip.delay: 300
+                    }
+
+                    Label {
                         visible: root.transportUi().beats
                         text: root.beatCounter()
                         color: backend.clock.indexOf("\"locked\":true") >= 0 ? root.textColor : root.mutedText
@@ -634,15 +678,29 @@ ApplicationWindow {
                     }
 
                     Row {
+                        id: loopIndicator
                         visible: root.transportUi().loop_indicator && backend.clock.length > 0
-                        spacing: 2
+                        spacing: 0
 
+                        // Cells are loop units. In beats mode the first beat of
+                        // every bar carries a wider gap on its left, so bars read
+                        // as groups; in bars mode each cell is already a bar.
                         Repeater {
                             model: root.loopInfo().count
-                            Rectangle {
-                                width: 6
+
+                            Item {
+                                property int gap: root.transportUi().loop_bars
+                                    ? 2
+                                    : ((index > 0 && index % root.loopBeatsPerBar() === 0) ? 6 : 2)
+                                width: 6 + (index === 0 ? 0 : gap)
                                 height: 6
-                                color: index <= root.loopInfo().index ? root.accentColor : root.borderColor
+
+                                Rectangle {
+                                    width: 6
+                                    height: 6
+                                    anchors.right: parent.right
+                                    color: index <= root.loopInfo().index ? root.accentColor : root.borderColor
+                                }
                             }
                         }
                     }
@@ -680,6 +738,12 @@ ApplicationWindow {
                         checkable: true
                         checked: root.transportUi().bpm
                         onTriggered: root.setTransportUi({ bpm: !root.transportUi().bpm })
+                    }
+                    MenuItem {
+                        text: "Clock stability readout"
+                        checkable: true
+                        checked: root.transportUi().stability
+                        onTriggered: root.setTransportUi({ stability: !root.transportUi().stability })
                     }
                     MenuItem {
                         text: "Beats:bars counter"

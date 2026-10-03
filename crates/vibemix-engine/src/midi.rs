@@ -60,6 +60,9 @@ const CONTINUE: u8 = 0xFB;
 const STOP: u8 = 0xFC;
 const RESET: u8 = 0xFF;
 
+/// Number of inter-pulse intervals kept for the tempo-jitter/glitch estimate.
+const JITTER_WINDOW: usize = 96;
+
 /// Tracks position and tempo from incoming 24 PPQN MIDI clock.
 pub struct Clock {
     pub playing: bool,
@@ -69,12 +72,19 @@ pub struct Clock {
     pub frames_since_start: u64,
     pub abs_frame: i64,
     pub pulses: u64,
+    /// Standard deviation of the instantaneous tempo over the recent window.
+    pub jitter_bpm: f32,
+    /// Pulses in the recent window whose interval was far from the mean.
+    pub glitches: u32,
     beats_per_bar: f32,
     sample_rate: f32,
     last_pulse_abs: i64,
     last_seen_abs: i64,
     interval_avg: f64,
     interval_count: u32,
+    interval_window: [f64; JITTER_WINDOW],
+    interval_len: usize,
+    interval_pos: usize,
 }
 
 impl Clock {
@@ -87,6 +97,8 @@ impl Clock {
             frames_since_start: 0,
             abs_frame: 0,
             pulses: 0,
+            jitter_bpm: 0.0,
+            glitches: 0,
             beats_per_bar: if beats_per_bar > 0.0 {
                 beats_per_bar
             } else {
@@ -97,6 +109,9 @@ impl Clock {
             last_seen_abs: -1,
             interval_avg: 0.0,
             interval_count: 0,
+            interval_window: [0.0; JITTER_WINDOW],
+            interval_len: 0,
+            interval_pos: 0,
         }
     }
 
@@ -110,6 +125,54 @@ impl Clock {
         if sample_rate > 0.0 {
             self.sample_rate = sample_rate;
         }
+    }
+
+    /// Appends one inter-pulse interval and refreshes the jitter/glitch stats.
+    fn push_interval(&mut self, interval: f64) {
+        self.interval_window[self.interval_pos] = interval;
+        self.interval_pos = (self.interval_pos + 1) % JITTER_WINDOW;
+        if self.interval_len < JITTER_WINDOW {
+            self.interval_len += 1;
+        }
+        self.update_stability();
+    }
+
+    fn reset_stability(&mut self) {
+        self.interval_len = 0;
+        self.interval_pos = 0;
+        self.jitter_bpm = 0.0;
+        self.glitches = 0;
+    }
+
+    /// Tempo jitter (std-dev of the instantaneous BPM) and pulse glitches over
+    /// the recent window. Allocation-free so it can run on the audio thread.
+    fn update_stability(&mut self) {
+        let n = self.interval_len;
+        if n == 0 {
+            self.jitter_bpm = 0.0;
+            self.glitches = 0;
+            return;
+        }
+        let window = &self.interval_window[..n];
+        let mean = window.iter().sum::<f64>() / n as f64;
+        if mean <= 0.0 {
+            return;
+        }
+        // Instantaneous tempo from each pulse period, in BPM.
+        let scale = 60.0 * self.sample_rate as f64 / 24.0;
+        let mean_bpm = window.iter().map(|&iv| scale / iv).sum::<f64>() / n as f64;
+        let mut variance = 0.0;
+        let mut glitches = 0u32;
+        for &iv in window {
+            let bpm = scale / iv;
+            let delta = bpm - mean_bpm;
+            variance += delta * delta;
+            if iv < 0.5 * mean || iv > 1.5 * mean {
+                glitches += 1;
+            }
+        }
+        self.jitter_bpm = (variance / n as f64).sqrt() as f32;
+        self.glitches = glitches;
     }
 
     /// Process a block's MIDI events (with frame offsets) and advance time.
@@ -139,6 +202,7 @@ impl Clock {
                             if bpm.is_finite() && (20.0..=400.0).contains(&bpm) {
                                 self.bpm = bpm as f32;
                             }
+                            self.push_interval(interval);
                         }
                     }
                     self.last_pulse_abs = abs;
@@ -152,6 +216,7 @@ impl Clock {
                     self.last_pulse_abs = -1;
                     self.interval_avg = 0.0;
                     self.interval_count = 0;
+                    self.reset_stability();
                 }
                 CONTINUE => self.playing = true,
                 STOP => self.playing = false,
@@ -214,6 +279,32 @@ mod tests {
         let clock = clock_at(120.0, 48000.0);
         assert!((clock.bpm - 120.0).abs() < 1.0, "bpm={}", clock.bpm);
         assert!(clock.locked);
+    }
+
+    #[test]
+    fn reports_tempo_jitter_and_glitches() {
+        let sample_rate = 48000.0f32;
+        let interval = (sample_rate as f64 * 60.0 / (120.0 * 24.0)).round() as usize;
+        let mut clock = Clock::new(sample_rate, 4.0);
+        clock.playing = true;
+        for _ in 0..50 {
+            clock.process_block(&[MidiEvent::new(0, &[CLOCK])], interval);
+        }
+        assert!(clock.jitter_bpm < 0.01, "jitter={}", clock.jitter_bpm);
+        assert_eq!(clock.glitches, 0);
+
+        // Alternating short/long pulses show up as tempo jitter, not glitches.
+        for i in 0..24 {
+            let step = if i % 2 == 0 { interval + 20 } else { interval - 20 };
+            clock.process_block(&[MidiEvent::new(0, &[CLOCK])], step);
+        }
+        assert!(clock.jitter_bpm > 0.1, "jitter={}", clock.jitter_bpm);
+        assert_eq!(clock.glitches, 0);
+
+        // A dropped pulse (one 3x-long block, then a normal pulse) is a glitch.
+        clock.process_block(&[MidiEvent::new(0, &[CLOCK])], interval * 3);
+        clock.process_block(&[MidiEvent::new(0, &[CLOCK])], interval);
+        assert!(clock.glitches >= 1, "glitches={}", clock.glitches);
     }
 
     #[test]
