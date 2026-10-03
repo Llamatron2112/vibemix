@@ -276,12 +276,12 @@ ApplicationWindow {
 
     function transportUi() {
         var t = mix.transport_ui
-        return t ? t : ({ beats: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8 })
+        return t ? t : ({ beats: true, bpm: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8 })
     }
     function setTransportUi(patch) {
         var t = root.transportUi()
         var next = {
-            beats: t.beats, time: t.time, loop_indicator: t.loop_indicator,
+            beats: t.beats, bpm: t.bpm, time: t.time, loop_indicator: t.loop_indicator,
             loop_bars: t.loop_bars, loop_length: t.loop_length
         }
         for (var k in patch) next[k] = patch[k]
@@ -597,6 +597,20 @@ ApplicationWindow {
                     spacing: 8
 
                     Label {
+                        id: bpmReadout
+                        visible: root.transportUi().bpm
+                        text: root.clockInfo().bpm.toFixed(1) + " BPM"
+                        color: root.clockInfo().locked ? root.textColor : root.mutedText
+                        font.pixelSize: 11
+                        font.family: "monospace"
+
+                        HoverHandler { id: bpmHover }
+                        ToolTip.visible: bpmHover.hovered
+                        ToolTip.text: root.clockInfo().locked ? "host tempo (MIDI clock)" : "no MIDI clock"
+                        ToolTip.delay: 300
+                    }
+
+                    Label {
                         visible: root.transportUi().beats
                         text: root.beatCounter()
                         color: backend.clock.indexOf("\"locked\":true") >= 0 ? root.textColor : root.mutedText
@@ -661,6 +675,12 @@ ApplicationWindow {
 
                 Menu {
                     id: transportMenu
+                    MenuItem {
+                        text: "Tempo (BPM) readout"
+                        checkable: true
+                        checked: root.transportUi().bpm
+                        onTriggered: root.setTransportUi({ bpm: !root.transportUi().bpm })
+                    }
                     MenuItem {
                         text: "Beats:bars counter"
                         checkable: true

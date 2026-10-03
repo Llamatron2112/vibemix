@@ -27,6 +27,7 @@
 #include "pluginterfaces/vst/ivstaudioprocessor.h"
 #include "pluginterfaces/vst/ivstcomponent.h"
 #include "pluginterfaces/vst/ivsteditcontroller.h"
+#include "pluginterfaces/vst/ivstmidicontrollers.h"
 #include "pluginterfaces/vst/ivstprocesscontext.h"
 
 using namespace Steinberg;
@@ -695,6 +696,105 @@ void vst3_run(void* handle, int frames) {
     hosted->changes.clearQueue();
     hosted->out_changes.clearQueue();
     hosted->events.clear();
+}
+
+/// Publishes the host transport to the plugin's `ProcessContext` for the next
+/// `vst3_run`. Tempo-synced plugins (delays, LFOs, arpeggiators) read `tempo`,
+/// `projectTimeMusic` and the `kPlaying` state from here.
+void vst3_set_position(void* handle, double project_time_music, double bar_position_music,
+                       double tempo, int32 time_sig_num, int32 time_sig_den,
+                       long long continuous_samples, long long project_time_samples,
+                       int playing) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted) return;
+    ProcessContext& ctx = hosted->context;
+    ctx.state = (playing ? ProcessContext::kPlaying : 0)
+        | ProcessContext::kProjectTimeMusicValid
+        | ProcessContext::kBarPositionValid
+        | ProcessContext::kTempoValid
+        | ProcessContext::kTimeSigValid
+        | ProcessContext::kContTimeValid;
+    ctx.projectTimeMusic = project_time_music;
+    ctx.barPositionMusic = bar_position_music;
+    ctx.tempo = tempo;
+    ctx.timeSigNumerator = time_sig_num;
+    ctx.timeSigDenominator = time_sig_den;
+    ctx.continousTimeSamples = continuous_samples;
+    ctx.projectTimeSamples = project_time_samples;
+}
+
+/// Queues one raw MIDI channel message for the next `vst3_run`. System realtime
+/// messages (clock/start/stop) carry no VST3 event and are conveyed by
+/// `vst3_set_position` instead.
+void vst3_midi_event(void* handle, int32 sample_offset, int32 status, int32 d1, int32 d2) {
+    auto* hosted = static_cast<Hosted*>(handle);
+    if (!hosted || !hosted->processor) return;
+
+    const int32 kind = status & 0xF0;
+    const int16 channel = static_cast<int16>(status & 0x0F);
+    Event event {};
+    event.busIndex = 0;
+    event.sampleOffset = sample_offset;
+    event.ppqPosition = 0.0;
+    event.flags = Event::kIsLive;
+
+    switch (kind) {
+    case 0x90:
+        if ((d2 & 0x7F) > 0) {
+            event.type = Event::kNoteOnEvent;
+            event.noteOn.channel = channel;
+            event.noteOn.pitch = static_cast<int16>(d1 & 0x7F);
+            event.noteOn.velocity = static_cast<float>(d2 & 0x7F) / 127.0f;
+            event.noteOn.noteId = -1;
+            break;
+        }
+        [[fallthrough]];
+    case 0x80:
+        event.type = Event::kNoteOffEvent;
+        event.noteOff.channel = channel;
+        event.noteOff.pitch = static_cast<int16>(d1 & 0x7F);
+        event.noteOff.velocity = static_cast<float>(d2 & 0x7F) / 127.0f;
+        event.noteOff.noteId = -1;
+        break;
+    case 0xA0:
+        event.type = Event::kPolyPressureEvent;
+        event.polyPressure.channel = channel;
+        event.polyPressure.pitch = static_cast<int16>(d1 & 0x7F);
+        event.polyPressure.pressure = static_cast<float>(d2 & 0x7F) / 127.0f;
+        event.polyPressure.noteId = -1;
+        break;
+    case 0xB0:
+        event.type = Event::kLegacyMIDICCOutEvent;
+        event.midiCCOut.controlNumber = static_cast<uint8>(d1 & 0x7F);
+        event.midiCCOut.channel = static_cast<int8>(channel);
+        event.midiCCOut.value = static_cast<int8>(d2 & 0x7F);
+        event.midiCCOut.value2 = 0;
+        break;
+    case 0xC0:
+        event.type = Event::kLegacyMIDICCOutEvent;
+        event.midiCCOut.controlNumber = kCtrlProgramChange;
+        event.midiCCOut.channel = static_cast<int8>(channel);
+        event.midiCCOut.value = static_cast<int8>(d1 & 0x7F);
+        event.midiCCOut.value2 = 0;
+        break;
+    case 0xD0:
+        event.type = Event::kLegacyMIDICCOutEvent;
+        event.midiCCOut.controlNumber = kAfterTouch;
+        event.midiCCOut.channel = static_cast<int8>(channel);
+        event.midiCCOut.value = static_cast<int8>(d1 & 0x7F);
+        event.midiCCOut.value2 = 0;
+        break;
+    case 0xE0:
+        event.type = Event::kLegacyMIDICCOutEvent;
+        event.midiCCOut.controlNumber = kPitchBend;
+        event.midiCCOut.channel = static_cast<int8>(channel);
+        event.midiCCOut.value = static_cast<int8>(d1 & 0x7F);
+        event.midiCCOut.value2 = static_cast<int8>(d2 & 0x7F);
+        break;
+    default:
+        return; // system / realtime messages handled via the process context
+    }
+    hosted->events.addEvent(event);
 }
 
 /// Writes a description of the plugin's editor support to `out`.

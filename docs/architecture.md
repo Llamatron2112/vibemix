@@ -509,10 +509,15 @@ generates clock. A single JACK `MidiIn` port carries clock, transport, notes and
 CC; a matching `MidiOut` (feedback) is deferred.
 
 - **Host tempo:** each block a `time:Position` atom (`frame`, `beat`, `bar`,
-  `barBeat`, `beatsPerMinute`) is forged into every atom input port that
-  `atom:supports time:Position`, and the `time:tempo` instantiate option is
-  provided, so tempo-synced effects (e.g. LSP delays) follow the clock. Incoming
-  MIDI is also forwarded to plugin atom inputs that support `midi:MidiEvent`.
+  `barBeat`, `beatsPerMinute`, `beatsPerBar`, `beatUnit`, `speed`) is forged into
+  every atom input port that `atom:supports time:Position`, so tempo-synced
+  effects (e.g. LSP delays) follow the clock. Incoming MIDI is also forwarded to
+  plugin atom inputs that support `midi:MidiEvent`, and to VST3 plugins as
+  channel events (`IEventList`). VST3 tempo/transport is published through the
+  process context (`tempo`, `projectTimeMusic`, `kPlaying`), so VST3 tempo-synced
+  effects (e.g. ZamDelay) follow the clock too. Plugins with their own sync
+  switch still need it enabled (LSP's flanger/phaser require **Tempo sync** plus
+  **Time computing method = Tempo**).
 - **Transport:** `0xFA` Start (reset position), `0xFB` Continue (resume), `0xFC`
   Stop (hold position), optional `0xF2` Song Position; a "locked" state with a
   timeout when clock stops.
@@ -522,11 +527,12 @@ CC; a matching `MidiOut` (feedback) is deferred.
   parameters/bypass. Absolute and relative encoders are supported, matched CCs
   are consumed (others are forwarded to plugins), and bindings are learnable and
   saved in the session.
-- **UI:** the top status bar has a right-click menu to toggle counters
-  (beats:bars since start, minutes:seconds, loop indicator) and open a small
-  loop-settings popup (unit beats/bars, value, beats-per-bar). The engine
-  publishes `{ locked, playing, bpm, beats_since_start, seconds_since_start }`
-  at meter rate; counter/loop settings live in the session.
+- **UI:** the top status bar shows an always-on host-BPM readout (dimmed until
+  the clock locks), and has a right-click menu to toggle counters (beats:bars
+  since start, minutes:seconds, loop indicator) and open a small loop-settings
+  popup (unit beats/bars, value, beats-per-bar). The engine publishes
+  `{ locked, playing, bpm, beats_since_start, seconds_since_start }` at meter
+  rate; counter/loop settings live in the session.
 - **Channels:** each strip and bus owns an optional MIDI channel ("any", or
   1-16) set from the bindings grid; its fader/pan/mute/solo/send bindings
   listen on that channel (several strips may share one, and mixer bindings

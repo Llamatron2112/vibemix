@@ -112,9 +112,22 @@ impl PluginNode for vibemix_vst3::PluginInstance {
         self.set_control(param, value)
     }
 
-    fn write_midi(&mut self, _events: &[MidiEvent]) {}
+    fn write_midi(&mut self, events: &[MidiEvent]) {
+        for event in events {
+            self.midi_event(event.time, event.as_slice());
+        }
+    }
 
-    fn write_position(&mut self, _position: &TimePosition) {}
+    fn write_position(&mut self, position: &TimePosition) {
+        self.set_position(
+            position.frame,
+            position.beat,
+            position.bar,
+            position.beats_per_minute,
+            position.beats_per_bar,
+            position.speed,
+        );
+    }
 
     fn run(&mut self, frames: usize) {
         self.run(frames)

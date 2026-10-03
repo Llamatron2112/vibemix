@@ -284,6 +284,9 @@ fn default_beats_per_bar() -> f32 {
 pub struct TransportUi {
     #[serde(default = "default_true")]
     pub beats: bool,
+    /// Host-tempo (BPM) readout in the transport bar.
+    #[serde(default = "default_true")]
+    pub bpm: bool,
     #[serde(default)]
     pub time: bool,
     #[serde(default)]
@@ -307,6 +310,7 @@ impl Default for TransportUi {
     fn default() -> Self {
         Self {
             beats: true,
+            bpm: true,
             time: false,
             loop_indicator: false,
             loop_bars: false,

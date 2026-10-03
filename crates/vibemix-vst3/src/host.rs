@@ -68,6 +68,24 @@ extern "C" {
     ) -> c_int;
     fn vst3_set_param(handle: *mut c_void, index: c_int, normalized: f32);
     fn vst3_get_param(handle: *mut c_void, index: c_int) -> f32;
+    fn vst3_set_position(
+        handle: *mut c_void,
+        project_time_music: f64,
+        bar_position_music: f64,
+        tempo: f64,
+        time_sig_num: c_int,
+        time_sig_den: c_int,
+        continuous_samples: i64,
+        project_time_samples: i64,
+        playing: c_int,
+    );
+    fn vst3_midi_event(
+        handle: *mut c_void,
+        sample_offset: c_int,
+        status: c_int,
+        d1: c_int,
+        d2: c_int,
+    );
     fn vst3_run(handle: *mut c_void, frames: c_int);
     fn vst3_status(
         handle: *mut c_void,
@@ -328,6 +346,58 @@ impl PluginInstance {
     pub fn run(&mut self, frames: usize) {
         let frames = frames.min(self.max_frames) as c_int;
         unsafe { vst3_run(self.handle, frames) };
+    }
+
+    /// Publishes the host transport for the next [`run`](Self::run): musical
+    /// position (quarter notes), tempo, time signature and play state. Plugins
+    /// that sync to host tempo read this from the VST3 `ProcessContext`.
+    pub fn set_position(
+        &mut self,
+        frame: i64,
+        beat: f64,
+        bar: i64,
+        bpm: f32,
+        beats_per_bar: f32,
+        speed: f32,
+    ) {
+        let playing = speed > 0.0;
+        let numerator = beats_per_bar.round().clamp(1.0, 32.0) as c_int;
+        unsafe {
+            vst3_set_position(
+                self.handle,
+                beat,
+                bar as f64 * beats_per_bar as f64,
+                bpm as f64,
+                numerator,
+                4,
+                frame,
+                frame,
+                playing as c_int,
+            )
+        };
+    }
+
+    /// Queues one raw MIDI channel message for the next [`run`](Self::run).
+    /// System realtime messages (clock/start/stop) are ignored here; tempo and
+    /// transport are conveyed through [`set_position`](Self::set_position).
+    pub fn midi_event(&mut self, time: i64, bytes: &[u8]) {
+        let Some(&status) = bytes.first() else {
+            return;
+        };
+        if status >= 0xF0 {
+            return;
+        }
+        let d1 = bytes.get(1).copied().unwrap_or(0);
+        let d2 = bytes.get(2).copied().unwrap_or(0);
+        unsafe {
+            vst3_midi_event(
+                self.handle,
+                time as c_int,
+                status as c_int,
+                d1 as c_int,
+                d2 as c_int,
+            )
+        };
     }
 
     /// Component state as an opaque byte blob (empty when the plugin has none).

@@ -13,11 +13,17 @@ pub struct AtomUrids {
     pub time_bar_beat: u32,
     pub time_beats_per_minute: u32,
     pub time_beats_per_bar: u32,
+    pub time_beat_unit: u32,
     pub time_speed: u32,
     pub atom_long: u32,
     pub atom_double: u32,
     pub atom_float: u32,
+    pub atom_int: u32,
 }
+
+/// Beat unit used in the host `time:Position`: quarter notes (4), matching the
+/// quarter-note `beats` derived from the incoming 24 PPQN clock.
+pub const TIME_BEAT_UNIT_QUARTER: u32 = 4;
 
 /// A single incoming MIDI message with its frame offset within the block.
 /// Fixed-size so the audio thread never allocates.
@@ -151,6 +157,13 @@ impl<'a> SequenceWriter<'a> {
             &position.beats_per_bar.to_ne_bytes(),
         );
         push_property(&mut body, &mut len, urids.time_speed, urids.atom_float, &position.speed.to_ne_bytes());
+        push_property(
+            &mut body,
+            &mut len,
+            urids.time_beat_unit,
+            urids.atom_int,
+            &TIME_BEAT_UNIT_QUARTER.to_ne_bytes(),
+        );
 
         if len > body.len() {
             return false;
@@ -273,10 +286,12 @@ mod tests {
             time_bar_beat: 34,
             time_beats_per_minute: 35,
             time_beats_per_bar: 36,
+            time_beat_unit: 38,
             time_speed: 37,
             atom_long: 40,
             atom_double: 41,
             atom_float: 42,
+            atom_int: 43,
         }
     }
 
@@ -319,6 +334,22 @@ mod tests {
         None
     }
 
+    fn find_int_property(body: &[u8], key: u32) -> Option<u32> {
+        let mut offset = 8; // id + otype
+        while offset + 16 <= body.len() {
+            let prop_key = u32::from_ne_bytes(body[offset..offset + 4].try_into().unwrap());
+            let size = u32::from_ne_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            if prop_key == key && size == 4 {
+                return Some(u32::from_ne_bytes(
+                    body[offset + 16..offset + 20].try_into().unwrap(),
+                ));
+            }
+            let stride = align8(16 + size);
+            offset += stride;
+        }
+        None
+    }
+
     #[test]
     fn position_properties_use_lv2_layout() {
         let mut buffer = vec![0u64; 128].into_boxed_slice();
@@ -341,6 +372,9 @@ mod tests {
         let body = &events[0].2;
         let bpm = find_float_property(body, urids().time_beats_per_minute).expect("bpm property");
         assert!((bpm - 135.0).abs() < 1e-6, "bpm={bpm}");
+        let beat_unit =
+            find_int_property(body, urids().time_beat_unit).expect("beatUnit property");
+        assert_eq!(beat_unit, TIME_BEAT_UNIT_QUARTER);
     }
 
     #[test]

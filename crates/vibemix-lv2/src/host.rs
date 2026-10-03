@@ -22,12 +22,14 @@ const ATOM_OBJECT: &str = "http://lv2plug.in/ns/ext/atom#Object";
 const ATOM_LONG: &str = "http://lv2plug.in/ns/ext/atom#Long";
 const ATOM_DOUBLE: &str = "http://lv2plug.in/ns/ext/atom#Double";
 const ATOM_FLOAT: &str = "http://lv2plug.in/ns/ext/atom#Float";
+const ATOM_INT: &str = "http://lv2plug.in/ns/ext/atom#Int";
 const TIME_FRAME: &str = "http://lv2plug.in/ns/ext/time#frame";
 const TIME_BEAT: &str = "http://lv2plug.in/ns/ext/time#beat";
 const TIME_BAR: &str = "http://lv2plug.in/ns/ext/time#bar";
 const TIME_BAR_BEAT: &str = "http://lv2plug.in/ns/ext/time#barBeat";
 const TIME_BPM: &str = "http://lv2plug.in/ns/ext/time#beatsPerMinute";
 const TIME_BEATS_PER_BAR: &str = "http://lv2plug.in/ns/ext/time#beatsPerBar";
+const TIME_BEAT_UNIT: &str = "http://lv2plug.in/ns/ext/time#beatUnit";
 const TIME_SPEED: &str = "http://lv2plug.in/ns/ext/time#speed";
 
 const OPTIONS_URI: &[u8] = b"http://lv2plug.in/ns/ext/options#options\0";
@@ -557,10 +559,12 @@ impl Host {
             time_bar_beat: self.urid.map(TIME_BAR_BEAT),
             time_beats_per_minute: self.urid.map(TIME_BPM),
             time_beats_per_bar: self.urid.map(TIME_BEATS_PER_BAR),
+            time_beat_unit: self.urid.map(TIME_BEAT_UNIT),
             time_speed: self.urid.map(TIME_SPEED),
             atom_long: self.urid.map(ATOM_LONG),
             atom_double: self.urid.map(ATOM_DOUBLE),
             atom_float: self.urid.map(ATOM_FLOAT),
+            atom_int: self.urid.map(ATOM_INT),
         };
         // Atom buffer indices (inputs come first in `atom_buffers`).
         let midi_buffers: Vec<usize> = midi_inputs
@@ -973,15 +977,22 @@ impl PluginInstance {
         }
     }
 
-    /// Replaces the host `time:Position` delivered to this instance.
+    /// Replaces the host `time:Position` delivered to this instance. When the
+    /// same atom buffer also receives MIDI (a port declaring both
+    /// `midi:MidiEvent` and `time:Position`), the MIDI events written by
+    /// [`write_midi`](Self::write_midi) earlier this block are preserved: the
+    /// position is appended after them instead of clearing the sequence.
     pub fn write_position(&mut self, position: &TimePosition) {
         if self.time_buffers.is_empty() {
             return;
         }
         let urids = self.urids;
         for &index in &self.time_buffers {
+            let shared = self.midi_buffers.contains(&index);
             let buffer = &mut self.atom_buffers[index];
-            crate::atom::clear_sequence(buffer);
+            if !shared {
+                crate::atom::clear_sequence(buffer);
+            }
             let mut writer = SequenceWriter::new(buffer);
             writer.append_position(0, position, &urids);
             writer.finish();
