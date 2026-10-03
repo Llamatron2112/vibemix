@@ -3,7 +3,7 @@ pub mod backend;
 use std::pin::Pin;
 
 use cxx_qt::casting::Upcast;
-use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QQmlEngine, QUrl};
+use cxx_qt_lib::{QGuiApplication, QQmlApplicationEngine, QQmlEngine, QString, QUrl};
 
 fn main() {
     for arg in std::env::args().skip(1) {
@@ -37,6 +37,14 @@ fn main() {
     }
 
     let mut app = QGuiApplication::new();
+
+    // Wayland/XDG and KDE X11 identify a window by the base name of its
+    // desktop entry; without this Qt falls back to the executable name
+    // ("vibemix-gui"), which has no .desktop file, so compositors show a
+    // generic window icon. "vibemix" matches packaging/vibemix.desktop,
+    // whose Icon= resolves to the installed hicolor SVG.
+    QGuiApplication::set_desktop_file_name(&QString::from("vibemix"));
+
     let mut engine = QQmlApplicationEngine::new();
 
     if let Some(engine) = engine.as_mut() {

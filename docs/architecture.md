@@ -260,6 +260,15 @@ Each plugin window is created with `WM_CLASS=vibemix-gui` (matching
 `_NET_WM_NAME` set to the plugin's name, so desktop environments group it under
 the vibemix application/icon rather than a generic one.
 
+The main GUI window takes the other route: it calls
+`QGuiApplication::setDesktopFileName("vibemix")`, so the Wayland `app_id`
+(and the X11 `_KDE_NET_WM_DESKTOP_FILE` property) match
+`packaging/vibemix.desktop` and the compositor resolves `Icon=vibemix`. Without
+it Qt falls back to the executable basename (`vibemix-gui`), for which no
+desktop entry exists, and the window gets a generic icon. `StartupWMClass`
+cannot cover this on Wayland: the icon is looked up from the desktop file
+identified by `app_id`, not from `WM_CLASS`.
+
 The engine calls `XInitThreads()` before its first Xlib call. Plugin UIs such
 as LSP's X11/GL toolkit use Xlib from multiple threads and call `XInitThreads`
 themselves, but that is only effective if it happens first; otherwise their
