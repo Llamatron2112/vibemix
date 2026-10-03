@@ -20,7 +20,7 @@ and a Qt Quick GUI that talk over a small OSC control protocol.
 ## Build
 
 Prerequisites are listed in [docs/prerequisites.md](docs/prerequisites.md)
-(Fedora packages, Arch mapping, Qt/cxx-qt and JACK/PipeWire notes).
+(Arch packages, Fedora mapping, Qt/cxx-qt and JACK/PipeWire notes).
 
 ```bash
 just build            # debug

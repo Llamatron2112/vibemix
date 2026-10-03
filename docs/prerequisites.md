@@ -1,26 +1,37 @@
 # Prerequisites
 
-Target platform: Fedora 44 (KDE, PipeWire). Arch package names are mapped at the bottom.
+Target platform: Arch Linux (KDE, PipeWire). Fedora package names are mapped at
+the bottom.
 
 ## Install
 
 ```bash
-sudo dnf install cargo cmake ninja-build gcc-c++ \
-  qt6-qtbase-devel qt6-qtdeclarative-devel qt6-qtquickcontrols2-devel \
-  lv2-devel lilv-devel serd-devel sord-devel sratom-devel suil-devel \
-  pipewire-jack-audio-connection-kit-devel lld
+sudo pacman -S --needed base-devel rust cmake ninja lld \
+  qt6-base qt6-declarative \
+  lv2 lilv serd sord sratom suil pipewire-jack libglvnd libx11
 ```
 
 Notes:
 
-- `serd-devel` is required at build time by the `lilv` crate (its `build.rs` probes `lilv-0 >= 0.24.2` and `serd-0 >= 0.30.0`).
-- `qt6-qtquickcontrols2-devel` is required by `cxx-qt-lib`'s `qt_full` feature.
-- `lld` provides a fast linker; Qt's Cargo link step fails with the default `ld.bfd`.
-- `clang` / `libclang` are **not** required for `cxx-qt` (a C++17 compiler is enough).
-- Optional LV2 test plugins: `sudo dnf install calf lsp-plugins-lv2 x42-plugins zam-plugins`.
-- Optional **GTK plugin UIs** (e.g. Calf's GTK2 GUI, packaged separately on some
-  distros): `gtk2` and/or `gtk3` at runtime. Nothing is linked against at build
-  time; the engine `dlopen`s GTK and simply skips GTK UIs when it is missing.
+- `base-devel` provides `gcc`/`g++`, `make` and `pkgconf`; `rust` includes
+  `cargo`.
+- `serd` is required at build time by the `lilv` crate (its `build.rs` probes
+  `lilv-0 >= 0.24.2` and `serd-0 >= 0.30.0`).
+- `qt6-declarative` ships Qt Quick Controls 2 (there is no separate
+  `qt6-quickcontrols2` package on Arch) and is required by `cxx-qt-lib`'s
+  `qt_full` feature.
+- `lld` provides a fast linker; Qt's Cargo link step fails with the default
+  `ld.bfd`.
+- `clang` / `libclang` are **not** required for `cxx-qt` (a C++17 compiler is
+  enough).
+- Do **not** install `jack2`: it conflicts with `pipewire-jack`, which already
+  ships the JACK headers, `libjack.so` and `jack.pc`.
+- Optional LV2 test plugins: `sudo pacman -S calf lsp-plugins-lv2 x42-plugins
+  zam-plugins`.
+- Optional **GTK plugin UIs** (e.g. Calf's GTK2 GUI): `gtk3` is in the official
+  repos, while `gtk2` is **AUR-only**, so Calf's GTK2 UI needs it built from
+  the AUR. Nothing is linked against at build time; the engine `dlopen`s GTK
+  and simply skips GTK UIs when it is missing.
 
 ## Verify
 
@@ -30,23 +41,25 @@ Notes:
 | Cargo | `cargo --version` | matches rustc |
 | C/C++ | `g++ --version` | >= C++17 |
 | CMake / Ninja | `cmake --version`, `ninja --version` | present |
-| Qt6 base dev | `ls /usr/lib64/cmake/Qt6Core/Qt6CoreConfig.cmake` | exists |
-| Qt6 QML dev | `ls /usr/lib64/cmake/Qt6Qml/Qt6QmlConfig.cmake` | exists |
-| Qt6 tools | `ls /usr/lib64/qt6/bin/qmake6` | exists |
+| Qt6 base dev | `ls /usr/lib/cmake/Qt6Core/Qt6CoreConfig.cmake` | exists |
+| Qt6 QML dev | `ls /usr/lib/cmake/Qt6Qml/Qt6QmlConfig.cmake` | exists |
+| Qt6 tools | `ls /usr/bin/qmake6` | exists |
 | LV2 | `pkg-config --modversion lv2` | present |
 | lilv / serd | `pkg-config --modversion lilv-0 serd-0` | present |
 | sord / sratom / suil | `pkg-config --modversion sord-0 sratom-0 suil-0` | present |
 | JACK headers | `pkg-config --modversion jack` | provided by pipewire-jack |
-| JACK lib | `ldconfig -p \| grep libjack.so.0` | `/usr/lib64/pipewire-0.3/jack/` |
+| JACK lib | `ldconfig -p \| grep libjack.so.0` | `/usr/lib/pipewire-0.3/jack/` |
 | Server | `systemctl --user is-active pipewire wireplumber` | `active` |
 | Graph tools | `pw-link -l` | lists ports |
+| QML lint | `qmllint --version` | present (Arch names it `qmllint`, not `qmllint6`) |
 
 ## cxx-qt build environment
 
-`cxx-qt-build` locates Qt via `qmake`. Fedora ships it as `qmake6`, so set one of:
+`cxx-qt-build` locates Qt via `qmake`. On Arch `qmake6` is on `PATH`, so Qt is
+detected automatically; set one of the following to be explicit:
 
 ```bash
-export QMAKE=/usr/lib64/qt6/bin/qmake6
+export QMAKE=/usr/bin/qmake6
 # or
 export QT_VERSION_MAJOR=6
 ```
@@ -118,29 +131,32 @@ pw-metadata -n settings 0 clock.force-quantum 256
 pw-metadata -n settings 0 clock.force-quantum 0   # reset to auto
 ```
 
-## Arch package mapping
+## Fedora package mapping
 
-| Fedora | Arch |
+| Arch | Fedora |
 |---|---|
-| `rust` + `cargo` | `rust` (includes cargo) |
-| `gcc-c++` | `gcc` |
+| `rust` (includes cargo) | `rust` + `cargo` |
+| `gcc` | `gcc-c++` |
 | `cmake` | `cmake` |
-| `ninja-build` | `ninja` |
-| `qt6-qtbase-devel` | `qt6-base` |
-| `qt6-qtdeclarative-devel` | `qt6-declarative` |
-| `qt6-qtquickcontrols2-devel` | `qt6-quickcontrols2` |
-| `lv2-devel` | `lv2` |
-| `lilv-devel` | `lilv` |
-| `serd-devel` | `serd` |
-| `sord-devel` | `sord` |
-| `sratom-devel` | `sratom` |
-| `suil-devel` | `suil` |
-| `mesa-libGL-devel` | `libglvnd` |
-| `libX11-devel` | `libx11` |
-| `pipewire-jack-audio-connection-kit-devel` | `pipewire-jack` |
+| `ninja` | `ninja-build` |
+| `qt6-base` | `qt6-qtbase-devel` |
+| `qt6-declarative` | `qt6-qtdeclarative-devel` |
+| `qt6-declarative` (ships Quick Controls 2) | `qt6-qtquickcontrols2-devel` |
+| `lv2` | `lv2-devel` |
+| `lilv` | `lilv-devel` |
+| `serd` | `serd-devel` |
+| `sord` | `sord-devel` |
+| `sratom` | `sratom-devel` |
+| `suil` | `suil-devel` |
+| `libglvnd` | `mesa-libGL-devel` |
+| `libx11` | `libX11-devel` |
+| `pipewire-jack` | `pipewire-jack-audio-connection-kit-devel` |
 | `lld` | `lld` |
 
-Arch's `pipewire-jack` ships JACK headers, `libjack.so` and `jack.pc` in one package. Do not also install `jack2`.
+Arch's `pipewire-jack` ships JACK headers, `libjack.so` and `jack.pc` in one
+package. Do not also install `jack2`. Fedora's
+`pipewire-jack-audio-connection-kit-devel` plays the same role; do not install
+`jack-audio-connection-kit`.
 
 ## Submodules
 
