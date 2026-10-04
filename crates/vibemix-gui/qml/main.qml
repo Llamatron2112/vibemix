@@ -22,6 +22,22 @@ ApplicationWindow {
         id: backend
     }
 
+    // Auto-fit (Options menu): while enabled, drive the window size from the
+    // mixer content, clamped to the screen's available area. Inactive otherwise
+    // so the window stays freely resizable, and while maximized.
+    Binding {
+        target: root
+        property: "width"
+        when: root.transportUi().autosize && root.visibility !== Window.Maximized
+        value: Math.min(content.implicitWidth, Screen.desktopAvailableWidth)
+    }
+    Binding {
+        target: root
+        property: "height"
+        when: root.transportUi().autosize && root.visibility !== Window.Maximized
+        value: Math.min(appMenuBar.height + content.implicitHeight, Screen.desktopAvailableHeight)
+    }
+
     readonly property int stripBody: 76
     readonly property int pluginRowHeight: 18
     readonly property int pluginFrame: pluginRowHeight * 2 + 6
@@ -276,14 +292,15 @@ ApplicationWindow {
 
     function transportUi() {
         var t = mix.transport_ui
-        return t ? t : ({ beats: true, bpm: true, stability: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8 })
+        return t ? t : ({ beats: true, bpm: true, stability: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8, autosize: false })
     }
     function setTransportUi(patch) {
         var t = root.transportUi()
         var next = {
             beats: t.beats, bpm: t.bpm, stability: t.stability, time: t.time,
             loop_indicator: t.loop_indicator,
-            loop_bars: t.loop_bars, loop_length: t.loop_length
+            loop_bars: t.loop_bars, loop_length: t.loop_length,
+            autosize: t.autosize
         }
         for (var k in patch) next[k] = patch[k]
         backend.setTransportUi(JSON.stringify(next))
@@ -596,7 +613,7 @@ ApplicationWindow {
         }
 
         Menu {
-            title: "MIDI"
+            title: "Options"
             MenuItem {
                 text: "MIDI sync"
                 checkable: true
@@ -609,6 +626,13 @@ ApplicationWindow {
                 text: "MIDI bindings…"
                 enabled: backend.connected
                 onTriggered: midiBindingsWindow.show()
+            }
+            MenuSeparator { }
+            MenuItem {
+                text: "Auto-fit window to content"
+                checkable: true
+                checked: root.transportUi().autosize
+                onTriggered: root.setTransportUi({ autosize: !root.transportUi().autosize })
             }
         }
 
@@ -867,6 +891,8 @@ ApplicationWindow {
             var geometry
             try { geometry = JSON.parse(backend.window_geometry) } catch (error) { return }
             if (!geometry || geometry.width <= 0 || geometry.height <= 0) return
+            // With auto-fit on, the size bindings own the window dimensions.
+            if (root.transportUi().autosize) return
             root.width = Math.max(root.minimumWidth, geometry.width)
             root.height = Math.max(root.minimumHeight, geometry.height)
             root.visibility = geometry.maximized ? Window.Maximized : Window.Windowed
@@ -3745,6 +3771,7 @@ ApplicationWindow {
                             MenuSeparator { }
                             MenuItem {
                                 text: "Mix to master"
+                                visible: busCard.busData.id !== 0
                                 checkable: true
                                 checked: busCard.busData.mix_to_master === true
                                 onTriggered: backend.setBusMixMaster(

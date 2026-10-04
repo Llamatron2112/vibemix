@@ -2656,7 +2656,7 @@ mod tests {
         );
         assert_eq!(
             bus_port_bases(&model).get(&0).map(String::as_str),
-            Some("master")
+            Some("Master")
         );
     }
 }

@@ -3860,10 +3860,17 @@ fn load_session(path: &str) -> Result<MixerModel, String> {
         tracing::warn!(%error, %path, "session read failed");
         error.to_string()
     })?;
-    toml::from_str(&text).map_err(|error| {
+    let mut model: MixerModel = toml::from_str(&text).map_err(|error| {
         tracing::warn!(%error, %path, "session parse failed");
         error.to_string()
-    })
+    })?;
+    // Sessions saved before the master bus was capitalised still say "master".
+    if let Some(master) = model.buses.iter_mut().find(|bus| bus.id.0 == 0) {
+        if master.name == "master" {
+            master.name = "Master".to_string();
+        }
+    }
+    Ok(model)
 }
 
 #[cfg(test)]

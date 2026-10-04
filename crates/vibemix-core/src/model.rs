@@ -299,6 +299,9 @@ pub struct TransportUi {
     pub loop_bars: bool,
     #[serde(default = "default_loop_length")]
     pub loop_length: u32,
+    /// Auto-fit the window to the mixer content (Options menu).
+    #[serde(default)]
+    pub autosize: bool,
 }
 
 fn default_true() -> bool {
@@ -319,6 +322,7 @@ impl Default for TransportUi {
             loop_indicator: false,
             loop_bars: false,
             loop_length: 8,
+            autosize: false,
         }
     }
 }
@@ -382,7 +386,7 @@ impl MixerModel {
 
     pub fn default_minimal() -> Self {
         let mut model = Self::new("untitled");
-        let mut master = Bus::new(BusId(0), "master");
+        let mut master = Bus::new(BusId(0), "Master");
         master.id = BusId(0);
         model.buses.push(master);
 
@@ -503,7 +507,7 @@ mod tests {
         assert_eq!(parsed.strips.len(), 1);
         assert_eq!(parsed.buses.len(), 1);
         assert_eq!(parsed.strips[0].name, "ch 1");
-        assert_eq!(parsed.buses[0].name, "master");
+        assert_eq!(parsed.buses[0].name, "Master");
         assert_eq!(parsed.strips[0].input_gain_db, 12.0);
         assert_eq!(parsed.strips[0].plugins_post.len(), 1);
         assert_eq!(
