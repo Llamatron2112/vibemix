@@ -157,6 +157,29 @@ more CPU and xrun risk; pick what the interface and session can sustain. Verify
 the running values with `pw-top` (QUANT / RATE / ERR columns) and, for the
 engine, its startup log line `engine running sample_rate=… buffer_size=…`.
 
+### Realtime scheduling
+
+Small quanta rely on the audio threads getting realtime scheduling. PipeWire
+gets it from `module-rt`; without the required privileges it falls back to RTKit,
+which caps the priority at 20. Grant the user/process realtime scheduling using
+whatever your distro provides (a `realtime` group with its limits entry, RTKit,
+or `setcap`), then start a new session. With privileges in place `module-rt`
+applies the configured `rt.prio` directly (88 in the stock config).
+
+Verify with:
+
+```bash
+ulimit -r                                              # > 0; 0 means RTKit fallback
+ps -eLo class,rtprio,comm | grep -E "pipewire|vibemix" # FF threads at a high prio
+```
+
+The PipeWire data loop should be `FF` at the configured priority, and while
+vibemix runs its `data-loop.0` thread (which runs the audio callback) should be
+`FF` as well. A `mod.rt: could not set nice-level …` journal message is harmless
+once the threads are `FF`: realtime scheduling does not need a negative nice,
+only priority. Note that `renice`/`chrt` on the vibemix process itself does not
+change the audio callback's scheduling — it is PipeWire's data thread.
+
 ## Fedora package mapping
 
 | Arch | Fedora |
