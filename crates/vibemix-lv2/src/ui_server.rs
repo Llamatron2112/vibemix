@@ -5,23 +5,104 @@
 //! not running the PipeWire data-loop. Building a toolkit UI here therefore
 //! cannot stall audio.
 //!
+//! The host shares the engine's URID map: it is seeded with the engine's whole
+//! table when it connects, and asks the engine to map any URI it has not seen
+//! (see `UiMessage::UridRequest`). A UI and its plugin must agree on URIDs to
+//! exchange atoms.
+//!
 //! Run on a single thread (the "main" thread for GTK): messages are drained,
 //! then every open window is pumped.
 
 use std::collections::HashMap;
+use std::ffi::{CStr, CString};
 use std::io::Read;
-use std::os::raw::c_void;
+use std::os::raw::{c_char, c_void};
 use std::os::unix::io::{AsRawFd, RawFd};
 use std::os::unix::net::UnixStream;
+use std::time::{Duration, Instant};
 
 use crate::ui::{self, UiCandidate, UiKind, UiWindow};
 use crate::ui_ipc::{self, FrameBuffer, UiMessage};
-use crate::urid::UridMap;
 
 struct HostedUi {
     id: u32,
     fd: RawFd,
     window: Option<UiWindow>,
+}
+
+struct Host {
+    fd: RawFd,
+    stream: UnixStream,
+    frames: FrameBuffer,
+    pending: Vec<UiMessage>,
+    uis: HashMap<u32, Box<HostedUi>>,
+    /// URI -> URID, seeded from the engine and extended on miss.
+    urid_by_uri: HashMap<String, u32>,
+    /// URID -> URI string kept alive for `unmap`.
+    urid_cstr: HashMap<u32, CString>,
+    running: bool,
+}
+
+impl Host {
+    fn read_available(&mut self, read_buf: &mut [u8]) {
+        loop {
+            match self.stream.read(read_buf) {
+                Ok(0) => {
+                    self.running = false;
+                    break;
+                }
+                Ok(count) => self.frames.push(&read_buf[..count]),
+                Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
+                Err(_) => {
+                    self.running = false;
+                    break;
+                }
+            }
+        }
+    }
+
+    fn remember(&mut self, uri: &str, urid: u32) {
+        if let Ok(value) = CString::new(uri) {
+            self.urid_cstr.insert(urid, value);
+        }
+        self.urid_by_uri.insert(uri.to_string(), urid);
+    }
+
+    /// The engine's URID for `uri`, asking it (and blocking) on a table miss so
+    /// the UI and plugin always agree.
+    fn map_uri(&mut self, uri: &str) -> u32 {
+        if let Some(&urid) = self.urid_by_uri.get(uri) {
+            return urid;
+        }
+        let _ = send(self.fd, &UiMessage::UridRequest { uri: uri.to_string() });
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            while let Some(message) = self.frames.pop() {
+                match message {
+                    UiMessage::UridReply { uri: got, urid } if got == uri => {
+                        self.remember(&got, urid);
+                        return urid;
+                    }
+                    other => self.pending.push(other),
+                }
+            }
+            if Instant::now() >= deadline {
+                return 0;
+            }
+            let mut read_buf = [0u8; 65536];
+            self.read_available(&mut read_buf);
+            if self.frames.is_empty() {
+                poll_fd(self.fd, libc::POLLIN, 20);
+            }
+        }
+    }
+
+    fn unmap_uri(&self, urid: u32) -> *const c_char {
+        self.urid_cstr
+            .get(&urid)
+            .map(|value| value.as_ptr())
+            .unwrap_or(std::ptr::null())
+    }
 }
 
 fn poll_fd(fd: RawFd, events: libc::c_short, timeout_ms: i32) -> bool {
@@ -59,6 +140,23 @@ fn send(fd: RawFd, message: &UiMessage) -> std::io::Result<()> {
     Ok(())
 }
 
+extern "C" fn proxy_urid_map(user: *mut c_void, uri: *const c_char) -> u32 {
+    if user.is_null() || uri.is_null() {
+        return 0;
+    }
+    let host = unsafe { &mut *(user as *mut Host) };
+    let uri = unsafe { CStr::from_ptr(uri) }.to_string_lossy().into_owned();
+    host.map_uri(&uri)
+}
+
+extern "C" fn proxy_urid_unmap(user: *mut c_void, urid: u32) -> *const c_char {
+    if user.is_null() {
+        return std::ptr::null();
+    }
+    let host = unsafe { &*(user as *const Host) };
+    host.unmap_uri(urid)
+}
+
 extern "C" fn host_write(
     user: *mut c_void,
     port: u32,
@@ -88,6 +186,7 @@ extern "C" fn host_write(
 
 #[allow(clippy::too_many_arguments)]
 fn open_ui(
+    host: *mut Host,
     id: u32,
     plugin_uri: String,
     ui_uri: String,
@@ -95,12 +194,8 @@ fn open_ui(
     bundle: String,
     binary: String,
     title: String,
-    scale: f32,
-    update_rate: f32,
-    fd: RawFd,
-    uis: &mut HashMap<u32, Box<HostedUi>>,
 ) {
-    let _ = (scale, update_rate);
+    let fd = unsafe { (*host).fd };
     let Some(kind) = UiKind::from_ui_type(&ui_type) else {
         let _ = send(
             fd,
@@ -127,8 +222,10 @@ fn open_ui(
     });
     let user = &mut *hosted as *mut HostedUi as *mut c_void;
     let window = unsafe {
-        ui::open(
-            UridMap::shared(),
+        ui::open_with_urid(
+            host as *mut c_void,
+            proxy_urid_map,
+            proxy_urid_unmap,
             &plugin_uri,
             &candidate,
             std::ptr::null_mut(),
@@ -138,10 +235,11 @@ fn open_ui(
             &title,
         )
     };
+    let host = unsafe { &mut *host };
     match window {
         Some(window) => {
             hosted.window = Some(window);
-            uis.insert(id, hosted);
+            host.uis.insert(id, hosted);
             let _ = send(fd, &UiMessage::Opened { id });
         }
         None => {
@@ -156,7 +254,7 @@ fn open_ui(
     }
 }
 
-fn handle(message: UiMessage, fd: RawFd, uis: &mut HashMap<u32, Box<HostedUi>>, running: &mut bool) {
+fn handle(host: *mut Host, message: UiMessage) {
     match message {
         UiMessage::Open {
             id,
@@ -166,53 +264,40 @@ fn handle(message: UiMessage, fd: RawFd, uis: &mut HashMap<u32, Box<HostedUi>>, 
             bundle,
             binary,
             title,
-            scale,
-            update_rate,
+            ..
         } => {
-            uis.remove(&id);
-            open_ui(
-                id,
-                plugin_uri,
-                ui_uri,
-                ui_type,
-                bundle,
-                binary,
-                title,
-                scale,
-                update_rate,
-                fd,
-                uis,
-            );
+            open_ui(host, id, plugin_uri, ui_uri, ui_type, bundle, binary, title);
+        }
+        UiMessage::UridTable { entries } => {
+            let host = unsafe { &mut *host };
+            for (uri, urid) in entries {
+                host.remember(&uri, urid);
+            }
         }
         UiMessage::PortEvent {
             id,
             port,
             format,
-            type_uri,
-            mut bytes,
+            bytes,
+            ..
         } => {
-            let Some(hosted) = uis.get(&id) else {
-                return;
-            };
-            let mut format = format;
-            if let Some(uri) = &type_uri {
-                // The engine's URIDs are process-local; remap the atom type into
-                // this process and rewrite the payload header to match.
-                let urid = UridMap::shared().map(uri);
-                ui_ipc::rewrite_atom_type(&mut bytes, urid);
-                format = urid;
-            }
-            if let Some(window) = &hosted.window {
-                window.port_event(port, bytes.len() as u32, format, &bytes);
+            let host = unsafe { &mut *host };
+            if let Some(hosted) = host.uis.get(&id) {
+                if let Some(window) = &hosted.window {
+                    window.port_event(port, bytes.len() as u32, format, &bytes);
+                }
             }
         }
         UiMessage::Close { id } => {
-            uis.remove(&id);
+            let host = unsafe { &mut *host };
+            host.uis.remove(&id);
         }
-        UiMessage::Shutdown => *running = false,
+        UiMessage::Shutdown => unsafe { (*host).running = false },
         UiMessage::Opened { .. }
         | UiMessage::OpenFailed { .. }
         | UiMessage::Write { .. }
+        | UiMessage::UridRequest { .. }
+        | UiMessage::UridReply { .. }
         | UiMessage::CloseRequest { .. }
         | UiMessage::Title { .. } => {}
     }
@@ -224,39 +309,38 @@ pub fn run_ui_host(path: &str) -> std::io::Result<()> {
     let stream = UnixStream::connect(path)?;
     stream.set_nonblocking(true)?;
     let fd = stream.as_raw_fd();
-    let mut frames = FrameBuffer::new();
-    let mut uis: HashMap<u32, Box<HostedUi>> = HashMap::new();
-    let mut running = true;
+    let mut host = Box::new(Host {
+        fd,
+        stream,
+        frames: FrameBuffer::new(),
+        pending: Vec::new(),
+        uis: HashMap::new(),
+        urid_by_uri: HashMap::new(),
+        urid_cstr: HashMap::new(),
+        running: true,
+    });
     let mut read_buf = [0u8; 65536];
 
-    while running {
+    while host.running {
         if poll_fd(fd, libc::POLLIN, 16) {
-            loop {
-                match (&stream).read(&mut read_buf) {
-                    Ok(0) => {
-                        running = false;
-                        break;
-                    }
-                    Ok(count) => frames.push(&read_buf[..count]),
-                    Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => break,
-                    Err(_) => {
-                        running = false;
-                        break;
-                    }
-                }
-            }
+            host.read_available(&mut read_buf);
         }
-        while let Some(message) = frames.pop() {
-            handle(message, fd, &mut uis, &mut running);
+        let mut messages = std::mem::take(&mut host.pending);
+        while let Some(message) = host.frames.pop() {
+            messages.push(message);
+        }
+        for message in messages {
+            handle(&mut *host as *mut Host, message);
         }
 
-        for hosted in uis.values_mut() {
+        for hosted in host.uis.values_mut() {
             if let Some(window) = &hosted.window {
                 window.pump();
             }
         }
 
-        let closed: Vec<u32> = uis
+        let closed: Vec<u32> = host
+            .uis
             .iter()
             .filter(|(_, hosted)| {
                 hosted
@@ -268,7 +352,7 @@ pub fn run_ui_host(path: &str) -> std::io::Result<()> {
             .map(|(id, _)| *id)
             .collect();
         for id in closed {
-            uis.remove(&id);
+            host.uis.remove(&id);
             let _ = send(fd, &UiMessage::CloseRequest { id });
         }
     }

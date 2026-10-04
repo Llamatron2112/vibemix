@@ -15,7 +15,7 @@ use vibemix_core::model::{
 use crate::midi_map::target_from_code;
 use vibemix_core::model::PluginFormat;
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
-use vibemix_lv2::{find_ui, Host, SharedOutputs, UiCandidate, UiMessage, UiWindow};
+use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 
 use crate::ui_service::UiService;
 use vibemix_proto::ControlMessage;
@@ -172,6 +172,8 @@ struct UiWriteCtx {
     params: Arc<SharedParams>,
     ports: Vec<(u32, usize)>,
     outputs: Option<Arc<SharedOutputs>>,
+    /// Control→audio mailbox for UI→DSP atom events.
+    ui_inputs: Option<Arc<SharedUiInputs>>,
     last_control: Vec<Option<u32>>,
     last_atom_seq: Vec<usize>,
 }
@@ -219,19 +221,24 @@ impl UiWriteCtx {
         if self.last_atom_seq.len() != atoms {
             self.last_atom_seq = vec![usize::MAX; atoms];
         }
+        // Per the atom extension, sequence events transfer individually to the
+        // UI with `format = atom:eventTransfer`.
+        let event_transfer = vibemix_lv2::urid::UridMap::shared().map(vibemix_lv2::EVENT_TRANSFER_URI);
         for index in 0..atoms {
             let seq = outputs.atom_seq(index);
             if seq == 0 || self.last_atom_seq[index] == seq {
                 continue;
             }
-            if let Some((bytes, format)) = outputs.read_atom(index) {
+            if let Some((bytes, _)) = outputs.read_atom(index) {
                 self.last_atom_seq[index] = seq;
-                let type_uri = vibemix_lv2::urid::UridMap::shared().unmap(format);
-                events.push(OutputEvent {
-                    port: outputs.atom_port(index),
-                    format,
-                    type_uri,
-                    bytes: bytes.to_vec(),
+                let port = outputs.atom_port(index);
+                vibemix_lv2::for_each_event(&bytes, |atom| {
+                    events.push(OutputEvent {
+                        port,
+                        format: event_transfer,
+                        type_uri: None,
+                        bytes: atom.to_vec(),
+                    });
                 });
             }
         }
@@ -246,25 +253,36 @@ extern "C" fn ui_port_write(
     format: u32,
     buffer: *const std::ffi::c_void,
 ) {
-    if user.is_null() || format != 0 || size != 4 || buffer.is_null() {
+    if user.is_null() || buffer.is_null() {
         return;
     }
     let context = unsafe { &*(user as *const UiWriteCtx) };
-    let value = unsafe { *(buffer as *const f32) };
-    if let Some((_, param)) = context
-        .ports
-        .iter()
-        .find(|(port, _)| *port == port_index)
-    {
-        if let Some(chain) = strip_chain(context.location) {
-            context
-                .params
-                .set_plugin_param(context.target, chain, context.slot, *param, value);
-        } else {
-            context
-                .params
-                .set_bus_plugin_param(context.target, context.slot, *param, value);
+    if format == 0 {
+        if size != 4 {
+            return;
         }
+        let value = unsafe { *(buffer as *const f32) };
+        if let Some((_, param)) = context
+            .ports
+            .iter()
+            .find(|(port, _)| *port == port_index)
+        {
+            if let Some(chain) = strip_chain(context.location) {
+                context
+                    .params
+                    .set_plugin_param(context.target, chain, context.slot, *param, value);
+            } else {
+                context
+                    .params
+                    .set_bus_plugin_param(context.target, context.slot, *param, value);
+            }
+        }
+        return;
+    }
+    // Atom event (`atom:eventTransfer`): hand it to the audio thread.
+    if let Some(inputs) = &context.ui_inputs {
+        let bytes = unsafe { std::slice::from_raw_parts(buffer as *const u8, size as usize) };
+        inputs.push(port_index, bytes);
     }
 }
 
@@ -1782,6 +1800,11 @@ impl Controller {
         } else {
             self.engine.bus_plugin_outputs(target as usize, slot as usize)
         };
+        let ui_inputs = if let Some(chain) = strip_chain(location) {
+            self.engine.plugin_ui_inputs(target as usize, chain, slot as usize)
+        } else {
+            self.engine.bus_plugin_ui_inputs(target as usize, slot as usize)
+        };
 
         let mut context = Box::new(UiWriteCtx {
             location,
@@ -1790,6 +1813,7 @@ impl Controller {
             params: Arc::clone(&self.params),
             ports,
             outputs,
+            ui_inputs,
             last_control: Vec::new(),
             last_atom_seq: Vec::new(),
         });
@@ -2054,11 +2078,20 @@ impl Controller {
                     format,
                     bytes,
                 } => {
-                    if format != 0 || bytes.len() != 4 {
-                        continue;
+                    if format == 0 {
+                        if bytes.len() != 4 {
+                            continue;
+                        }
+                        let value = f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+                        self.apply_remote_ui_write(id, port, value);
+                    } else if let Some(inputs) = self.remote_ui_inputs(id) {
+                        // Atom event from the UI: deliver it to the plugin input.
+                        inputs.push(port, &bytes);
                     }
-                    let value = f32::from_ne_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
-                    self.apply_remote_ui_write(id, port, value);
+                }
+                UiMessage::UridRequest { uri } => {
+                    let urid = vibemix_lv2::urid::UridMap::shared().map(&uri);
+                    self.ui_service.send_urid_reply(&uri, urid);
                 }
                 UiMessage::CloseRequest { id } => {
                     let key = self.uis.iter().find_map(|(key, ui)| match ui {
@@ -2070,10 +2103,22 @@ impl Controller {
                     }
                 }
                 UiMessage::Title { .. } | UiMessage::Opened { .. } | UiMessage::OpenFailed { .. } => {}
-                UiMessage::Open { .. } | UiMessage::PortEvent { .. } | UiMessage::Close { .. }
+                UiMessage::Open { .. }
+                | UiMessage::PortEvent { .. }
+                | UiMessage::Close { .. }
+                | UiMessage::UridTable { .. }
+                | UiMessage::UridReply { .. }
                 | UiMessage::Shutdown => {}
             }
         }
+    }
+
+    /// The UI→DSP mailbox for a remote UI, if one is open.
+    fn remote_ui_inputs(&self, id: u32) -> Option<Arc<SharedUiInputs>> {
+        self.uis.values().find_map(|ui| match ui {
+            OpenUi::Lv2Remote { id: ui_id, context } if *ui_id == id => context.ui_inputs.clone(),
+            _ => None,
+        })
     }
 
     /// Folds a control-port edit made in a remote editor into the shared

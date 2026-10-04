@@ -208,12 +208,92 @@ impl Drop for UiWindow {
     }
 }
 
+/// URID map callback signature (mirrors `LV2_URID_Map::map`).
+pub type UridMapFn = extern "C" fn(*mut c_void, *const c_char) -> u32;
+/// URID unmap callback signature (mirrors `LV2_URID_Unmap::unmap`).
+pub type UridUnmapFn = extern "C" fn(*mut c_void, u32) -> *const c_char;
+
 /// # Safety
 /// `plugin_handle` must be a valid handle to a live plugin instance, and
 /// `write_user` must stay valid for as long as the returned window lives.
 #[allow(clippy::too_many_arguments)]
 pub unsafe fn open(
     urid: &'static UridMap,
+    plugin_uri: &str,
+    candidate: &UiCandidate,
+    plugin_handle: *mut c_void,
+    write_cb: PortWrite,
+    write_user: *mut c_void,
+    headless: bool,
+    title: &str,
+) -> Option<UiWindow> {
+    let (handle, map_fn, unmap_fn) = urid.parts();
+    let map = Box::new(Lv2UridMap {
+        handle,
+        map: map_fn,
+    });
+    let unmap = Box::new(Lv2UridUnmap {
+        handle,
+        unmap: unmap_fn,
+    });
+    open_inner(
+        map,
+        unmap,
+        plugin_uri,
+        candidate,
+        plugin_handle,
+        write_cb,
+        write_user,
+        headless,
+        title,
+    )
+}
+
+/// Like [`open`], but with a caller-provided URID map. The out-of-process UI
+/// host uses this to delegate mapping to the engine, so the plugin and its UI
+/// share one URID numbering.
+///
+/// # Safety
+/// Same requirements as [`open`]; additionally `urid_handle`/`map_fn`/`unmap_fn`
+/// must form a valid map/unmap pair that outlives the returned window.
+#[allow(clippy::too_many_arguments)]
+pub unsafe fn open_with_urid(
+    urid_handle: *mut c_void,
+    map_fn: UridMapFn,
+    unmap_fn: UridUnmapFn,
+    plugin_uri: &str,
+    candidate: &UiCandidate,
+    plugin_handle: *mut c_void,
+    write_cb: PortWrite,
+    write_user: *mut c_void,
+    headless: bool,
+    title: &str,
+) -> Option<UiWindow> {
+    let map = Box::new(Lv2UridMap {
+        handle: urid_handle,
+        map: map_fn,
+    });
+    let unmap = Box::new(Lv2UridUnmap {
+        handle: urid_handle,
+        unmap: unmap_fn,
+    });
+    open_inner(
+        map,
+        unmap,
+        plugin_uri,
+        candidate,
+        plugin_handle,
+        write_cb,
+        write_user,
+        headless,
+        title,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+unsafe fn open_inner(
+    mut map: Box<Lv2UridMap>,
+    mut unmap: Box<Lv2UridUnmap>,
     plugin_uri: &str,
     candidate: &UiCandidate,
     plugin_handle: *mut c_void,
@@ -229,32 +309,20 @@ pub unsafe fn open(
     let binary = CString::new(candidate.binary.as_str()).ok()?;
     let title = CString::new(title).unwrap_or_default();
 
-    let (handle, map_fn, unmap_fn) = urid.parts();
-    let mut map = Box::new(Lv2UridMap {
-        handle,
-        map: map_fn,
-    });
-    let mut unmap = Box::new(Lv2UridUnmap {
-        handle,
-        unmap: unmap_fn,
-    });
-
-    let window = unsafe {
-        vibemix_ui_open(
-            plugin.as_ptr(),
-            ui_uri.as_ptr(),
-            ui_type.as_ptr(),
-            bundle.as_ptr(),
-            binary.as_ptr(),
-            plugin_handle,
-            &mut *map as *mut Lv2UridMap as *mut c_void,
-            &mut *unmap as *mut Lv2UridUnmap as *mut c_void,
-            write_cb,
-            write_user,
-            headless as c_int,
-            title.as_ptr(),
-        )
-    };
+    let window = vibemix_ui_open(
+        plugin.as_ptr(),
+        ui_uri.as_ptr(),
+        ui_type.as_ptr(),
+        bundle.as_ptr(),
+        binary.as_ptr(),
+        plugin_handle,
+        &mut *map as *mut Lv2UridMap as *mut c_void,
+        &mut *unmap as *mut Lv2UridUnmap as *mut c_void,
+        write_cb,
+        write_user,
+        headless as c_int,
+        title.as_ptr(),
+    );
     if window.is_null() {
         return None;
     }

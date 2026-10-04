@@ -13,9 +13,10 @@ mod worker;
 /// are retested. Increment whenever a host fix could unblock a plugin.
 pub const HOST_ABI_VERSION: u32 = 3;
 
-pub use atom::{MidiEvent, TimePosition};
+pub use atom::{append_atom_event, for_each_event, MidiEvent, TimePosition, EVENT_TRANSFER_URI};
 pub use host::{ControlPort, Host, PluginInfo, PluginInstance};
 pub use state::{StateEntry, StateProxy};
 pub use ui::{find_ui, UiCandidate, UiKind, UiWindow};
 pub use ui_ipc::UiMessage;
 pub use ui_outputs::SharedOutputs;
+pub use ui_outputs::SharedUiInputs;

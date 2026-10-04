@@ -8,7 +8,7 @@ use jack::{
 };
 use rtrb::{Consumer, Producer};
 use vibemix_core::model::{BusConnections, MixerModel, PluginFormat, PluginSlot, StripConnections};
-use vibemix_lv2::{Host, MidiEvent, PluginInstance, SharedOutputs, StateEntry, StateProxy};
+use vibemix_lv2::{Host, MidiEvent, PluginInstance, SharedOutputs, SharedUiInputs, StateEntry, StateProxy};
 
 use crate::plugin::PluginNode;
 
@@ -57,6 +57,7 @@ type StripChains = [Vec<SlotPlugin>; PLUGIN_CHAINS];
 type StripProxies = [Vec<Option<SlotState>>; PLUGIN_CHAINS];
 type StripHandles = [Vec<Option<usize>>; PLUGIN_CHAINS];
 type StripOutputs = [Vec<Option<Arc<SharedOutputs>>>; PLUGIN_CHAINS];
+type StripUiInputs = [Vec<Option<Arc<SharedUiInputs>>>; PLUGIN_CHAINS];
 
 struct Built {
     strip_chains: Vec<StripChains>,
@@ -67,6 +68,8 @@ struct Built {
     bus_proxies: Vec<Vec<Option<SlotState>>>,
     bus_handles: Vec<Vec<Option<usize>>>,
     bus_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>>,
+    strip_ui_inputs: Vec<StripUiInputs>,
+    bus_ui_inputs: Vec<Vec<Option<Arc<SharedUiInputs>>>>,
 }
 
 pub enum SlotPlugin {
@@ -95,6 +98,15 @@ impl SlotPlugin {
         match self {
             SlotPlugin::Stereo(instance) => instance.outputs(),
             SlotPlugin::Mono(left, _) => left.outputs(),
+            SlotPlugin::Missing => None,
+        }
+    }
+
+    /// UI→DSP mailbox shared with the control thread.
+    fn ui_inputs(&self) -> Option<Arc<SharedUiInputs>> {
+        match self {
+            SlotPlugin::Stereo(instance) => instance.ui_inputs(),
+            SlotPlugin::Mono(left, _) => left.ui_inputs(),
             SlotPlugin::Missing => None,
         }
     }
@@ -504,6 +516,7 @@ impl MixerGraph {
                     if midi_sync {
                         instance.write_position(&position);
                     }
+                    instance.write_ui_events(midi_sync);
                     feed_sidechain(
                         &mut **instance,
                         false,
@@ -536,6 +549,7 @@ impl MixerGraph {
                         if midi_sync {
                             instance.write_position(&position);
                         }
+                        instance.write_ui_events(midi_sync);
                         feed_sidechain(
                             &mut **instance,
                             false,
@@ -597,6 +611,7 @@ impl MixerGraph {
                     if midi_sync {
                         instance.write_position(&position);
                     }
+                    instance.write_ui_events(midi_sync);
                     feed_sidechain(
                         &mut **instance,
                         true,
@@ -629,6 +644,7 @@ impl MixerGraph {
                         if midi_sync {
                             instance.write_position(&position);
                         }
+                        instance.write_ui_events(midi_sync);
                         feed_sidechain(
                             &mut **instance,
                             true,
@@ -1066,9 +1082,11 @@ pub struct JackEngine {
     state_proxies: Vec<StripProxies>,
     plugin_handles: Vec<StripHandles>,
     plugin_outputs: Vec<StripOutputs>,
+    plugin_ui_inputs: Vec<StripUiInputs>,
     bus_state_proxies: Vec<Vec<Option<SlotState>>>,
     bus_plugin_handles: Vec<Vec<Option<usize>>>,
     bus_plugin_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>>,
+    bus_plugin_ui_inputs: Vec<Vec<Option<Arc<SharedUiInputs>>>>,
     strip_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
     strip_count: usize,
     bus_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
@@ -1111,6 +1129,8 @@ impl JackEngine {
             bus_proxies: bus_state_proxies,
             bus_handles: bus_plugin_handles,
             bus_outputs: bus_plugin_outputs,
+            strip_ui_inputs: plugin_ui_inputs,
+            bus_ui_inputs: bus_plugin_ui_inputs,
         } = built;
 
         let mut strips: Vec<Option<StripPorts>> = (0..strip_count).map(|_| None).collect();
@@ -1278,9 +1298,11 @@ impl JackEngine {
             state_proxies,
             plugin_handles,
             plugin_outputs,
+            plugin_ui_inputs,
             bus_state_proxies,
             bus_plugin_handles,
             bus_plugin_outputs,
+            bus_plugin_ui_inputs,
             strip_ports,
             strip_count,
             bus_ports,
@@ -1365,6 +1387,7 @@ impl JackEngine {
         handle: usize,
     ) -> Result<()> {
         let outputs = plugin.outputs();
+        let ui_inputs = plugin.ui_inputs();
         self.commands
             .push(EngineCommand::AddPlugin {
                 strip,
@@ -1399,6 +1422,15 @@ impl JackEngine {
                 slots.push(outputs);
             }
         }
+        if let Some(slots) = self
+            .plugin_ui_inputs
+            .get_mut(strip)
+            .and_then(|chains| chains.get_mut(chain))
+        {
+            if slots.len() < MAX_PLUGINS {
+                slots.push(ui_inputs);
+            }
+        }
         Ok(())
     }
 
@@ -1426,6 +1458,15 @@ impl JackEngine {
         }
         if let Some(slots) = self
             .plugin_outputs
+            .get_mut(strip)
+            .and_then(|chains| chains.get_mut(chain))
+        {
+            if slot < slots.len() {
+                slots.remove(slot);
+            }
+        }
+        if let Some(slots) = self
+            .plugin_ui_inputs
             .get_mut(strip)
             .and_then(|chains| chains.get_mut(chain))
         {
@@ -1481,6 +1522,16 @@ impl JackEngine {
                 slots.insert(to, outputs);
             }
         }
+        if let Some(slots) = self
+            .plugin_ui_inputs
+            .get_mut(strip)
+            .and_then(|chains| chains.get_mut(chain))
+        {
+            if from < slots.len() && to < slots.len() {
+                let inputs = slots.remove(from);
+                slots.insert(to, inputs);
+            }
+        }
         Ok(())
     }
 
@@ -1503,6 +1554,11 @@ impl JackEngine {
                 slots.clear();
             }
         }
+        if let Some(chains) = self.plugin_ui_inputs.get_mut(strip) {
+            for slots in chains.iter_mut() {
+                slots.clear();
+            }
+        }
         Ok(())
     }
 
@@ -1514,6 +1570,7 @@ impl JackEngine {
         handle: usize,
     ) -> Result<()> {
         let outputs = plugin.outputs();
+        let ui_inputs = plugin.ui_inputs();
         self.commands
             .push(EngineCommand::AddBusPlugin { bus, plugin })
             .map_err(|_| anyhow!("engine command queue full"))?;
@@ -1530,6 +1587,11 @@ impl JackEngine {
         if let Some(slots) = self.bus_plugin_outputs.get_mut(bus) {
             if slots.len() < MAX_PLUGINS {
                 slots.push(outputs);
+            }
+        }
+        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
+            if slots.len() < MAX_PLUGINS {
+                slots.push(ui_inputs);
             }
         }
         Ok(())
@@ -1550,6 +1612,11 @@ impl JackEngine {
             }
         }
         if let Some(slots) = self.bus_plugin_outputs.get_mut(bus) {
+            if slot < slots.len() {
+                slots.remove(slot);
+            }
+        }
+        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
             if slot < slots.len() {
                 slots.remove(slot);
             }
@@ -1579,6 +1646,12 @@ impl JackEngine {
                 slots.insert(to, outputs);
             }
         }
+        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
+            if from < slots.len() && to < slots.len() {
+                let inputs = slots.remove(from);
+                slots.insert(to, inputs);
+            }
+        }
         Ok(())
     }
 
@@ -1593,6 +1666,9 @@ impl JackEngine {
             slots.clear();
         }
         if let Some(slots) = self.bus_plugin_outputs.get_mut(bus) {
+            slots.clear();
+        }
+        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
             slots.clear();
         }
         Ok(())
@@ -1618,6 +1694,13 @@ impl JackEngine {
             .get(bus)
             .and_then(|slots| slots.get(slot))
             .and_then(|outputs| outputs.clone())
+    }
+
+    pub fn bus_plugin_ui_inputs(&self, bus: usize, slot: usize) -> Option<Arc<SharedUiInputs>> {
+        self.bus_plugin_ui_inputs
+            .get(bus)
+            .and_then(|slots| slots.get(slot))
+            .and_then(|inputs| inputs.clone())
     }
 
     pub fn add_strip_ports(&mut self, strip: usize) -> Result<()> {
@@ -2025,6 +2108,19 @@ impl JackEngine {
             .and_then(|outputs| outputs.clone())
     }
 
+    pub fn plugin_ui_inputs(
+        &self,
+        strip: usize,
+        chain: usize,
+        slot: usize,
+    ) -> Option<Arc<SharedUiInputs>> {
+        self.plugin_ui_inputs
+            .get(strip)
+            .and_then(|chains| chains.get(chain))
+            .and_then(|slots| slots.get(slot))
+            .and_then(|inputs| inputs.clone())
+    }
+
     pub fn rebuild_plugins(
         &mut self,
         lv2: &Host,
@@ -2053,9 +2149,11 @@ impl JackEngine {
         self.state_proxies = built.strip_proxies;
         self.plugin_handles = built.strip_handles;
         self.plugin_outputs = built.strip_outputs;
+        self.plugin_ui_inputs = built.strip_ui_inputs;
         self.bus_state_proxies = built.bus_proxies;
         self.bus_plugin_handles = built.bus_handles;
         self.bus_plugin_outputs = built.bus_outputs;
+        self.bus_plugin_ui_inputs = built.bus_ui_inputs;
         Ok(())
     }
 
@@ -2254,12 +2352,17 @@ fn build_chains(
     let mut strip_outputs: Vec<StripOutputs> = (0..strip_count)
         .map(|_| std::array::from_fn(|_| Vec::with_capacity(MAX_PLUGINS)))
         .collect();
+    let mut strip_ui_inputs: Vec<StripUiInputs> = (0..strip_count)
+        .map(|_| std::array::from_fn(|_| Vec::with_capacity(MAX_PLUGINS)))
+        .collect();
     let mut bus_chains: Vec<Vec<SlotPlugin>> = (0..bus_count)
         .map(|_| Vec::with_capacity(MAX_PLUGINS))
         .collect();
     let mut bus_proxies: Vec<Vec<Option<SlotState>>> = (0..bus_count).map(|_| Vec::new()).collect();
     let mut bus_handles: Vec<Vec<Option<usize>>> = (0..bus_count).map(|_| Vec::new()).collect();
     let mut bus_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>> =
+        (0..bus_count).map(|_| Vec::new()).collect();
+    let mut bus_ui_inputs: Vec<Vec<Option<Arc<SharedUiInputs>>>> =
         (0..bus_count).map(|_| Vec::new()).collect();
 
     for strip in &mut model.strips {
@@ -2289,10 +2392,12 @@ fn build_chains(
                         }
                         params.set_plugin_bypass(index, chain, slot, plugin.bypassed);
                         let outputs = slot_plugin.outputs();
+                        let ui_inputs = slot_plugin.ui_inputs();
                         strip_chains[index][chain].push(slot_plugin);
                         strip_proxies[index][chain].push(proxy);
                         strip_handles[index][chain].push(Some(handle));
                         strip_outputs[index][chain].push(outputs);
+                        strip_ui_inputs[index][chain].push(ui_inputs);
                     }
                     None => {
                         plugin.missing = true;
@@ -2300,6 +2405,7 @@ fn build_chains(
                         strip_proxies[index][chain].push(None);
                         strip_handles[index][chain].push(None);
                         strip_outputs[index][chain].push(None);
+                        strip_ui_inputs[index][chain].push(None);
                     }
                 }
                 kept.push(plugin);
@@ -2331,10 +2437,12 @@ fn build_chains(
                     }
                     params.set_bus_plugin_bypass(index, slot, plugin.bypassed);
                     let outputs = slot_plugin.outputs();
+                    let ui_inputs = slot_plugin.ui_inputs();
                     bus_chains[index].push(slot_plugin);
                     bus_proxies[index].push(proxy);
                     bus_handles[index].push(Some(handle));
                     bus_outputs[index].push(outputs);
+                    bus_ui_inputs[index].push(ui_inputs);
                 }
                 None => {
                     plugin.missing = true;
@@ -2342,6 +2450,7 @@ fn build_chains(
                     bus_proxies[index].push(None);
                     bus_handles[index].push(None);
                     bus_outputs[index].push(None);
+                    bus_ui_inputs[index].push(None);
                 }
             }
             kept.push(plugin);
@@ -2354,10 +2463,12 @@ fn build_chains(
         strip_proxies,
         strip_handles,
         strip_outputs,
+        strip_ui_inputs,
         bus_chains,
         bus_proxies,
         bus_handles,
         bus_outputs,
+        bus_ui_inputs,
     }
 }
 

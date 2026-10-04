@@ -25,6 +25,10 @@ pub struct AtomUrids {
 /// quarter-note `beats` derived from the incoming 24 PPQN clock.
 pub const TIME_BEAT_UNIT_QUARTER: u32 = 4;
 
+/// `atom:eventTransfer` — the `format` used when transferring individual events
+/// to/from an LV2 UI (`LV2UI_Write_Function` / `LV2UI_Port_Event`).
+pub const EVENT_TRANSFER_URI: &str = "http://lv2plug.in/ns/ext/atom#eventTransfer";
+
 /// A single incoming MIDI message with its frame offset within the block.
 /// Fixed-size so the audio thread never allocates.
 #[derive(Clone, Copy, Default)]
@@ -75,6 +79,27 @@ pub fn clear_sequence(words: &mut [u64]) {
         unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
     bytes[0..4].copy_from_slice(&(SEQUENCE_BODY as u32).to_ne_bytes());
     bytes[8..16].fill(0);
+}
+
+/// Calls `f` with each event's `LV2_Atom` (header + body, without the 8-byte
+/// timestamp) in an `LV2_Atom_Sequence` serialized as `[size][type][unit][pad]…`.
+pub fn for_each_event(sequence: &[u8], mut f: impl FnMut(&[u8])) {
+    if sequence.len() < 16 {
+        return;
+    }
+    let size = u32::from_ne_bytes(sequence[0..4].try_into().unwrap()) as usize;
+    let end = (SEQUENCE_BODY + size).min(sequence.len());
+    let mut offset = SEQUENCE_BODY + 8; // skip the atom header and the sequence body head
+    while offset + 16 <= end {
+        let atom_size = u32::from_ne_bytes(sequence[offset + 8..offset + 12].try_into().unwrap())
+            as usize;
+        let atom_end = offset + 16 + atom_size;
+        if atom_end > end {
+            break;
+        }
+        f(&sequence[offset + 8..atom_end]);
+        offset += align8(16 + atom_size);
+    }
 }
 
 /// Appends `LV2_Atom_Event`s to a `LV2_Atom_Sequence` buffer in place.
@@ -186,6 +211,35 @@ impl<'a> SequenceWriter<'a> {
         let size = self.size as u32;
         self.bytes[0..4].copy_from_slice(&size.to_ne_bytes());
     }
+}
+
+/// Appends a complete `LV2_Atom` (header + body) as an event at `time`. Used to
+/// forward UI→DSP events (already an atom) into a plugin's input sequence.
+pub fn append_atom_event(
+    writer: &mut SequenceWriter,
+    time: i64,
+    atom: &[u8],
+) -> bool {
+    if atom.len() < 8 {
+        return false;
+    }
+    let size = u32::from_ne_bytes(atom[0..4].try_into().unwrap()) as usize;
+    let type_ = u32::from_ne_bytes(atom[4..8].try_into().unwrap());
+    if atom.len() < 8 + size {
+        return false;
+    }
+    let body = &atom[8..8 + size];
+    let total = align8(16 + body.len());
+    if writer.size + total > writer.capacity() {
+        return false;
+    }
+    let offset = writer.size;
+    writer.write_event_header(offset, body.len(), type_);
+    let dst = &mut writer.bytes[8 + offset..];
+    dst[0..8].copy_from_slice(&time.to_ne_bytes());
+    dst[16..16 + body.len()].copy_from_slice(body);
+    writer.size += total;
+    true
 }
 
 fn push_property(buf: &mut [u8], len: &mut usize, key: u32, value_type: u32, value: &[u8]) {

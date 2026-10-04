@@ -12,6 +12,7 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use vibemix_lv2::ui_ipc::{self, FrameBuffer, UiMessage};
+use vibemix_lv2::urid::UridMap;
 use vibemix_lv2::UiCandidate;
 
 /// How long to wait for the host to connect after spawning it.
@@ -113,6 +114,11 @@ impl UiService {
         stream.set_nonblocking(true)?;
         self.stream = Some(stream);
         self.child = Some(child);
+        // Seed the host with this process's URID table so the UI and its plugin
+        // share one numbering (rare misses are requested back over the socket).
+        self.send(&UiMessage::UridTable {
+            entries: UridMap::shared().entries(),
+        });
         Ok(())
     }
 
@@ -165,6 +171,11 @@ impl UiService {
                         tracing::warn!(id, %reason, "UI host failed to open editor");
                         return false;
                     }
+                    // The host is instantiating the UI and needs a URID now.
+                    UiMessage::UridRequest { uri } => {
+                        let urid = UridMap::shared().map(&uri);
+                        self.send(&UiMessage::UridReply { uri, urid });
+                    }
                     other => self.pending.push(other),
                 }
             }
@@ -198,6 +209,14 @@ impl UiService {
 
     pub fn close(&mut self, id: u32) {
         self.send(&UiMessage::Close { id });
+    }
+
+    /// Answers a URID lookup from the host with this process's numbering.
+    pub fn send_urid_reply(&mut self, uri: &str, urid: u32) {
+        self.send(&UiMessage::UridReply {
+            uri: uri.to_string(),
+            urid,
+        });
     }
 
     /// Returns every message the host has sent since the last call.

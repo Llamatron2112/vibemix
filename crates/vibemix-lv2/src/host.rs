@@ -12,7 +12,7 @@ use crate::urid::UridMap;
 use crate::worker::{Worker, WorkerInterface, WORKER_INTERFACE_URI, WORKER_SCHEDULE_URI};
 use crate::state::{StateEntry, StateInterface, StateProxy, STATE_INTERFACE_URI};
 use crate::ui::{self, UiCandidate, UiWindow};
-use crate::ui_outputs::SharedOutputs;
+use crate::ui_outputs::{SharedOutputs, SharedUiInputs};
 
 use std::sync::Arc;
 
@@ -61,11 +61,12 @@ const OUTPUT_PORT: &str = "http://lv2plug.in/ns/lv2core#OutputPort";
 const ATOM_PORT: &str = "http://lv2plug.in/ns/ext/atom#AtomPort";
 const ATOM_SEQUENCE: &str = "http://lv2plug.in/ns/ext/atom#Sequence";
 const ATOM_BUFFER_BYTES: usize = 8192;
-/// Capacity (in bytes) advertised for output `atom:Sequence` ports. Must be
-/// written to `atom.size` before every `run()`: plugins leave it at the used
-/// size after writing, and atom-output plugins (e.g. meters.lv2) read it back
-/// as the buffer capacity on the next block.
-const OUTPUT_SEQUENCE_CAPACITY: u32 = (ATOM_BUFFER_BYTES - crate::atom::SEQUENCE_BODY) as u32;
+/// `resize-port:minimumSize` — the host must provide at least this many bytes
+/// for the port (LSP declares it on its `in_ui`/`out_ui` atom ports).
+const RESIZE_MINIMUM_SIZE: &str = "http://lv2plug.in/ns/ext/resize-port#minimumSize";
+/// Upper bound on a host-provided port buffer, so a plugin cannot ask for an
+/// unbounded allocation. LSP's largest UI port requests ~50 MiB.
+const ATOM_BUFFER_MAX: usize = 64 << 20;
 const CV_PORT: &str = "http://lv2plug.in/ns/lv2core#CVPort";
 const CONNECTION_OPTIONAL: &str = "http://lv2plug.in/ns/lv2core#connectionOptional";
 const PG_GROUP: &str = "http://lv2plug.in/ns/ext/port-groups#group";
@@ -231,6 +232,7 @@ impl Host {
         let output = self.world.new_uri(OUTPUT_PORT);
         let midi_event = self.world.new_uri(MIDI_EVENT);
         let time_position = self.world.new_uri(TIME_POSITION);
+        let min_size = self.world.new_uri(RESIZE_MINIMUM_SIZE);
 
         let mut classified = Classified {
             hostable: true,
@@ -255,6 +257,13 @@ impl Host {
                     classified.hostable = false;
                 }
             } else if port.is_a(&atom) {
+                let minimum = port
+                    .value(&min_size)
+                    .iter()
+                    .find_map(|node| node.as_int())
+                    .unwrap_or(0)
+                    .max(0) as usize;
+                classified.atom_min_sizes.push((index, minimum));
                 if port.is_a(&output) {
                     classified.atom_outputs.push(index);
                 } else if port.is_a(&input) {
@@ -405,6 +414,7 @@ impl Host {
         sample_rate: f32,
         nominal_block: u32,
         max_block: u32,
+        sequence_size: usize,
     ) -> OptionFeatures {
         let map = |uri: &str| self.urid.map(uri);
         let key_sample = map("http://lv2plug.in/ns/ext/parameters#sampleRate");
@@ -420,7 +430,7 @@ impl Host {
         values[1] = 1;
         values[2] = u64::from(max_block);
         values[3] = u64::from(nominal_block);
-        values[4] = u64::from(ATOM_BUFFER_BYTES as u32);
+        values[4] = u64::from(sequence_size as u32);
 
         let base = values.as_ptr();
         let value_at = |index: usize| unsafe { base.add(index) as *const c_void };
@@ -546,6 +556,7 @@ impl Host {
         let control_outputs = classified.control_outputs;
         let atom_inputs = classified.atom_inputs;
         let atom_outputs = classified.atom_outputs;
+        let atom_min_sizes = classified.atom_min_sizes;
         let midi_inputs = classified.midi_inputs;
         let time_inputs = classified.time_inputs;
         let sequence_urid = self.urid.map(ATOM_SEQUENCE);
@@ -576,10 +587,36 @@ impl Host {
             .filter_map(|port| atom_inputs.iter().position(|p| p == port))
             .collect();
 
+        // Honour `resize-port:minimumSize`: LSP streams its UI graphs (meshes)
+        // through the `out_ui` atom port, which can ask for tens of KiB up to
+        // tens of MiB. Buffers are per port, floored at the default and capped.
+        let min_size_for = |index: usize| {
+            atom_min_sizes
+                .iter()
+                .find(|(port, _)| *port == index)
+                .map(|(_, size)| *size)
+                .unwrap_or(0)
+        };
+        let atom_port_bytes = |index: usize| {
+            min_size_for(index)
+                .clamp(ATOM_BUFFER_BYTES, ATOM_BUFFER_MAX)
+                .next_multiple_of(8)
+        };
+        let atom_input_bytes: Vec<usize> = atom_inputs.iter().map(|&i| atom_port_bytes(i)).collect();
+        let atom_output_bytes: Vec<usize> =
+            atom_outputs.iter().map(|&i| atom_port_bytes(i)).collect();
+        let max_atom_bytes = atom_input_bytes
+            .iter()
+            .chain(atom_output_bytes.iter())
+            .copied()
+            .max()
+            .unwrap_or(ATOM_BUFFER_BYTES);
+
         let option_features = self.build_option_features(
             sample_rate as f32,
             nominal_block as u32,
             max_block as u32,
+            max_atom_bytes,
         );
         let mut features: Vec<&LV2Feature> = Vec::new();
         features.extend(self.urid.features());
@@ -629,14 +666,19 @@ impl Host {
             .collect();
         let mut control_output_buffers: Vec<f32> = vec![0.0f32; control_outputs.len()];
         let mut atom_buffers: Vec<Box<[u64]>> = Vec::new();
-        for _ in &atom_inputs {
+        for &bytes in &atom_input_bytes {
             atom_buffers.push(sequence_buffer(
                 sequence_urid,
                 crate::atom::SEQUENCE_BODY as u32,
+                bytes,
             ));
         }
-        for _ in &atom_outputs {
-            atom_buffers.push(sequence_buffer(sequence_urid, OUTPUT_SEQUENCE_CAPACITY));
+        for &bytes in &atom_output_bytes {
+            atom_buffers.push(sequence_buffer(
+                sequence_urid,
+                (bytes - crate::atom::SEQUENCE_BODY) as u32,
+                bytes,
+            ));
         }
 
         for (buffer, index) in input_buffers.iter_mut().zip(&audio_inputs) {
@@ -663,7 +705,7 @@ impl Host {
         let outputs = Arc::new(SharedOutputs::new(
             &control_outputs,
             &atom_outputs,
-            ATOM_BUFFER_BYTES,
+            &atom_output_bytes,
         ));
 
         Some(PluginInstance {
@@ -688,6 +730,7 @@ impl Host {
             worker,
             state,
             outputs,
+            ui_inputs: Arc::new(SharedUiInputs::new()),
         })
     }
 }
@@ -701,16 +744,19 @@ struct Classified {
     control_outputs: Vec<usize>,
     atom_inputs: Vec<usize>,
     atom_outputs: Vec<usize>,
+    /// `(port index, resize-port:minimumSize)` for every atom port.
+    atom_min_sizes: Vec<(usize, usize)>,
     midi_inputs: Vec<usize>,
     time_inputs: Vec<usize>,
     hostable: bool,
 }
 
-fn sequence_buffer(sequence_urid: u32, size: u32) -> Box<[u64]> {
-    let mut buffer = vec![0u64; ATOM_BUFFER_BYTES / 8].into_boxed_slice();
+fn sequence_buffer(sequence_urid: u32, header_size: u32, bytes: usize) -> Box<[u64]> {
+    let words_len = bytes.div_ceil(std::mem::size_of::<u64>());
+    let mut buffer = vec![0u64; words_len].into_boxed_slice();
     let words = buffer.as_mut_ptr() as *mut u32;
     unsafe {
-        *words = size;
+        *words = header_size;
         *words.add(1) = sequence_urid;
         *words.add(2) = 0;
     }
@@ -814,6 +860,7 @@ pub struct PluginInstance {
     worker: Option<Box<Worker>>,
     state: Option<StateProxy>,
     outputs: Arc<SharedOutputs>,
+    ui_inputs: Arc<SharedUiInputs>,
 }
 
 unsafe impl Send for PluginInstance {}
@@ -1006,8 +1053,11 @@ impl PluginInstance {
         // buffer capacity before each run.
         for buffer in self.atom_buffers.iter_mut().skip(self.atom_inputs.len()) {
             let words = buffer.as_mut_ptr() as *mut u32;
+            // Advertise the port's capacity in `atom.size` before `run`; plugins
+            // (e.g. LSP) read it back as the writable space.
+            let capacity = buffer.len() * std::mem::size_of::<u64>() - crate::atom::SEQUENCE_BODY;
             // SAFETY: every output atom buffer starts with an `LV2_Atom` header.
-            unsafe { *words = OUTPUT_SEQUENCE_CAPACITY };
+            unsafe { *words = capacity as u32 };
         }
         unsafe { self.active.run(frames) };
         self.publish_outputs();
@@ -1027,7 +1077,8 @@ impl PluginInstance {
             // SAFETY: the buffer is a live `LV2_Atom_Sequence` written by the
             // plugin on this thread during `run`.
             let (size, format) = unsafe { (*words as usize, *words.add(1)) };
-            let total = (std::mem::size_of::<u32>() * 2 + size).min(ATOM_BUFFER_BYTES);
+            let capacity = buffer.len() * std::mem::size_of::<u64>();
+            let total = (std::mem::size_of::<u32>() * 2 + size).min(capacity);
             let bytes =
                 unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, total) };
             self.outputs.publish_atom(index - base, bytes, format);
@@ -1050,6 +1101,42 @@ impl PluginInstance {
 
     pub fn outputs(&self) -> Arc<SharedOutputs> {
         Arc::clone(&self.outputs)
+    }
+
+    /// The UI→DSP event mailbox for this instance.
+    pub fn ui_inputs(&self) -> Arc<SharedUiInputs> {
+        Arc::clone(&self.ui_inputs)
+    }
+
+    /// Appends queued UI→DSP events (from the control thread) to their input
+    /// atom sequences, after the host's own events. `time_cleared` says whether
+    /// `write_position` already ran this block, so a buffer that is both a time
+    /// and UI input is only cleared once.
+    pub fn write_ui_events(&mut self, time_cleared: bool) {
+        let inputs = Arc::clone(&self.ui_inputs);
+        let atom_inputs = &self.atom_inputs;
+        let time_buffers = &self.time_buffers;
+        let midi_buffers = &self.midi_buffers;
+        let buffers = &mut self.atom_buffers;
+        let mut cleared = [usize::MAX; 8];
+        let mut cleared_count = 0usize;
+        inputs.drain(|port, bytes| {
+            let Some(position) = atom_inputs.iter().position(|&p| p == port as usize) else {
+                return;
+            };
+            let is_time = time_buffers.contains(&position);
+            let is_midi = midi_buffers.contains(&position);
+            let needs_clear = (!is_time && !is_midi) || (is_time && !time_cleared);
+            let already = cleared[..cleared_count].contains(&position);
+            if needs_clear && !already && cleared_count < cleared.len() {
+                crate::atom::clear_sequence(&mut buffers[position]);
+                cleared[cleared_count] = position;
+                cleared_count += 1;
+            }
+            let mut writer = SequenceWriter::new(&mut buffers[position]);
+            crate::atom::append_atom_event(&mut writer, 0, bytes);
+            writer.finish();
+        });
     }
 
     pub fn restore_state(&mut self, entries: &[StateEntry]) {

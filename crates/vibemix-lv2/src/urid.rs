@@ -35,50 +35,53 @@ unsafe impl Sync for UridMap {}
 
 impl UridMap {
     pub fn shared() -> &'static UridMap {
-        let mut map = Box::new(UridMap {
-            inner: Mutex::new(Inner {
-                next: AtomicU32::new(1),
-                by_uri: HashMap::new(),
-                by_id: Vec::new(),
-            }),
-            map_uri: CString::new(LV2_URID__MAP).expect("urid map uri"),
-            unmap_uri: CString::new(LV2_URID__UNMAP).expect("urid unmap uri"),
-            map_struct: LV2UridMap {
-                handle: ptr::null_mut(),
-                map: urid_map,
-            },
-            unmap_struct: Lv2UridUnmap {
-                handle: ptr::null_mut(),
-                unmap: urid_unmap,
-            },
-            map_feature: LV2Feature {
-                uri: ptr::null(),
-                data: ptr::null_mut(),
-            },
-            unmap_feature: LV2Feature {
-                uri: ptr::null(),
-                data: ptr::null_mut(),
-            },
-        });
+        static SHARED: std::sync::OnceLock<&'static UridMap> = std::sync::OnceLock::new();
+        SHARED.get_or_init(|| {
+            let mut map = Box::new(UridMap {
+                inner: Mutex::new(Inner {
+                    next: AtomicU32::new(1),
+                    by_uri: HashMap::new(),
+                    by_id: Vec::new(),
+                }),
+                map_uri: CString::new(LV2_URID__MAP).expect("urid map uri"),
+                unmap_uri: CString::new(LV2_URID__UNMAP).expect("urid unmap uri"),
+                map_struct: LV2UridMap {
+                    handle: ptr::null_mut(),
+                    map: urid_map,
+                },
+                unmap_struct: Lv2UridUnmap {
+                    handle: ptr::null_mut(),
+                    unmap: urid_unmap,
+                },
+                map_feature: LV2Feature {
+                    uri: ptr::null(),
+                    data: ptr::null_mut(),
+                },
+                unmap_feature: LV2Feature {
+                    uri: ptr::null(),
+                    data: ptr::null_mut(),
+                },
+            });
 
-        let handle = &*map as *const UridMap as *mut c_void;
-        let map_uri = map.map_uri.as_ptr();
-        let unmap_uri = map.unmap_uri.as_ptr();
-        let map_data = &map.map_struct as *const LV2UridMap as *mut c_void;
-        let unmap_data = &map.unmap_struct as *const Lv2UridUnmap as *mut c_void;
+            let handle = &*map as *const UridMap as *mut c_void;
+            let map_uri = map.map_uri.as_ptr();
+            let unmap_uri = map.unmap_uri.as_ptr();
+            let map_data = &map.map_struct as *const LV2UridMap as *mut c_void;
+            let unmap_data = &map.unmap_struct as *const Lv2UridUnmap as *mut c_void;
 
-        map.map_struct.handle = handle;
-        map.unmap_struct.handle = handle;
-        map.map_feature = LV2Feature {
-            uri: map_uri,
-            data: map_data,
-        };
-        map.unmap_feature = LV2Feature {
-            uri: unmap_uri,
-            data: unmap_data,
-        };
+            map.map_struct.handle = handle;
+            map.unmap_struct.handle = handle;
+            map.map_feature = LV2Feature {
+                uri: map_uri,
+                data: map_data,
+            };
+            map.unmap_feature = LV2Feature {
+                uri: unmap_uri,
+                data: unmap_data,
+            };
 
-        Box::leak(map)
+            Box::leak(map)
+        })
     }
 
     pub fn features(&self) -> [&LV2Feature; 2] {
@@ -98,6 +101,17 @@ impl UridMap {
             .by_id
             .get((urid - 1) as usize)
             .map(|value| value.to_string_lossy().into_owned())
+    }
+
+    /// Every `(uri, urid)` pair currently mapped. Used to seed an out-of-process
+    /// client (the UI host) with this host's numbering.
+    pub fn entries(&self) -> Vec<(String, u32)> {
+        let guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
+        guard
+            .by_uri
+            .iter()
+            .map(|(uri, urid)| (uri.clone(), *urid))
+            .collect()
     }
 
     pub fn parts(

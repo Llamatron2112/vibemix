@@ -1,5 +1,7 @@
 use std::cell::UnsafeCell;
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::Mutex;
 
 /// Lock-free snapshot of a plugin instance's output ports, shared between the
 /// audio thread (which publishes after every `run`) and the control thread
@@ -27,7 +29,7 @@ struct AtomSlot {
 unsafe impl Sync for AtomSlot {}
 
 impl SharedOutputs {
-    pub fn new(control_ports: &[usize], atom_ports: &[usize], atom_capacity: usize) -> Self {
+    pub fn new(control_ports: &[usize], atom_ports: &[usize], atom_capacities: &[usize]) -> Self {
         Self {
             active: AtomicBool::new(false),
             control_ports: control_ports.iter().map(|&port| port as u32).collect(),
@@ -35,12 +37,17 @@ impl SharedOutputs {
                 .map(|_| AtomicU32::new(0))
                 .collect(),
             atom_ports: atom_ports.iter().map(|&port| port as u32).collect(),
-            atoms: (0..atom_ports.len())
-                .map(|_| AtomSlot {
-                    seq: AtomicUsize::new(0),
-                    len: AtomicUsize::new(0),
-                    format: AtomicU32::new(0),
-                    buffer: UnsafeCell::new(vec![0u8; atom_capacity].into_boxed_slice()),
+            atoms: atom_ports
+                .iter()
+                .enumerate()
+                .map(|(index, _)| {
+                    let capacity = atom_capacities.get(index).copied().unwrap_or(0);
+                    AtomSlot {
+                        seq: AtomicUsize::new(0),
+                        len: AtomicUsize::new(0),
+                        format: AtomicU32::new(0),
+                        buffer: UnsafeCell::new(vec![0u8; capacity].into_boxed_slice()),
+                    }
                 })
                 .collect(),
         }
@@ -145,13 +152,61 @@ fn slot_buffer_len(slot: &AtomSlot) -> usize {
     unsafe { (&*slot.buffer.get()).len() }
 }
 
+/// Mailbox for UI→DSP atom events, from the control thread (UI writes) to the
+/// audio thread. The audio thread only ever `try_lock`s, so it never blocks,
+/// and buffers are recycled so it never allocates or frees either.
+pub struct SharedUiInputs {
+    inner: Mutex<UiInputInner>,
+}
+
+#[derive(Default)]
+struct UiInputInner {
+    queue: VecDeque<(u32, Vec<u8>)>,
+    free: Vec<Vec<u8>>,
+}
+
+impl SharedUiInputs {
+    pub fn new() -> Self {
+        Self {
+            inner: Mutex::new(UiInputInner::default()),
+        }
+    }
+
+    /// Control thread: queue one atom event for plugin port `port`.
+    pub fn push(&self, port: u32, bytes: &[u8]) {
+        if let Ok(mut inner) = self.inner.lock() {
+            let mut buffer = inner.free.pop().unwrap_or_default();
+            buffer.clear();
+            buffer.extend_from_slice(bytes);
+            inner.queue.push_back((port, buffer));
+        }
+    }
+
+    /// Audio thread: drain the queued events, recycling their buffers.
+    pub fn drain(&self, mut f: impl FnMut(u32, &[u8])) {
+        let Ok(mut inner) = self.inner.try_lock() else {
+            return;
+        };
+        while let Some((port, bytes)) = inner.queue.pop_front() {
+            f(port, &bytes);
+            inner.free.push(bytes);
+        }
+    }
+}
+
+impl Default for SharedUiInputs {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn inactive_outputs_are_not_published() {
-        let outputs = SharedOutputs::new(&[7], &[], 16);
+        let outputs = SharedOutputs::new(&[7], &[], &[]);
         outputs.publish_control(&[42.0]);
         assert!(!outputs.is_active());
         assert_eq!(outputs.control_value(0), 0.0);
@@ -159,7 +214,7 @@ mod tests {
 
     #[test]
     fn control_values_round_trip() {
-        let outputs = SharedOutputs::new(&[5, 9], &[], 16);
+        let outputs = SharedOutputs::new(&[5, 9], &[], &[]);
         outputs.set_active(true);
         assert!(outputs.is_active());
         assert_eq!(outputs.control_port_count(), 2);
@@ -172,7 +227,7 @@ mod tests {
 
     #[test]
     fn atom_payloads_round_trip() {
-        let outputs = SharedOutputs::new(&[], &[3], 16);
+        let outputs = SharedOutputs::new(&[], &[3], &[16]);
         outputs.set_active(true);
         assert_eq!(outputs.atom_seq(0), 0);
 

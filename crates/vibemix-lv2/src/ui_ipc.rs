@@ -54,6 +54,13 @@ pub enum UiMessage {
     Title { id: u32, title: String },
     /// engine -> host: exit.
     Shutdown,
+    /// engine -> host: this host's complete URID table, so the UI process uses
+    /// the same numbering as the plugins.
+    UridTable { entries: Vec<(String, u32)> },
+    /// host -> engine: request the engine's URID for `uri` (table miss).
+    UridRequest { uri: String },
+    /// engine -> host: the URID for `uri`.
+    UridReply { uri: String, urid: u32 },
 }
 
 const TAG_OPEN: u8 = 1;
@@ -65,6 +72,9 @@ const TAG_CLOSE: u8 = 6;
 const TAG_CLOSE_REQUEST: u8 = 7;
 const TAG_TITLE: u8 = 8;
 const TAG_SHUTDOWN: u8 = 9;
+const TAG_URID_TABLE: u8 = 10;
+const TAG_URID_REQUEST: u8 = 11;
+const TAG_URID_REPLY: u8 = 12;
 
 fn put_u32(out: &mut Vec<u8>, value: u32) {
     out.extend_from_slice(&value.to_le_bytes());
@@ -206,6 +216,23 @@ pub fn encode(message: &UiMessage) -> Vec<u8> {
             put_str(&mut out, title);
         }
         UiMessage::Shutdown => out.push(TAG_SHUTDOWN),
+        UiMessage::UridTable { entries } => {
+            out.push(TAG_URID_TABLE);
+            put_u32(&mut out, entries.len() as u32);
+            for (uri, urid) in entries {
+                put_str(&mut out, uri);
+                put_u32(&mut out, *urid);
+            }
+        }
+        UiMessage::UridRequest { uri } => {
+            out.push(TAG_URID_REQUEST);
+            put_str(&mut out, uri);
+        }
+        UiMessage::UridReply { uri, urid } => {
+            out.push(TAG_URID_REPLY);
+            put_str(&mut out, uri);
+            put_u32(&mut out, *urid);
+        }
     }
     out
 }
@@ -261,6 +288,23 @@ pub fn decode(payload: &[u8]) -> Option<UiMessage> {
             title: reader.string()?,
         }),
         TAG_SHUTDOWN => Some(UiMessage::Shutdown),
+        TAG_URID_TABLE => {
+            let count = reader.u32()? as usize;
+            let mut entries = Vec::with_capacity(count.min(4096));
+            for _ in 0..count {
+                let uri = reader.string()?;
+                let urid = reader.u32()?;
+                entries.push((uri, urid));
+            }
+            Some(UiMessage::UridTable { entries })
+        }
+        TAG_URID_REQUEST => Some(UiMessage::UridRequest {
+            uri: reader.string()?,
+        }),
+        TAG_URID_REPLY => Some(UiMessage::UridReply {
+            uri: reader.string()?,
+            urid: reader.u32()?,
+        }),
         _ => None,
     }
 }
@@ -288,6 +332,16 @@ impl FrameBuffer {
 
     pub fn push(&mut self, data: &[u8]) {
         self.buf.extend_from_slice(data);
+    }
+
+    /// True when no complete frame is buffered (a partial frame counts as
+    /// empty, since it cannot be popped yet).
+    pub fn is_empty(&self) -> bool {
+        if self.buf.len() < 4 {
+            return true;
+        }
+        let len = u32::from_le_bytes(self.buf[0..4].try_into().unwrap()) as usize;
+        self.buf.len() < 4 + len
     }
 
     /// Pops the next complete message, or `None` if the buffer holds only a
@@ -377,6 +431,23 @@ mod tests {
             title: "Renamed".into(),
         });
         round_trip(UiMessage::Shutdown);
+    }
+
+    #[test]
+    fn urid_round_trip() {
+        round_trip(UiMessage::UridTable {
+            entries: vec![
+                ("http://example.com/a".into(), 1),
+                ("http://example.com/b".into(), 7),
+            ],
+        });
+        round_trip(UiMessage::UridRequest {
+            uri: "http://example.com/c".into(),
+        });
+        round_trip(UiMessage::UridReply {
+            uri: "http://example.com/c".into(),
+            urid: 9,
+        });
     }
 
     #[test]

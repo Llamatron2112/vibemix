@@ -7,7 +7,7 @@
 
 use std::sync::Arc;
 
-use vibemix_lv2::{MidiEvent, SharedOutputs, TimePosition};
+use vibemix_lv2::{MidiEvent, SharedOutputs, SharedUiInputs, TimePosition};
 
 pub trait PluginNode: Send {
     fn input_buffer_mut(&mut self, channel: usize) -> &mut [f32];
@@ -19,11 +19,19 @@ pub trait PluginNode: Send {
 
     fn write_midi(&mut self, events: &[MidiEvent]);
     fn write_position(&mut self, position: &TimePosition);
+    /// Appends UI→DSP events queued by the control thread. `time_cleared` is
+    /// true when the host's own time input was already written this block.
+    fn write_ui_events(&mut self, _time_cleared: bool) {}
     fn run(&mut self, frames: usize);
     fn deliver_responses(&mut self);
 
     /// Snapshot shared with the control thread for native-UI output.
     fn outputs(&self) -> Option<Arc<SharedOutputs>>;
+
+    /// Control→audio mailbox for UI→DSP events (LV2 only).
+    fn ui_inputs(&self) -> Option<Arc<SharedUiInputs>> {
+        None
+    }
 
     /// Restores serialized state produced by the matching host (empty = no-op).
     fn load_state(&mut self, state: &str);
@@ -66,6 +74,10 @@ impl PluginNode for vibemix_lv2::PluginInstance {
         self.write_position(position)
     }
 
+    fn write_ui_events(&mut self, time_cleared: bool) {
+        self.write_ui_events(time_cleared)
+    }
+
     fn run(&mut self, frames: usize) {
         self.run(frames)
     }
@@ -76,6 +88,10 @@ impl PluginNode for vibemix_lv2::PluginInstance {
 
     fn outputs(&self) -> Option<Arc<SharedOutputs>> {
         Some(self.outputs())
+    }
+
+    fn ui_inputs(&self) -> Option<Arc<SharedUiInputs>> {
+        Some(self.ui_inputs())
     }
 
     fn load_state(&mut self, state: &str) {
