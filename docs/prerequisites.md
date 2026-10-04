@@ -124,12 +124,38 @@ install it when available without making vibemix uninstallable without it:
 
 JACK is provided by PipeWire; do not install `jack-audio-connection-kit` (it conflicts with `pipewire-jack`). Clients link against `libjack.so` and appear in the PipeWire graph. Inspect with `pw-link -l`, `pw-dump`, `pw-cli info 0`.
 
-Low-latency quantum for testing:
+Low-latency quantum (buffer size) for testing:
 
 ```bash
 pw-metadata -n settings 0 clock.force-quantum 256
 pw-metadata -n settings 0 clock.force-quantum 0   # reset to auto
 ```
+
+### Buffer size (quantum) and sample rate
+
+PipeWire owns the graph quantum; JACK clients only see it. Two places set it,
+and they interact:
+
+- **Graph default** — `~/.config/pipewire/pipewire.conf.d/*.conf`
+  (`default.clock.rate`, `default.clock.quantum`, `default.clock.min-quantum`,
+  `default.clock.max-quantum`). Between the min and max the quantum adapts to
+  load; `pw-metadata … clock.force-quantum N` pins it at runtime.
+- **JACK clients** — `~/.config/pipewire/jack.conf` `jack.properties`.
+  `node.force-quantum` / `node.quantum` / `node.latency` apply to *every* JACK
+  client, and PipeWire's default `node.lock-quantum = true` pins the graph to
+  that value while such a client is active. To target one program, put the
+  override in `jack.rules` matched on `application.process.binary` instead.
+
+Keep the values consistent with the configured graph rate. In particular
+`node.rate` (written as `1/<rate>`) must match `default.clock.rate`: a mismatch
+(e.g. `1/41400` in a 44100 graph) makes PipeWire resample the client, adds
+latency and can produce xruns even though the client itself reports the graph
+rate. Omit `node.rate` unless a per-client rate is genuinely wanted.
+
+A 32-frame quantum is ~0.7 ms at 44.1 kHz — minimal latency, but proportionally
+more CPU and xrun risk; pick what the interface and session can sustain. Verify
+the running values with `pw-top` (QUANT / RATE / ERR columns) and, for the
+engine, its startup log line `engine running sample_rate=… buffer_size=…`.
 
 ## Fedora package mapping
 
