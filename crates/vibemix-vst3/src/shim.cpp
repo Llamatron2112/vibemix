@@ -488,8 +488,29 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
                 arr_in[hosted->sidechain_bus] =
                     sidechain.channelCount == 1 ? SpeakerArr::kMono : SpeakerArr::kStereo;
         }
-        hosted->processor->setBusArrangements(arr_in.data(), num_arr_in, arr_out.data(),
-                                              num_arr_out);
+        if (hosted->processor->setBusArrangements(arr_in.data(), num_arr_in, arr_out.data(),
+                                                  num_arr_out) != kResultOk &&
+            std::getenv("VIBEMIX_VST3_DEBUG")) {
+            std::fprintf(stderr, "[vst3] setBusArrangements rejected\n");
+        }
+    }
+
+    // Negotiation can change bus 0's channel count: an Ambisonics plugin may
+    // default it to 64 and then accept a stereo arrangement. Re-read it so
+    // `in_channels`/`out_channels` describe the layout we will actually deliver.
+    // Otherwise the host allocates the wrong buffers and rejects a plugin it can
+    // otherwise run (the caller only accepts mono/stereo).
+    if (in_buses > 0) {
+        BusInfo negotiated {};
+        if (hosted->component->getBusInfo(kAudio, kInput, 0, negotiated) == kResultOk &&
+            negotiated.channelCount > 0)
+            hosted->in_channels = negotiated.channelCount;
+    }
+    if (out_buses > 0) {
+        BusInfo negotiated {};
+        if (hosted->component->getBusInfo(kAudio, kOutput, 0, negotiated) == kResultOk &&
+            negotiated.channelCount > 0)
+            hosted->out_channels = negotiated.channelCount;
     }
 
     ProcessSetup setup {};
