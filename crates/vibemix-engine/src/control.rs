@@ -576,7 +576,7 @@ impl Controller {
         {
             tracing::warn!(%error, "failed to rebuild plugins after sample-rate change");
         }
-        self.uis.clear();
+        self.close_all_uis();
     }
 
     fn apply(&mut self, message: ControlMessage) -> Actions {
@@ -825,7 +825,11 @@ impl Controller {
                     tracing::warn!(%error, strip, "failed to unregister strip ports");
                 }
                 self.engine.sync_port_names(&self.model);
-                self.uis.retain(|(entry_strip, _, _), _| *entry_strip != strip);
+                // Close the editors of every plugin on the removed strip, on
+                // both the pre- and post-fader chains.
+                self.close_uis_where(|location, target, _| {
+                    location != PLUGIN_LOC_BUS && target == strip
+                });
                 Actions {
                     snapshot: true,
                     catalog: false,
@@ -843,6 +847,10 @@ impl Controller {
                     tracing::warn!(%error, bus, "failed to unregister bus return ports");
                 }
                 self.engine.sync_port_names(&self.model);
+                // Close the editors of every plugin on the removed bus.
+                self.close_uis_where(|location, target, _| {
+                    location == PLUGIN_LOC_BUS && target == bus
+                });
                 Actions {
                     snapshot: true,
                     catalog: false,
@@ -1134,7 +1142,7 @@ impl Controller {
                 // Rebinding plugins recreates every instance, so any open editor
                 // (which holds the old instance handle) must be closed first or
                 // it would touch freed memory once the old graph is retired.
-                self.uis.clear();
+                self.close_all_uis();
                 if let Err(error) =
                     self.engine
                         .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, sample_rate)
@@ -1203,7 +1211,7 @@ impl Controller {
                     .rebuild_plugins(&self.host, &self.vst3, &mut model, &self.params, sample_rate)
                 {
                     Ok(()) => {
-                        self.uis.clear();
+                        self.close_all_uis();
                         self.model = model;
                         self.engine.sync_port_names(&self.model);
                         self.rebuild_shared_bindings();
@@ -1240,7 +1248,7 @@ impl Controller {
                         .rebuild_plugins(&self.host, &self.vst3, &mut loaded, &self.params, sample_rate)
                     {
                         Ok(()) => {
-                            self.uis.clear();
+                            self.close_all_uis();
                             self.model = loaded;
                             self.ensure_model_vst3_controls();
                             save_catalog(&self.plugins);
@@ -2755,7 +2763,7 @@ impl Controller {
             if let Err(error) = self.engine.sync_bus_return_ports(&self.params) {
                 tracing::warn!(%error, "failed to sync bus return ports on undo");
             }
-            self.uis.clear();
+            self.close_all_uis();
             let sample_rate = self.engine.sample_rate() as f64;
             if let Err(error) =
                 self.engine
@@ -2859,12 +2867,72 @@ impl Controller {
         self.engine.midi_map().set_bindings(&effective);
     }
 
-    fn remove_plugin(&mut self, location: u32, target: u32, slot: u32) -> bool {
-        self.uis
-            .retain(|(entry_loc, entry_target, _), _| {
-                !(*entry_loc == location && *entry_target == target)
-            });
+    /// Closes one open editor and drops it from the map. Remote LV2 editors
+    /// live in the UI host, so they need an explicit `Close`; in-process LV2
+    /// and VST3 editors tear their window down when dropped.
+    fn close_ui(&mut self, key: (u32, u32, u32)) {
+        if let Some(OpenUi::Lv2Remote { id, .. }) = self.uis.remove(&key) {
+            self.ui_service.close(id);
+        }
+    }
 
+    /// Follows a structural change in one plugin chain by remapping the slots of
+    /// its open editors: `map` returns the editor's new slot, or `None` to close
+    /// it. LV2 editors carry their slot in their write context, so it is updated
+    /// too (VST3 reads the slot from the map key).
+    fn remap_uis_for(&mut self, location: u32, target: u32, map: impl Fn(u32) -> Option<u32>) {
+        let keys: Vec<(u32, u32, u32)> = self
+            .uis
+            .keys()
+            .filter(|(loc, tgt, _)| *loc == location && *tgt == target)
+            .copied()
+            .collect();
+        let mut moved: Vec<((u32, u32, u32), OpenUi)> = Vec::new();
+        for key in keys {
+            match map(key.2) {
+                Some(new_slot) => {
+                    if let Some(mut ui) = self.uis.remove(&key) {
+                        match &mut ui {
+                            OpenUi::Lv2Remote { context, .. }
+                            | OpenUi::Lv2Local { context, .. } => {
+                                context.slot = new_slot as usize;
+                            }
+                            OpenUi::Vst3 { .. } => {}
+                        }
+                        moved.push(((location, target, new_slot), ui));
+                    }
+                }
+                None => self.close_ui(key),
+            }
+        }
+        for (key, ui) in moved {
+            self.uis.insert(key, ui);
+        }
+    }
+
+    /// Closes every editor matching `predicate` (e.g. all editors on a strip).
+    fn close_uis_where(&mut self, mut predicate: impl FnMut(u32, u32, u32) -> bool) {
+        let keys: Vec<(u32, u32, u32)> = self
+            .uis
+            .keys()
+            .filter(|(loc, tgt, slot)| predicate(*loc, *tgt, *slot))
+            .copied()
+            .collect();
+        for key in keys {
+            self.close_ui(key);
+        }
+    }
+
+    /// Closes every open editor, e.g. before a rebuild that retires the plugin
+    /// instances the editors point at.
+    fn close_all_uis(&mut self) {
+        let keys: Vec<(u32, u32, u32)> = self.uis.keys().copied().collect();
+        for key in keys {
+            self.close_ui(key);
+        }
+    }
+
+    fn remove_plugin(&mut self, location: u32, target: u32, slot: u32) -> bool {
         if let Some(chain) = strip_chain(location) {
             let count = match self.model.strip(StripId(target)) {
                 Some(target) if (slot as usize) < strip_plugin_list(target, chain).len() => {
@@ -2925,16 +2993,22 @@ impl Controller {
                 bus.plugins.remove(slot as usize);
             }
         }
+        // Close the removed plugin's editor and shift the rest up one slot so
+        // each window stays attached to its own plugin.
+        self.remap_uis_for(location, target, |s| {
+            if s == slot {
+                None
+            } else if s > slot {
+                Some(s - 1)
+            } else {
+                Some(s)
+            }
+        });
         tracing::info!(location, target, slot, "removed plugin");
         true
     }
 
     fn move_plugin(&mut self, location: u32, target: u32, from: u32, to: u32) -> bool {
-        self.uis
-            .retain(|(entry_loc, entry_target, _), _| {
-                !(*entry_loc == location && *entry_target == target)
-            });
-
         if let Some(chain) = strip_chain(location) {
             let count = match self.model.strip(StripId(target)) {
                 Some(strip) => strip_plugin_list(strip, chain).len(),
@@ -2989,6 +3063,19 @@ impl Controller {
                 bus.plugins.insert(to as usize, plugin);
             }
         }
+        // The moved plugin's editor follows `from -> to`; editors in between
+        // shift by one so each window stays attached to its own plugin.
+        self.remap_uis_for(location, target, |s| {
+            if s == from {
+                Some(to)
+            } else if from < to && s > from && s <= to {
+                Some(s - 1)
+            } else if from > to && s >= to && s < from {
+                Some(s + 1)
+            } else {
+                Some(s)
+            }
+        });
         tracing::info!(location, target, from, to, "moved plugin");
         true
     }
