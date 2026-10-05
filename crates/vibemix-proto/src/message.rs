@@ -275,6 +275,15 @@ pub enum ControlMessage {
     MissingConnections {
         json: String,
     },
+    /// One part of a message too large for a single UDP datagram. `data` is a
+    /// slice of the encoded inner message; the receiver concatenates the parts
+    /// (ordered by `index`, grouped by `transfer`) and decodes the result.
+    Chunk {
+        transfer: u32,
+        index: u32,
+        total: u32,
+        data: Vec<u8>,
+    },
     /// Boxed: fourteen `Vec<f32>` make this the largest variant by far, and
     /// boxing keeps `ControlMessage` itself small.
     Meters(Box<MetersData>),
@@ -808,6 +817,20 @@ impl ControlMessage {
                 addr: addr::CONNECTIONS_MISSING.to_string(),
                 args: vec![OscType::String(json.clone())],
             },
+            Chunk {
+                transfer,
+                index,
+                total,
+                data,
+            } => OscMessage {
+                addr: addr::CHUNK.to_string(),
+                args: vec![
+                    OscType::Int(*transfer as i32),
+                    OscType::Int(*index as i32),
+                    OscType::Int(*total as i32),
+                    OscType::Blob(data.clone()),
+                ],
+            },
             Meters(data) => {
                 let strip_count = data.strips_out_l.len();
                 let bus_count = data.buses_l.len();
@@ -1124,6 +1147,12 @@ impl ControlMessage {
             addr::CONNECTIONS_MISSING => Some(ControlMessage::MissingConnections {
                 json: string(args, 0)?,
             }),
+            addr::CHUNK => Some(ControlMessage::Chunk {
+                transfer: int(args, 0)? as u32,
+                index: int(args, 1)? as u32,
+                total: int(args, 2)? as u32,
+                data: blob(args, 3)?,
+            }),
             addr::METERS => {
                 let strip_count = int(args, 0)? as usize;
                 let strips_in_l = float_run(args, 1, strip_count)?;
@@ -1171,6 +1200,107 @@ impl ControlMessage {
         let (_remaining, packet) = rosc::decoder::decode_udp(bytes).ok()?;
         Self::from_packet(packet)
     }
+
+    /// Encodes this message, splitting it into ordered [`ControlMessage::Chunk`]
+    /// datagrams when the encoded form exceeds [`MAX_DATAGRAM`]. A message sent
+    /// as one datagram fails with `EMSGSIZE` once it passes the UDP payload
+    /// limit, which the plugin catalog does with many plugins installed.
+    pub fn encode_datagrams(&self) -> Result<Vec<Vec<u8>>, rosc::OscError> {
+        let bytes = self.encode()?;
+        if bytes.len() <= MAX_DATAGRAM {
+            return Ok(vec![bytes]);
+        }
+        let total = bytes.len().div_ceil(CHUNK_SIZE);
+        let transfer = NEXT_TRANSFER.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let mut datagrams = Vec::with_capacity(total);
+        for (index, part) in bytes.chunks(CHUNK_SIZE).enumerate() {
+            let mut data = part.to_vec();
+            // Keep the payload off a 4-byte boundary too: rosc's blob decoder
+            // mis-reads the padding when the blob length is 4-aligned (see
+            // `CHUNK_SIZE`). The extra trailing byte is ignored when the
+            // reassembled message is decoded.
+            if data.len() % 4 == 0 {
+                data.push(0);
+            }
+            datagrams.push(
+                ControlMessage::Chunk {
+                    transfer,
+                    index: index as u32,
+                    total: total as u32,
+                    data,
+                }
+                .encode()?,
+            );
+        }
+        Ok(datagrams)
+    }
+}
+
+/// Largest encoded message we put in a single UDP datagram. Comfortably below
+/// the ~65507-byte IPv4 UDP payload limit, leaving room for the OSC framing of
+/// the chunk that carries it.
+pub const MAX_DATAGRAM: usize = 32 * 1024;
+
+/// Chunk payload size. Deliberately not a multiple of 4: rosc's blob decoder
+/// (`pad_to_32_bit_boundary`) asks for 4 padding bytes instead of 0 when the
+/// blob length is 4-aligned, which would fail to decode the last argument of a
+/// `Chunk`. A per-chunk guard below keeps the final chunk off the boundary too.
+const CHUNK_SIZE: usize = MAX_DATAGRAM - 1;
+
+/// Source of ids that group a chunked transfer.
+static NEXT_TRANSFER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+
+/// Reassembles [`ControlMessage::Chunk`] datagrams into the original message.
+/// Feed every received message through [`ChunkAssembler::accept`].
+#[derive(Default)]
+pub struct ChunkAssembler {
+    active: bool,
+    transfer: u32,
+    total: u32,
+    parts: Vec<Option<Vec<u8>>>,
+    received: u32,
+}
+
+impl ChunkAssembler {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns the message to handle: the input itself when it is not a chunk,
+    /// or the reassembled original once the last chunk of a transfer arrives.
+    /// Returns `None` while a transfer is still incomplete.
+    pub fn accept(&mut self, message: ControlMessage) -> Option<ControlMessage> {
+        let ControlMessage::Chunk {
+            transfer,
+            index,
+            total,
+            data,
+        } = message
+        else {
+            return Some(message);
+        };
+        if !self.active || self.transfer != transfer || self.total != total {
+            self.active = true;
+            self.transfer = transfer;
+            self.total = total;
+            self.parts = vec![None; total as usize];
+            self.received = 0;
+        }
+        let slot = self.parts.get_mut(index as usize)?;
+        if slot.is_none() {
+            *slot = Some(data);
+            self.received += 1;
+        }
+        if self.received < self.total {
+            return None;
+        }
+        self.active = false;
+        let mut bytes = Vec::new();
+        for part in self.parts.drain(..) {
+            bytes.extend_from_slice(part.as_deref()?);
+        }
+        ControlMessage::decode(&bytes)
+    }
 }
 
 fn int(args: &[OscType], index: usize) -> Option<i32> {
@@ -1204,6 +1334,13 @@ fn as_f32(value: &OscType) -> Option<f32> {
 fn string(args: &[OscType], index: usize) -> Option<String> {
     match args.get(index) {
         Some(OscType::String(value)) => Some(value.clone()),
+        _ => None,
+    }
+}
+
+fn blob(args: &[OscType], index: usize) -> Option<Vec<u8>> {
+    match args.get(index) {
+        Some(OscType::Blob(value)) => Some(value.clone()),
         _ => None,
     }
 }
@@ -1573,5 +1710,53 @@ mod tests {
             args: Vec::new(),
         });
         assert_eq!(ControlMessage::from_packet(packet), None);
+    }
+
+    #[test]
+    fn roundtrip_chunk() {
+        roundtrip(ControlMessage::Chunk {
+            transfer: 7,
+            index: 1,
+            total: 3,
+            data: vec![0, 1, 2, 3, 250, 251, 252],
+        });
+    }
+
+    #[test]
+    fn small_message_is_one_datagram() {
+        let message = ControlMessage::Catalog {
+            json: "[]".to_string(),
+        };
+        let datagrams = message.encode_datagrams().unwrap();
+        assert_eq!(datagrams.len(), 1);
+        let mut assembler = ChunkAssembler::new();
+        assert_eq!(
+            assembler.accept(message),
+            Some(ControlMessage::Catalog {
+                json: "[]".to_string()
+            })
+        );
+    }
+
+    #[test]
+    fn large_message_chunks_and_reassembles() {
+        let json = "p".repeat(MAX_DATAGRAM * 2 + 123);
+        let message = ControlMessage::Catalog { json: json.clone() };
+        let datagrams = message.encode_datagrams().unwrap();
+        assert!(datagrams.len() >= 3, "expected several chunks");
+        for datagram in &datagrams {
+            assert!(
+                datagram.len() <= 65_507,
+                "chunk of {} bytes exceeds the UDP payload limit",
+                datagram.len()
+            );
+        }
+        let mut assembler = ChunkAssembler::new();
+        let mut result = None;
+        for datagram in datagrams {
+            let decoded = ControlMessage::decode(&datagram).expect("chunk decodes");
+            result = assembler.accept(decoded);
+        }
+        assert_eq!(result, Some(ControlMessage::Catalog { json }));
     }
 }

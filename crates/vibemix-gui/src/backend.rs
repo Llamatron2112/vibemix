@@ -9,7 +9,7 @@ use std::time::Duration;
 use std::fs;
 
 use cxx_qt_lib::QString;
-use vibemix_proto::ControlMessage;
+use vibemix_proto::{message::ChunkAssembler, ControlMessage};
 
 static SOCKET: OnceLock<UdpSocket> = OnceLock::new();
 static ENGINE_ADDR: OnceLock<SocketAddr> = OnceLock::new();
@@ -201,9 +201,14 @@ fn send(message: ControlMessage) {
 
 fn receive_loop(socket: UdpSocket) {
     let mut buffer = [0u8; 65536];
+    let mut assembler = ChunkAssembler::new();
     loop {
         if let Ok((length, _)) = socket.recv_from(&mut buffer) {
-            match ControlMessage::decode(&buffer[..length]) {
+            // Reassemble chunked messages (e.g. a large plugin catalog) before
+            // dispatching; non-chunk messages pass straight through.
+            let assembled = ControlMessage::decode(&buffer[..length])
+                .and_then(|message| assembler.accept(message));
+            match assembled {
                 Some(ControlMessage::State { json }) => {
                     // Parse the snapshot once and feed every consumer from it.
                     let value: serde_json::Value =

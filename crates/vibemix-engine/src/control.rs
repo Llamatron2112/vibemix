@@ -1162,6 +1162,9 @@ impl Controller {
             | ControlMessage::PluginScan { .. }
             | ControlMessage::SessionResult { .. }
             | ControlMessage::MissingConnections { .. } => Actions::default(),
+            // Chunk envelopes are reassembled by the receiver before dispatch;
+            // the engine never expects one inbound, but ignore it if it arrives.
+            ControlMessage::Chunk { .. } => Actions::default(),
             ControlMessage::SaveSession {
                 path,
                 width,
@@ -2994,8 +2997,22 @@ impl Controller {
         let message = ControlMessage::Catalog {
             json: self.catalog_json.clone(),
         };
-        if let Ok(bytes) = message.encode() {
-            let _ = self.socket.send_to(&bytes, address);
+        self.send_message(&message, address);
+    }
+
+    /// Encodes and sends a control message, splitting it into `Chunk` datagrams
+    /// when it exceeds the UDP payload limit. Failures are logged: an oversized
+    /// message used to be dropped silently, which hid the plugin catalog.
+    fn send_message(&self, message: &ControlMessage, address: SocketAddr) {
+        match message.encode_datagrams() {
+            Ok(datagrams) => {
+                for datagram in datagrams {
+                    if let Err(error) = self.socket.send_to(&datagram, address) {
+                        tracing::warn!(%error, %address, "failed to send control message");
+                    }
+                }
+            }
+            Err(error) => tracing::warn!(%error, "failed to encode control message"),
         }
     }
 
@@ -3005,9 +3022,7 @@ impl Controller {
             done: self.scan.done as u32,
             total: self.scan.total as u32,
         };
-        if let Ok(bytes) = message.encode() {
-            let _ = self.socket.send_to(&bytes, address);
-        }
+        self.send_message(&message, address);
     }
 
     fn send_state(&self, address: SocketAddr) {
@@ -3020,18 +3035,14 @@ impl Controller {
                 self.engine.xrun_count(),
             ),
         };
-        if let Ok(bytes) = message.encode() {
-            let _ = self.socket.send_to(&bytes, address);
-        }
+        self.send_message(&message, address);
     }
 
     fn send_missing(&self, address: SocketAddr, json: &str) {
         let message = ControlMessage::MissingConnections {
             json: json.to_string(),
         };
-        if let Ok(bytes) = message.encode() {
-            let _ = self.socket.send_to(&bytes, address);
-        }
+        self.send_message(&message, address);
     }
 
     fn send_session_result(&self, address: SocketAddr, ok: bool, path: &str, error: &str) {
@@ -3040,9 +3051,7 @@ impl Controller {
             path: path.to_string(),
             error: error.to_string(),
         };
-        if let Ok(bytes) = message.encode() {
-            let _ = self.socket.send_to(&bytes, address);
-        }
+        self.send_message(&message, address);
     }
 
     fn send_clipboard(&self, address: SocketAddr) {
@@ -3055,9 +3064,7 @@ impl Controller {
             location,
             name,
         };
-        if let Ok(bytes) = message.encode() {
-            let _ = self.socket.send_to(&bytes, address);
-        }
+        self.send_message(&message, address);
     }
 
     fn send_edit_state(&self, address: SocketAddr) {
@@ -3075,9 +3082,7 @@ impl Controller {
                 .map(|entry| entry.label.clone())
                 .unwrap_or_default(),
         };
-        if let Ok(bytes) = message.encode() {
-            let _ = self.socket.send_to(&bytes, address);
-        }
+        self.send_message(&message, address);
     }
 }
 

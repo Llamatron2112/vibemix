@@ -64,3 +64,6 @@ pub const MIDI_BIND: &str = "/vibemix/midi/bind";
 pub const MIDI_UNBIND: &str = "/vibemix/midi/unbind";
 pub const CONNECTIONS_MISSING: &str = "/vibemix/connections/missing";
 pub const METERS: &str = "/vibemix/meters";
+/// One part of a message too large for a single UDP datagram (see
+/// [`crate::message::ChunkAssembler`]).
+pub const CHUNK: &str = "/vibemix/chunk";
