@@ -78,6 +78,10 @@ const LV2_PORT_PROPERTY: &str = "http://lv2plug.in/ns/lv2core#portProperty";
 const LV2_SCALE_POINT: &str = "http://lv2plug.in/ns/lv2core#scalePoint";
 const RDF_VALUE: &str = "http://www.w3.org/1999/02/22-rdf-syntax-ns#value";
 const RDFS_LABEL: &str = "http://www.w3.org/2000/01/rdf-schema#label";
+const RDFS_COMMENT: &str = "http://www.w3.org/2000/01/rdf-schema#comment";
+const DOAP_SHORTDESC: &str = "http://usefulinc.com/ns/doap#shortdesc";
+const DOAP_HOMEPAGE: &str = "http://usefulinc.com/ns/doap#homepage";
+const DOAP_LICENSE: &str = "http://usefulinc.com/ns/doap#license";
 /// Optional operator escape hatch: comma-separated URIs to keep out of the
 /// catalog entirely. There is no built-in list; crashing plugins are surfaced
 /// with a red name instead (see the plugin health sweep).
@@ -122,6 +126,21 @@ pub struct PluginInfo {
     pub optional_features: Vec<String>,
     pub hostable: bool,
     pub has_ui: bool,
+    /// Human class label from lilv (e.g. "Delay", "Reverb", "Instrument").
+    #[serde(default)]
+    pub class_label: String,
+    #[serde(default)]
+    pub author: String,
+    /// `doap:shortdesc`, falling back to `rdfs:comment`.
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub homepage: String,
+    #[serde(default)]
+    pub license: String,
+    /// URI of the bundle the plugin lives in.
+    #[serde(default)]
+    pub bundle: Option<String>,
 }
 
 pub struct Host {
@@ -140,6 +159,16 @@ impl Host {
             world,
             urid: UridMap::shared(),
         }
+    }
+
+    /// First string value of `uri` on `plugin`, or an empty string.
+    fn property_string(&self, plugin: &lilv::plugin::Plugin, uri: &str) -> String {
+        let predicate = self.world.new_uri(uri);
+        plugin
+            .value(&predicate)
+            .iter()
+            .find_map(|node| node.as_str().map(str::to_string))
+            .unwrap_or_default()
     }
 
     fn property_float(&self, port: &lilv::port::Port, uri: &str) -> Option<f32> {
@@ -389,6 +418,12 @@ impl Host {
             }
             let classified = self.classify(&plugin);
             let uri = plugin.uri().as_uri().unwrap_or_default().to_string();
+            let shortdesc = self.property_string(&plugin, DOAP_SHORTDESC);
+            let description = if shortdesc.is_empty() {
+                self.property_string(&plugin, RDFS_COMMENT)
+            } else {
+                shortdesc
+            };
             infos.push(PluginInfo {
                 has_ui: ui::find_ui(&uri).is_some(),
                 uri,
@@ -404,6 +439,15 @@ impl Host {
                 required_features: feature_uris(&plugin.required_features()),
                 optional_features: feature_uris(&plugin.optional_features()),
                 hostable: classified.hostable,
+                class_label: plugin.class().label().as_str().unwrap_or_default().to_string(),
+                author: plugin
+                    .author_name()
+                    .and_then(|node| node.as_str().map(str::to_string))
+                    .unwrap_or_default(),
+                description,
+                homepage: self.property_string(&plugin, DOAP_HOMEPAGE),
+                license: self.property_string(&plugin, DOAP_LICENSE),
+                bundle: plugin.bundle_uri().as_uri().map(str::to_string),
             });
         }
         infos

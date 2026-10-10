@@ -363,6 +363,9 @@ char* vst3_scan(const char* dir) {
                 json += "{\"class_id\":\"" + hex_uid(ci.ID()) + "\"";
                 json += ",\"name\":\"" + json_escape(ci.name()) + "\"";
                 json += ",\"vendor\":\"" + json_escape(ci.vendor()) + "\"";
+                json += ",\"version\":\"" + json_escape(ci.version()) + "\"";
+                json += ",\"category\":\"" + json_escape(ci.category()) + "\"";
+                json += ",\"subcategories\":\"" + json_escape(ci.subCategoriesString()) + "\"";
                 json += ",\"bundle\":\"" + json_escape(path.string()) + "\"";
                 json += "}";
             }

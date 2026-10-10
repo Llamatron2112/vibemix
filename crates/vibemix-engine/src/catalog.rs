@@ -74,7 +74,23 @@ pub struct PluginEntry {
     /// LV2 URI or VST3 class id (the identifier sent to the GUI and sessions).
     pub id: String,
     pub name: String,
-    /// `.vst3` bundle path (VST3 only).
+    /// Vendor / author shown in the browser.
+    #[serde(default)]
+    pub vendor: String,
+    /// Short category shown in the browser (e.g. "Delay", "Reverb").
+    #[serde(default)]
+    pub category: String,
+    /// Plugin version (VST3 only).
+    #[serde(default)]
+    pub version: String,
+    /// One-line description (LV2 only).
+    #[serde(default)]
+    pub description: String,
+    #[serde(default)]
+    pub homepage: String,
+    #[serde(default)]
+    pub license: String,
+    /// `.vst3` bundle path (VST3) or LV2 bundle URI.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<String>,
     #[serde(default)]

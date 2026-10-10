@@ -31,6 +31,14 @@ pub struct PluginInfo {
     pub class_id: String,
     pub name: String,
     pub vendor: String,
+    #[serde(default)]
+    pub version: String,
+    /// SDK class category (e.g. "Audio Module Class").
+    #[serde(default)]
+    pub category: String,
+    /// Pipe-separated subcategories (e.g. "Fx|Delay").
+    #[serde(default)]
+    pub subcategories: String,
     /// Path to the `.vst3` bundle.
     pub bundle: String,
 }

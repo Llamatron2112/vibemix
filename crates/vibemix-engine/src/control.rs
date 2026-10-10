@@ -3405,7 +3405,15 @@ fn build_catalog(plugins: &[PluginEntry], health: &HealthStore) -> String {
                 "uri": entry.id,
                 "format": entry.format.as_str(),
                 "name": entry.name,
+                "vendor": entry.vendor,
+                "category": entry.category,
+                "version": entry.version,
+                "description": entry.description,
+                "homepage": entry.homepage,
+                "license": entry.license,
+                "bundle": entry.bundle,
                 "has_ui": entry.has_ui,
+                "has_sidechain": entry.has_sidechain,
                 "inputs": entry.inputs,
                 "outputs": entry.outputs,
                 "midi": entry.midi,
@@ -3474,6 +3482,31 @@ fn spawn_ui_smoke(map: Arc<Mutex<HashMap<String, bool>>>, key: String, args: Vec
         });
 }
 
+/// Picks the most specific VST3 subcategory that isn't a channel descriptor.
+/// The SDK lists subcategories general-to-specific ("Fx|Delay"), but some
+/// plugins (e.g. LSP) append the channel layout ("Fx|Stereo"), so the leaf is
+/// not always the useful one.
+fn vst3_category(subcategories: &str, category: &str) -> String {
+    let segments: Vec<&str> = subcategories
+        .split('|')
+        .filter(|segment| !segment.is_empty())
+        .collect();
+    for segment in segments.iter().rev() {
+        let lower = segment.to_ascii_lowercase();
+        if lower != "mono" && lower != "stereo" && lower != "surround" {
+            return (*segment).to_string();
+        }
+    }
+    if let Some(first) = segments.first() {
+        return (*first).to_string();
+    }
+    if category.is_empty() {
+        "Effect".to_string()
+    } else {
+        category.to_string()
+    }
+}
+
 fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> {
     let mut entries: Vec<PluginEntry> = host
         .discover()
@@ -3490,7 +3523,13 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
                 format: PluginFormat::Lv2,
                 id: info.uri,
                 name: info.name,
-                bundle: None,
+                vendor: info.author,
+                category: info.class_label,
+                version: String::new(),
+                description: info.description,
+                homepage: info.homepage,
+                license: info.license,
+                bundle: info.bundle,
                 has_ui: info.has_ui,
                 has_sidechain: info.audio_inputs.len() > info.main_input_count,
                 inputs: info.audio_inputs.len(),
@@ -3503,10 +3542,17 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
         })
         .collect();
     for info in vst3.discover() {
+        let category = vst3_category(&info.subcategories, &info.category);
         entries.push(PluginEntry {
             format: PluginFormat::Vst3,
             id: info.class_id,
             name: info.name,
+            vendor: info.vendor,
+            category,
+            version: info.version,
+            description: String::new(),
+            homepage: String::new(),
+            license: String::new(),
             bundle: Some(info.bundle),
             has_ui: false,
             has_sidechain: false,
@@ -3530,6 +3576,18 @@ struct CatalogEntry {
     #[serde(alias = "uri")]
     id: String,
     name: String,
+    #[serde(default)]
+    vendor: String,
+    #[serde(default)]
+    category: String,
+    #[serde(default)]
+    version: String,
+    #[serde(default)]
+    description: String,
+    #[serde(default)]
+    homepage: String,
+    #[serde(default)]
+    license: String,
     #[serde(default)]
     format: PluginFormat,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -3559,6 +3617,12 @@ fn load_catalog() -> Vec<PluginEntry> {
             format: entry.format,
             id: entry.id,
             name: entry.name,
+            vendor: entry.vendor,
+            category: entry.category,
+            version: entry.version,
+            description: entry.description,
+            homepage: entry.homepage,
+            license: entry.license,
             bundle: entry.bundle,
             has_ui: entry.has_ui,
             has_sidechain: entry.has_sidechain,
@@ -3578,6 +3642,12 @@ fn save_catalog(plugins: &[PluginEntry]) {
         .map(|entry| CatalogEntry {
             id: entry.id.clone(),
             name: entry.name.clone(),
+            vendor: entry.vendor.clone(),
+            category: entry.category.clone(),
+            version: entry.version.clone(),
+            description: entry.description.clone(),
+            homepage: entry.homepage.clone(),
+            license: entry.license.clone(),
             format: entry.format,
             bundle: entry.bundle.clone(),
             has_ui: entry.has_ui,

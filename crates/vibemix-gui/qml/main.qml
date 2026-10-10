@@ -282,7 +282,47 @@ ApplicationWindow {
             if (!needle) return true
             return entry.name.toLowerCase().indexOf(needle) >= 0
                 || entry.uri.toLowerCase().indexOf(needle) >= 0
+                || (entry.vendor || "").toLowerCase().indexOf(needle) >= 0
+                || (entry.category || "").toLowerCase().indexOf(needle) >= 0
         })
+    }
+    // Muted second line of a picker row: vendor · category.
+    function pluginSubtitle(entry) {
+        var parts = []
+        if (entry.vendor) parts.push(entry.vendor)
+        if (entry.category) parts.push(entry.category)
+        return parts.join(" \u00b7 ")
+    }
+    function formatLabel(entry) {
+        return entry.format === "vst3" ? "VST3" : "LV2"
+    }
+    function channelText(entry) {
+        if (!entry.inputs && !entry.outputs) return ""
+        return entry.inputs + " in / " + entry.outputs + " out"
+    }
+    // Label/value rows for the details panel; empty values are omitted.
+    function pluginDetails(entry) {
+        if (!entry) return []
+        var rows = []
+        function add(label, value) {
+            if (value === undefined || value === null) return
+            var text = String(value)
+            if (text.length === 0) return
+            rows.push({ label: label, value: text })
+        }
+        add("Vendor", entry.vendor)
+        add("Category", entry.category)
+        add("Version", entry.version)
+        add("Format", root.formatLabel(entry))
+        add("Channels", root.channelText(entry))
+        add("MIDI", entry.midi ? "yes" : "")
+        add("Sidechain", entry.has_sidechain ? "yes" : "")
+        add("Homepage", entry.homepage)
+        add("License", entry.license)
+        add("ID", entry.uri)
+        add("Bundle", entry.bundle)
+        if (entry.status && entry.status !== "ok") add("Status", root.pluginStatusText(entry))
+        return rows
     }
     function localPath(url) {
         var text = String(url)
@@ -981,6 +1021,7 @@ ApplicationWindow {
         pickerWindow.target = target
         pickerFilter.text = ""
         pickerWindow.channelFilter = ""
+        pickerList.currentIndex = 0
         pickerWindow.show()
     }
 
@@ -2906,15 +2947,19 @@ ApplicationWindow {
         property bool scanning: false
         property bool hideFailed: false
         property string channelFilter: ""
+        // Model and selection are shared by the list and the details panel.
+        property var filtered: root.filteredCatalog(pickerFilter.text, channelFilter, hideFailed)
+        property var currentEntry: (pickerList.currentIndex >= 0 && pickerList.currentIndex < filtered.length)
+            ? filtered[pickerList.currentIndex] : null
 
         modality: Qt.ApplicationModal
         flags: Qt.Dialog
         transientParent: root
         visible: false
-        width: 440
-        height: 520
-        minimumWidth: 320
-        minimumHeight: 240
+        width: 720
+        height: 540
+        minimumWidth: 560
+        minimumHeight: 260
         title: pickerWindow.location === 2
             ? "add bus insert"
             : (pickerWindow.location === 1 ? "add post-fader plugin" : "add pre-fader plugin")
@@ -3006,59 +3051,148 @@ ApplicationWindow {
                 }
             }
 
-            Label {
-                Layout.fillWidth: true
-                text: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter, pickerWindow.hideFailed).length
-                    + " / " + catalog.length + " plugins"
-                color: root.mutedText
-                font.pixelSize: 9
-            }
-
-            ListView {
-                id: pickerList
+            SplitView {
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                clip: true
-                model: root.filteredCatalog(pickerFilter.text, pickerWindow.channelFilter, pickerWindow.hideFailed)
-                boundsBehavior: Flickable.StopAtBounds
-                ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+                orientation: Qt.Horizontal
 
-                delegate: Rectangle {
-                    id: pickerRow
-                    width: ListView.view.width
-                    height: 22
-                    color: pickerMouse.containsMouse ? root.controlColor : "transparent"
+                ColumnLayout {
+                    SplitView.minimumWidth: 260
+                    SplitView.preferredWidth: pickerWindow.width * 0.56
+                    spacing: 4
 
                     Label {
-                        anchors.left: parent.left
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.leftMargin: 4
-                        anchors.right: statusLabel.left
-                        anchors.rightMargin: 8
-                        text: modelData.name
-                        elide: Text.ElideRight
-                        color: root.pluginFailed(modelData) ? "#e53935" : root.textColor
-                        font.pixelSize: 11
-                    }
-
-                    Label {
-                        id: statusLabel
-                        anchors.right: parent.right
-                        anchors.verticalCenter: parent.verticalCenter
-                        anchors.rightMargin: 8
-                        text: root.pluginStatusText(modelData)
-                        color: "#e53935"
+                        Layout.fillWidth: true
+                        text: pickerWindow.filtered.length + " / " + catalog.length + " plugins"
+                        color: root.mutedText
                         font.pixelSize: 9
-                        visible: text.length > 0
                     }
 
-                    MouseArea {
-                        id: pickerMouse
-                        anchors.fill: parent
-                        hoverEnabled: true
-                        onClicked: {
-                            backend.addPlugin(pickerWindow.location, pickerWindow.target, modelData.uri)
-                            pickerWindow.close()
+                    ListView {
+                        id: pickerList
+                        Layout.fillWidth: true
+                        Layout.fillHeight: true
+                        clip: true
+                        model: pickerWindow.filtered
+                        boundsBehavior: Flickable.StopAtBounds
+                        ScrollBar.vertical: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                        delegate: Rectangle {
+                            id: pickerRow
+                            width: ListView.view.width
+                            height: 34
+                            color: pickerMouse.containsMouse || ListView.isCurrentItem
+                                ? root.controlColor : "transparent"
+
+                            Column {
+                                anchors.left: parent.left
+                                anchors.leftMargin: 6
+                                anchors.right: rightInfo.left
+                                anchors.rightMargin: 6
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 1
+
+                                Label {
+                                    width: parent.width
+                                    text: modelData.name
+                                    elide: Text.ElideRight
+                                    color: root.pluginFailed(modelData) ? "#e53935" : root.textColor
+                                    font.pixelSize: 11
+                                }
+                                Label {
+                                    width: parent.width
+                                    text: root.pluginSubtitle(modelData)
+                                    elide: Text.ElideRight
+                                    color: root.mutedText
+                                    font.pixelSize: 9
+                                    visible: text.length > 0
+                                }
+                            }
+
+                            Row {
+                                id: rightInfo
+                                anchors.right: parent.right
+                                anchors.rightMargin: 8
+                                anchors.verticalCenter: parent.verticalCenter
+                                spacing: 6
+
+                                Label {
+                                    text: root.formatLabel(modelData)
+                                    color: root.mutedText
+                                    font.pixelSize: 8
+                                }
+                                Label {
+                                    id: statusLabel
+                                    text: root.pluginStatusText(modelData)
+                                    color: "#e53935"
+                                    font.pixelSize: 9
+                                    visible: text.length > 0
+                                }
+                            }
+
+                            MouseArea {
+                                id: pickerMouse
+                                anchors.fill: parent
+                                hoverEnabled: true
+                                onEntered: pickerList.currentIndex = index
+                                onClicked: {
+                                    backend.addPlugin(pickerWindow.location, pickerWindow.target, modelData.uri)
+                                    pickerWindow.close()
+                                }
+                            }
+                        }
+                    }
+                }
+
+                ScrollView {
+                    id: pickerDetails
+                    SplitView.minimumWidth: 220
+                    SplitView.fillWidth: true
+                    contentWidth: availableWidth
+                    clip: true
+
+                    ColumnLayout {
+                        width: pickerDetails.availableWidth
+                        spacing: 5
+
+                        Label {
+                            Layout.fillWidth: true
+                            text: pickerWindow.currentEntry ? pickerWindow.currentEntry.name : "Select a plugin"
+                            color: root.textColor
+                            font.bold: true
+                            font.pixelSize: 12
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Label {
+                            Layout.fillWidth: true
+                            visible: text.length > 0
+                            text: pickerWindow.currentEntry ? pickerWindow.currentEntry.description : ""
+                            color: root.mutedText
+                            font.pixelSize: 10
+                            wrapMode: Text.WordWrap
+                        }
+
+                        Repeater {
+                            model: root.pluginDetails(pickerWindow.currentEntry)
+                            delegate: RowLayout {
+                                Layout.fillWidth: true
+                                spacing: 6
+
+                                Label {
+                                    text: modelData.label
+                                    color: root.mutedText
+                                    font.pixelSize: 9
+                                    Layout.preferredWidth: 60
+                                }
+                                Label {
+                                    Layout.fillWidth: true
+                                    text: modelData.value
+                                    color: root.textColor
+                                    font.pixelSize: 9
+                                    elide: Text.ElideMiddle
+                                }
+                            }
                         }
                     }
                 }
