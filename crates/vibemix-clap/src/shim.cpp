@@ -188,7 +188,6 @@ struct Hosted {
   std::atomic<bool> want_callback{false};
   std::atomic<bool> want_process{false};
   std::atomic<bool> want_restart{false};
-  std::atomic<bool> want_flush{false};
 
   std::vector<Timer> timers;
 
@@ -222,8 +221,10 @@ static bool host_is_audio_thread(const clap_host_t*) { return tls_audio_thread; 
 
 static void host_params_rescan(const clap_host_t*, clap_param_rescan_flags) {}
 static void host_params_clear(const clap_host_t*, clap_id, clap_param_clear_flags) {}
-static void host_params_flush(const clap_host_t* host) {
-  if (Hosted* h = self(host)) h->want_flush.store(true);
+static void host_params_flush(const clap_host_t*) {
+  // `clap_plugin_params.flush` is [active ? audio-thread : main-thread]; since
+  // we process continuously, pending host parameter changes are delivered in
+  // process(). Nothing to do here.
 }
 
 static void host_gui_hints_changed(const clap_host_t*) {}
@@ -940,14 +941,6 @@ static int64_t now_ms() {
 extern "C" void clap_poll(void* handle) {
   Hosted* h = static_cast<Hosted*>(handle);
   if (!h || !h->plugin) return;
-  if (h->want_flush.exchange(false) && h->params && h->params->flush) {
-    InEvents in_ctx;
-    OutEvents out_ctx;
-    clap_input_events_t in_list{&in_ctx, in_events_size, in_events_get};
-    clap_output_events_t out_list{&out_ctx, out_events_push};
-    h->params->flush(h->plugin, &in_list, &out_list);
-    apply_output_events(h, out_ctx);
-  }
   const bool callback = h->want_callback.exchange(false);
   h->want_process.exchange(false);
   h->want_restart.exchange(false);
@@ -1001,8 +994,17 @@ extern "C" void* clap_view_open(void* instance, const char* title) {
     XCloseDisplay(dpy);
     return nullptr;
   }
-  if (h->gui->suggest_title) h->gui->suggest_title(h->plugin, wm_title);
+  // The host titles the embedded window itself (XStoreName above);
+  // `suggest_title` is only valid for floating windows, and plugins that
+  // enforce the CLAP contract abort if it is called on an embedded one.
   if (h->gui->show) h->gui->show(h->plugin);
+  if (std::getenv("VIBEMIX_CLAP_DEBUG")) {
+    XWindowAttributes attrs {};
+    XSync(dpy, False);
+    XGetWindowAttributes(dpy, win, &attrs);
+    std::fprintf(stderr, "[clap] view win=0x%lx map_state=%d %dx%d\n", (unsigned long)win,
+                 attrs.map_state, attrs.width, attrs.height);
+  }
   h->dpy = dpy;
   h->win = win;
   h->gui_created = true;
