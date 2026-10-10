@@ -103,12 +103,60 @@ pub fn smoke_plugin_vst3_ui(bundle: &str, class_id: &str) -> i32 {
     }
 }
 
+/// Instantiates a CLAP plugin and runs a few blocks of DC input.
+pub fn smoke_plugin_clap(bundle: &str, plugin_id: &str) -> i32 {
+    let host = vibemix_clap::Host::new();
+    let Some(mut instance) = host.instantiate(
+        bundle,
+        plugin_id,
+        48_000.0,
+        SMOKE_FRAMES,
+        vibemix_clap::PluginInstance::max_frames(),
+    ) else {
+        return SMOKE_INSTANTIATE_FAILED;
+    };
+    for _ in 0..SMOKE_BLOCKS {
+        for channel in 0..instance.audio_input_count() {
+            for sample in instance.input_buffer_mut(channel)[..SMOKE_FRAMES].iter_mut() {
+                *sample = 0.1;
+            }
+        }
+        instance.run(SMOKE_FRAMES);
+    }
+    SMOKE_OK
+}
+
+/// Creates and tears down a CLAP plugin's editor, so a crashing editor is
+/// caught before the engine opens one for real.
+pub fn smoke_plugin_clap_ui(bundle: &str, plugin_id: &str) -> i32 {
+    let host = vibemix_clap::Host::new();
+    let Some(instance) = host.instantiate(
+        bundle,
+        plugin_id,
+        48_000.0,
+        SMOKE_FRAMES,
+        vibemix_clap::PluginInstance::max_frames(),
+    ) else {
+        return SMOKE_INSTANTIATE_FAILED;
+    };
+    let Some(view) = instance.instance_handle().open_view("vibemix clap smoke") else {
+        return SMOKE_FAILED;
+    };
+    drop(view);
+    SMOKE_OK
+}
+
 /// A plugin to smoke-test.
 enum SmokeTarget {
     Lv2 { uri: String, name: String },
     Vst3 {
         bundle: String,
         class_id: String,
+        name: String,
+    },
+    Clap {
+        bundle: String,
+        plugin_id: String,
         name: String,
     },
 }
@@ -118,12 +166,15 @@ impl SmokeTarget {
         match self {
             SmokeTarget::Lv2 { uri, .. } => uri,
             SmokeTarget::Vst3 { class_id, .. } => class_id,
+            SmokeTarget::Clap { plugin_id, .. } => plugin_id,
         }
     }
 
     fn name(&self) -> &str {
         match self {
-            SmokeTarget::Lv2 { name, .. } | SmokeTarget::Vst3 { name, .. } => name,
+            SmokeTarget::Lv2 { name, .. }
+            | SmokeTarget::Vst3 { name, .. }
+            | SmokeTarget::Clap { name, .. } => name,
         }
     }
 
@@ -133,6 +184,9 @@ impl SmokeTarget {
             SmokeTarget::Vst3 {
                 bundle, class_id, ..
             } => smoke_plugin_vst3(bundle, class_id),
+            SmokeTarget::Clap {
+                bundle, plugin_id, ..
+            } => smoke_plugin_clap(bundle, plugin_id),
         }
     }
 }
@@ -184,6 +238,15 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
             targets.push(SmokeTarget::Vst3 {
                 bundle: info.bundle,
                 class_id: info.class_id,
+                name: info.name,
+            });
+        }
+    }
+    for info in vibemix_clap::Host::new().discover() {
+        if in_only(&info.id) {
+            targets.push(SmokeTarget::Clap {
+                bundle: info.bundle,
+                plugin_id: info.id,
                 name: info.name,
             });
         }

@@ -63,6 +63,18 @@ struct Args {
     #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "CLASS"])]
     probe_vst3: Vec<String>,
 
+    /// Smoke-test a CLAP plugin: `--smoke-clap <bundle> <plugin-id>`.
+    #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "PLUGIN"])]
+    smoke_clap: Vec<String>,
+
+    /// Smoke-test a CLAP editor headlessly: `--smoke-clap-ui <bundle> <plugin-id>`.
+    #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "PLUGIN"])]
+    smoke_clap_ui: Vec<String>,
+
+    /// Probe a CLAP plugin's audio path: `--probe-clap <bundle> <plugin-id>`.
+    #[arg(long, hide = true, num_args = 2, value_names = ["BUNDLE", "PLUGIN"])]
+    probe_clap: Vec<String>,
+
     /// Verbose plugin diagnostics (also via VIBEMIX_DEBUG=1).
     #[arg(long)]
     debug: bool,
@@ -118,6 +130,15 @@ fn main() -> Result<()> {
     if args.probe_vst3.len() == 2 {
         run_probe_vst3(&args.probe_vst3[0], &args.probe_vst3[1]);
     }
+    if args.smoke_clap.len() == 2 {
+        run_smoke_clap(&args.smoke_clap[0], &args.smoke_clap[1]);
+    }
+    if args.smoke_clap_ui.len() == 2 {
+        run_smoke_clap_ui(&args.smoke_clap_ui[0], &args.smoke_clap_ui[1]);
+    }
+    if args.probe_clap.len() == 2 {
+        run_probe_clap(&args.probe_clap[0], &args.probe_clap[1]);
+    }
     if args.scan_plugins {
         let only = (!args.only.is_empty()).then_some(args.only);
         smoke::scan_plugins(only);
@@ -149,6 +170,7 @@ fn main() -> Result<()> {
 
     let host = Host::new();
     let vst3 = vibemix_vst3::Host::new();
+    let clap = vibemix_clap::Host::new();
     let engine = JackEngine::start(
         &args.client_name,
         Arc::clone(&params),
@@ -156,6 +178,7 @@ fn main() -> Result<()> {
         args.auto_connect,
         &host,
         &vst3,
+        &clap,
         &mut model,
     )
     .context("start jack engine")?;
@@ -167,7 +190,7 @@ fn main() -> Result<()> {
     );
 
     let mut controller =
-        control::Controller::new(args.osc_port, params, meters, model, engine, host, vst3)
+        control::Controller::new(args.osc_port, params, meters, model, engine, host, vst3, clap)
             .with_context(|| format!("bind OSC port {}", args.osc_port))?;
 
     tracing::info!(
@@ -193,6 +216,69 @@ fn run_smoke_vst3_ui(bundle: &str, class_id: &str) -> ! {
     smoke::disable_core_dumps();
     smoke::lower_priority();
     std::process::exit(smoke::smoke_plugin_vst3_ui(bundle, class_id));
+}
+
+fn run_smoke_clap(bundle: &str, plugin_id: &str) -> ! {
+    smoke::disable_core_dumps();
+    std::process::exit(smoke::smoke_plugin_clap(bundle, plugin_id));
+}
+
+fn run_smoke_clap_ui(bundle: &str, plugin_id: &str) -> ! {
+    smoke::disable_core_dumps();
+    smoke::lower_priority();
+    std::process::exit(smoke::smoke_plugin_clap_ui(bundle, plugin_id));
+}
+
+/// Feeds a sine through a CLAP plugin and reports the output peak per block.
+fn run_probe_clap(bundle: &str, plugin_id: &str) -> ! {
+    use std::f32::consts::PI;
+    let host = vibemix_clap::Host::new();
+    let sample_rate = 48_000.0f64;
+    let block = 512usize;
+    let Some(mut instance) = host.instantiate(
+        bundle,
+        plugin_id,
+        sample_rate,
+        block,
+        vibemix_clap::PluginInstance::max_frames(),
+    ) else {
+        eprintln!("probe: instantiate failed");
+        std::process::exit(1);
+    };
+    eprintln!(
+        "probe: in={} out={} params={} sidechain={} buses={} {}",
+        instance.audio_input_count(),
+        instance.audio_output_count(),
+        instance.control_count(),
+        instance.has_sidechain(),
+        instance.bus_info(),
+        instance.editor_info()
+    );
+    let step = 2.0 * PI * 440.0 / sample_rate as f32;
+    let mut phase = 0.0f32;
+    for block_index in 0..64 {
+        for channel in 0..instance.audio_input_count() {
+            let buffer = instance.input_buffer_mut(channel);
+            for sample in buffer[..block].iter_mut() {
+                *sample = 0.5 * phase.sin();
+            }
+        }
+        phase += step;
+        if phase > 2.0 * PI {
+            phase -= 2.0 * PI;
+        }
+        instance.run(block);
+        let mut peak = 0.0f32;
+        for channel in 0..instance.audio_output_count() {
+            for sample in &instance.output_buffer(channel)[..block] {
+                peak = peak.max(sample.abs());
+            }
+        }
+        if block_index % 16 == 0 || block_index == 63 {
+            eprintln!("probe: block {block_index} out_peak={peak}");
+        }
+    }
+    std::process::exit(0);
 }
 
 /// Feeds a sine through a VST3 plugin and reports the output peak per block, so

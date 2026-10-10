@@ -94,6 +94,8 @@ pub struct Controller {
     host: Host,
     /// VST3 host (discovery + instantiation).
     vst3: vibemix_vst3::Host,
+    /// CLAP host (discovery + instantiation).
+    clap: vibemix_clap::Host,
     /// Out-of-process LV2 UI host (spawned lazily on the first remote open).
     ui_service: UiService,
     plugins: Vec<PluginEntry>,
@@ -112,6 +114,8 @@ pub struct Controller {
     ui_safe: Arc<Mutex<HashMap<String, bool>>>,
     /// Per-class VST3 editor smoke verdicts, filled the same way.
     vst3_ui_safe: Arc<Mutex<HashMap<String, bool>>>,
+    /// Per-id CLAP editor smoke verdicts, filled the same way.
+    clap_ui_safe: Arc<Mutex<HashMap<String, bool>>>,
     missing_report: Option<String>,
     pending_session: Option<(bool, String, String)>,
     sample_rate: u32,
@@ -151,6 +155,11 @@ enum OpenUi {
         view: vibemix_vst3::View,
         /// Kept so editor-driven parameter moves can be drained.
         handle: vibemix_vst3::InstanceHandle,
+    },
+    Clap {
+        view: vibemix_clap::View,
+        /// Kept so editor-driven parameter moves can be drained.
+        handle: vibemix_clap::InstanceHandle,
     },
 }
 
@@ -287,6 +296,7 @@ extern "C" fn ui_port_write(
 }
 
 impl Controller {
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         port: u16,
         params: Arc<SharedParams>,
@@ -295,12 +305,13 @@ impl Controller {
         engine: JackEngine,
         host: Host,
         vst3: vibemix_vst3::Host,
+        clap: vibemix_clap::Host,
     ) -> std::io::Result<Self> {
         let socket = UdpSocket::bind(("127.0.0.1", port))?;
         socket.set_read_timeout(Some(METER_INTERVAL))?;
 
         let plugins: Vec<PluginEntry> = {
-            let discovered = discover_catalog(&host, &vst3);
+            let discovered = discover_catalog(&host, &vst3, &clap);
             if discovered.is_empty() {
                 load_catalog()
             } else {
@@ -325,6 +336,7 @@ impl Controller {
             engine,
             host,
             vst3,
+            clap,
             ui_service: UiService::new(),
             plugins,
             catalog_json,
@@ -338,6 +350,7 @@ impl Controller {
             ui_cache: HashMap::new(),
             ui_safe: Arc::new(Mutex::new(HashMap::new())),
             vst3_ui_safe: Arc::new(Mutex::new(HashMap::new())),
+            clap_ui_safe: Arc::new(Mutex::new(HashMap::new())),
             missing_report,
             pending_session: None,
             sample_rate,
@@ -354,7 +367,7 @@ impl Controller {
             meter_levels: MeterLevels::default(),
             meter_bytes: Vec::new(),
         };
-        controller.ensure_model_vst3_controls();
+        controller.ensure_model_plugin_controls();
         save_catalog(&controller.plugins);
         controller.rebuild_shared_bindings();
         controller.start_health_scan();
@@ -416,7 +429,9 @@ impl Controller {
 
             self.engine.drain_garbage();
             self.pump_uis();
-            let param_edits = self.drain_vst3_param_edits();
+            let vst3_edits = self.drain_vst3_param_edits();
+            let clap_edits = self.drain_clap_param_edits();
+            let param_edits = vst3_edits || clap_edits;
 
             // Keep the sidechain-aware strip order up to date. The topological
             // sort allocates, so only run it when the sidechain routing (the
@@ -572,7 +587,7 @@ impl Controller {
 
         if let Err(error) =
             self.engine
-                .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, rate as f64)
+                .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut self.model, &self.params, rate as f64)
         {
             tracing::warn!(%error, "failed to rebuild plugins after sample-rate change");
         }
@@ -1131,11 +1146,11 @@ impl Controller {
                 // `Arc<World>`, so dropping the old host here is safe; no
                 // retired-host list (which would grow without bound) is needed.
                 self.host = Host::new();
-                self.plugins = discover_catalog(&self.host, &self.vst3);
+                self.plugins = discover_catalog(&self.host, &self.vst3, &self.clap);
                 if self.plugins.is_empty() {
                     self.plugins = load_catalog();
                 }
-                self.ensure_model_vst3_controls();
+                self.ensure_model_plugin_controls();
                 self.catalog_json = build_catalog(&self.plugins, &self.health);
                 save_catalog(&self.plugins);
                 let sample_rate = self.engine.sample_rate() as f64;
@@ -1145,7 +1160,7 @@ impl Controller {
                 self.close_all_uis();
                 if let Err(error) =
                     self.engine
-                        .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, sample_rate)
+                        .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut self.model, &self.params, sample_rate)
                 {
                     tracing::warn!(%error, "failed to rebuild plugins after rescan");
                 }
@@ -1208,7 +1223,7 @@ impl Controller {
                 let sample_rate = self.engine.sample_rate() as f64;
                 match self
                     .engine
-                    .rebuild_plugins(&self.host, &self.vst3, &mut model, &self.params, sample_rate)
+                    .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut model, &self.params, sample_rate)
                 {
                     Ok(()) => {
                         self.close_all_uis();
@@ -1245,12 +1260,12 @@ impl Controller {
                     let sample_rate = self.engine.sample_rate() as f64;
                     match self
                         .engine
-                        .rebuild_plugins(&self.host, &self.vst3, &mut loaded, &self.params, sample_rate)
+                        .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut loaded, &self.params, sample_rate)
                     {
                         Ok(()) => {
                             self.close_all_uis();
                             self.model = loaded;
-                            self.ensure_model_vst3_controls();
+                            self.ensure_model_plugin_controls();
                             save_catalog(&self.plugins);
                             self.engine.sync_port_names(&self.model);
                             self.rebuild_shared_bindings();
@@ -1625,6 +1640,10 @@ impl Controller {
         self.run_smoke_child(class_id, &["--smoke-vst3", bundle, class_id])
     }
 
+    fn clap_is_safe(&mut self, bundle: &str, plugin_id: &str) -> bool {
+        self.run_smoke_child(plugin_id, &["--smoke-clap", bundle, plugin_id])
+    }
+
     fn ui_is_safe(&mut self, uri: &str) -> bool {
         if let Some(safe) = ui_safe_map(&self.ui_safe).get(uri).copied() {
             return safe;
@@ -1653,6 +1672,23 @@ impl Controller {
             tracing::warn!(%class_id, "VST3 editor failed smoke test; not opening");
         }
         ui_safe_map(&self.vst3_ui_safe).insert(class_id.to_string(), safe);
+        safe
+    }
+
+    /// Runs the CLAP editor headlessly in a child so a crashing editor is
+    /// refused rather than taking the engine down.
+    fn clap_ui_is_safe(&mut self, bundle: &str, plugin_id: &str) -> bool {
+        if let Some(safe) = ui_safe_map(&self.clap_ui_safe).get(plugin_id).copied() {
+            return safe;
+        }
+        let safe = ui_smoke_ok(
+            &["--smoke-clap-ui", bundle, plugin_id],
+            Duration::from_secs(10),
+        );
+        if !safe {
+            tracing::warn!(%plugin_id, "CLAP editor failed smoke test; not opening");
+        }
+        ui_safe_map(&self.clap_ui_safe).insert(plugin_id.to_string(), safe);
         safe
     }
 
@@ -1700,6 +1736,23 @@ impl Controller {
                     Arc::clone(&self.ui_safe),
                     uri.to_string(),
                     vec!["--smoke-ui".to_string(), uri.to_string()],
+                );
+            }
+            PluginFormat::Clap => {
+                let Some(bundle) = bundle else {
+                    return;
+                };
+                if ui_safe_map(&self.clap_ui_safe).contains_key(uri) {
+                    return;
+                }
+                spawn_ui_smoke(
+                    Arc::clone(&self.clap_ui_safe),
+                    uri.to_string(),
+                    vec![
+                        "--smoke-clap-ui".to_string(),
+                        bundle.to_string(),
+                        uri.to_string(),
+                    ],
                 );
             }
         }
@@ -1774,6 +1827,32 @@ impl Controller {
             };
             tracing::info!(location, target, slot, %uri, "opened VST3 editor");
             self.uis.insert(key, OpenUi::Vst3 { view, handle });
+            return;
+        }
+
+        if format == PluginFormat::Clap {
+            let Some(bundle) = bundle else {
+                tracing::warn!(%uri, "CLAP plugin has no bundle for editor");
+                return;
+            };
+            if !self.clap_ui_is_safe(&bundle, &uri) {
+                return;
+            }
+            let state = if let Some(chain) = strip_chain(location) {
+                self.engine.state_proxy(target as usize, chain, slot as usize)
+            } else {
+                self.engine.bus_state_proxy(target as usize, slot as usize)
+            };
+            let Some(handle) = state.and_then(|state| state.clap_handle()) else {
+                tracing::warn!(%uri, "no CLAP instance for editor");
+                return;
+            };
+            let Some(view) = handle.open_view(&title) else {
+                tracing::warn!(%uri, "failed to open CLAP editor");
+                return;
+            };
+            tracing::info!(location, target, slot, %uri, "opened CLAP editor");
+            self.uis.insert(key, OpenUi::Clap { view, handle });
             return;
         }
 
@@ -1913,6 +1992,10 @@ impl Controller {
                     view.set_param(param as usize, value);
                     return;
                 }
+                OpenUi::Clap { view, .. } => {
+                    view.set_param(param as usize, value);
+                    return;
+                }
             }
         }
         if let Some((id, port)) = remote {
@@ -2029,6 +2112,23 @@ impl Controller {
         changed
     }
 
+    /// Folds parameter moves made in open CLAP editors into the shared state
+    /// (mirrors the VST3 editor write-back). Returns true if any moved.
+    fn drain_clap_param_edits(&self) -> bool {
+        let mut changed = false;
+        for (key, ui) in self.uis.iter() {
+            let OpenUi::Clap { handle, .. } = ui else {
+                continue;
+            };
+            let (location, target, slot) = *key;
+            while let Some((param, value)) = handle.take_param_edit() {
+                self.apply_vst3_param(location, target, slot, param, value);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     fn pump_uis(&mut self) {
         self.poll_ui_host();
 
@@ -2065,6 +2165,12 @@ impl Controller {
                         }
                     }
                     OpenUi::Vst3 { view, .. } => {
+                        view.pump();
+                        if view.wants_close() {
+                            closed.push(*key);
+                        }
+                    }
+                    OpenUi::Clap { view, .. } => {
                         view.pump();
                         if view.wants_close() {
                             closed.push(*key);
@@ -2253,6 +2359,7 @@ impl Controller {
 
     fn add_plugin(&mut self, location: u32, target: u32, uri: &str) -> bool {
         self.ensure_vst3_controls(uri);
+        self.ensure_clap_controls(uri);
         let Some(info) = self.plugins.iter().find(|entry| entry.id == uri).cloned() else {
             tracing::warn!(%uri, "plugin not in catalog");
             return false;
@@ -2305,29 +2412,78 @@ impl Controller {
         self.plugins[index].has_sidechain = instance.has_sidechain();
     }
 
-    /// Fills VST3 parameter metadata (and editor availability) for plugins that
-    /// are present in a loaded session. Fresh discovery cannot know either
+    /// Fills a catalog entry's CLAP control metadata (and editor/sidechain
+    /// flags) by instantiating the plugin once on the control thread.
+    fn ensure_clap_controls(&mut self, id: &str) {
+        let Some(index) = self.plugins.iter().position(|entry| entry.id == id) else {
+            return;
+        };
+        if self.plugins[index].format != PluginFormat::Clap
+            || (!self.plugins[index].controls.is_empty() && self.plugins[index].has_ui)
+        {
+            return;
+        }
+        let Some(bundle) = self.plugins[index].bundle.clone() else {
+            return;
+        };
+        let sample_rate = self.engine.sample_rate() as f64;
+        let buffer_size = self.engine.buffer_size() as usize;
+        let Some(instance) = self.clap.instantiate(
+            &bundle,
+            id,
+            sample_rate,
+            buffer_size,
+            vibemix_clap::PluginInstance::max_frames(),
+        ) else {
+            return;
+        };
+        self.plugins[index].controls = instance
+            .controls()
+            .iter()
+            .cloned()
+            .map(ControlInfo::from)
+            .collect();
+        self.plugins[index].has_ui = instance.has_editor();
+        self.plugins[index].has_sidechain = instance.has_sidechain();
+    }
+
+    /// Fills VST3/CLAP parameter metadata (and editor availability) for plugins
+    /// that are present in a loaded session. Fresh discovery cannot know either
     /// without instantiating, and `add_plugin` is not involved on restore.
-    fn ensure_model_vst3_controls(&mut self) {
-        let mut ids: Vec<String> = Vec::new();
+    fn ensure_model_plugin_controls(&mut self) {
+        let mut vst3_ids: HashSet<String> = HashSet::new();
+        let mut clap_ids: HashSet<String> = HashSet::new();
         for strip in &self.model.strips {
             for plugin in strip.plugins.iter().chain(strip.plugins_post.iter()) {
-                if plugin.format == PluginFormat::Vst3 {
-                    ids.push(plugin.uri.clone());
+                match plugin.format {
+                    PluginFormat::Vst3 => {
+                        vst3_ids.insert(plugin.uri.clone());
+                    }
+                    PluginFormat::Clap => {
+                        clap_ids.insert(plugin.uri.clone());
+                    }
+                    PluginFormat::Lv2 => {}
                 }
             }
         }
         for bus in &self.model.buses {
             for plugin in &bus.plugins {
-                if plugin.format == PluginFormat::Vst3 {
-                    ids.push(plugin.uri.clone());
+                match plugin.format {
+                    PluginFormat::Vst3 => {
+                        vst3_ids.insert(plugin.uri.clone());
+                    }
+                    PluginFormat::Clap => {
+                        clap_ids.insert(plugin.uri.clone());
+                    }
+                    PluginFormat::Lv2 => {}
                 }
             }
         }
-        ids.sort();
-        ids.dedup();
-        for id in ids {
+        for id in vst3_ids {
             self.ensure_vst3_controls(&id);
+        }
+        for id in clap_ids {
+            self.ensure_clap_controls(&id);
         }
     }
 
@@ -2357,6 +2513,7 @@ impl Controller {
         };
 
         self.ensure_vst3_controls(&plugin.uri);
+        self.ensure_clap_controls(&plugin.uri);
         if plugin.params.is_empty() {
             if let Some(info) = self.plugins.iter().find(|entry| entry.id == plugin.uri) {
                 plugin.params = info
@@ -2383,12 +2540,21 @@ impl Controller {
                     return false;
                 }
             }
+            PluginFormat::Clap => {
+                let Some(bundle) = plugin.bundle.clone() else {
+                    tracing::warn!(uri = %plugin.uri, "CLAP plugin has no bundle path");
+                    return false;
+                };
+                if !self.clap_is_safe(&bundle, &plugin.uri) {
+                    return false;
+                }
+            }
         }
 
         let sample_rate = self.engine.sample_rate() as f64;
         let buffer_size = self.engine.buffer_size() as usize;
         let Some((slot_plugin, proxy, handle)) =
-            instantiate_slot(&self.host, &self.vst3, &plugin, sample_rate, buffer_size)
+            instantiate_slot(&self.host, &self.vst3, &self.clap, &plugin, sample_rate, buffer_size)
         else {
             tracing::warn!(uri = %plugin.uri, "plugin instantiate failed");
             return false;
@@ -2767,7 +2933,7 @@ impl Controller {
             let sample_rate = self.engine.sample_rate() as f64;
             if let Err(error) =
                 self.engine
-                    .rebuild_plugins(&self.host, &self.vst3, &mut self.model, &self.params, sample_rate)
+                    .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut self.model, &self.params, sample_rate)
             {
                 tracing::warn!(%error, "failed to rebuild plugins on undo");
             }
@@ -2898,6 +3064,7 @@ impl Controller {
                                 context.slot = new_slot as usize;
                             }
                             OpenUi::Vst3 { .. } => {}
+                            OpenUi::Clap { .. } => {}
                         }
                         moved.push(((location, target, new_slot), ui));
                     }
@@ -3507,7 +3674,11 @@ fn vst3_category(subcategories: &str, category: &str) -> String {
     }
 }
 
-fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> {
+fn discover_catalog(
+    host: &Host,
+    vst3: &vibemix_vst3::Host,
+    clap: &vibemix_clap::Host,
+) -> Vec<PluginEntry> {
     let mut entries: Vec<PluginEntry> = host
         .discover()
         .into_iter()
@@ -3564,7 +3735,55 @@ fn discover_catalog(host: &Host, vst3: &vibemix_vst3::Host) -> Vec<PluginEntry> 
             controls: Vec::new(),
         });
     }
+    for info in clap.discover() {
+        let category = clap_category(&info.features);
+        entries.push(PluginEntry {
+            format: PluginFormat::Clap,
+            id: info.id,
+            name: info.name,
+            vendor: info.vendor,
+            category,
+            version: info.version,
+            description: info.description,
+            homepage: info.url,
+            license: String::new(),
+            bundle: Some(info.bundle),
+            has_ui: false,
+            has_sidechain: false,
+            inputs: 0,
+            outputs: 0,
+            midi: false,
+            hostable: true,
+            unsupported: None,
+            controls: Vec::new(),
+        });
+    }
     entries
+}
+
+/// Picks a display category from a CLAP feature list. Channel/layout and
+/// format features are ignored in favour of a concrete effect type.
+fn clap_category(features: &str) -> String {
+    let mut fallback = "Effect".to_string();
+    for feature in features.split(',').map(str::trim).filter(|f| !f.is_empty()) {
+        match feature {
+            "instrument" | "synthesizer" | "sampler" | "drum-machine" | "drum" => {
+                return "Instrument".to_string();
+            }
+            "audio-effect" | "mono" | "stereo" | "surround" | "ambisonic" | "note-effect"
+            | "note-detector" => continue,
+            "utility" => {
+                fallback = "Utility".to_string();
+                continue;
+            }
+            _ => {}
+        }
+        let mut chars = feature.chars();
+        if let Some(first) = chars.next() {
+            return first.to_uppercase().collect::<String>() + chars.as_str();
+        }
+    }
+    fallback
 }
 
 fn catalog_path() -> std::path::PathBuf {

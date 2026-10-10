@@ -294,7 +294,9 @@ ApplicationWindow {
         return parts.join(" \u00b7 ")
     }
     function formatLabel(entry) {
-        return entry.format === "vst3" ? "VST3" : "LV2"
+        if (entry.format === "vst3") return "VST3"
+        if (entry.format === "clap") return "CLAP"
+        return "LV2"
     }
     function channelText(entry) {
         if (!entry.inputs && !entry.outputs) return ""

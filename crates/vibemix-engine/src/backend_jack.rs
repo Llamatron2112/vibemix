@@ -27,6 +27,7 @@ const COMMAND_CAPACITY: usize = 64;
 pub enum SlotState {
     Lv2(StateProxy),
     Vst3(vibemix_vst3::InstanceHandle),
+    Clap(vibemix_clap::InstanceHandle),
 }
 
 impl SlotState {
@@ -41,6 +42,10 @@ impl SlotState {
                 let bytes = handle.save();
                 (!bytes.is_empty()).then(|| vibemix_vst3::encode_blob(&bytes))
             }
+            SlotState::Clap(handle) => {
+                let bytes = handle.save();
+                (!bytes.is_empty()).then(|| vibemix_clap::encode_blob(&bytes))
+            }
         }
     }
 
@@ -48,7 +53,15 @@ impl SlotState {
     pub fn vst3_handle(&self) -> Option<vibemix_vst3::InstanceHandle> {
         match self {
             SlotState::Vst3(handle) => Some(handle.clone()),
-            SlotState::Lv2(_) => None,
+            SlotState::Lv2(_) | SlotState::Clap(_) => None,
+        }
+    }
+
+    /// The CLAP instance handle, if this is a CLAP plugin.
+    pub fn clap_handle(&self) -> Option<vibemix_clap::InstanceHandle> {
+        match self {
+            SlotState::Clap(handle) => Some(handle.clone()),
+            SlotState::Lv2(_) | SlotState::Vst3(_) => None,
         }
     }
 }
@@ -1098,6 +1111,7 @@ pub struct JackEngine {
 }
 
 impl JackEngine {
+    #[allow(clippy::too_many_arguments)]
     pub fn start(
         client_name: &str,
         params: Arc<SharedParams>,
@@ -1105,6 +1119,7 @@ impl JackEngine {
         auto_connect: bool,
         lv2: &Host,
         vst3: &vibemix_vst3::Host,
+        clap: &vibemix_clap::Host,
         model: &mut MixerModel,
     ) -> Result<Self> {
         let (client, _status) = Client::new(client_name, ClientOptions::NO_START_SERVER)?;
@@ -1119,7 +1134,7 @@ impl JackEngine {
         let max_delay_samples =
             (vibemix_core::model::MAX_SEND_DELAY_MS as f64 / 1000.0 * sample_rate).ceil() as usize + 1;
 
-        let built = build_chains(lv2, vst3, model, strip_count, bus_count, sample_rate, buffer_size, &params);
+        let built = build_chains(lv2, vst3, clap, model, strip_count, bus_count, sample_rate, buffer_size, &params);
         let Built {
             strip_chains: plugin_chains,
             strip_proxies: state_proxies,
@@ -2125,6 +2140,7 @@ impl JackEngine {
         &mut self,
         lv2: &Host,
         vst3: &vibemix_vst3::Host,
+        clap: &vibemix_clap::Host,
         model: &mut MixerModel,
         params: &SharedParams,
         sample_rate: f64,
@@ -2133,6 +2149,7 @@ impl JackEngine {
         let built = build_chains(
             lv2,
             vst3,
+            clap,
             model,
             self.strip_count,
             self.bus_count,
@@ -2248,6 +2265,7 @@ fn feed_sidechain(
 pub fn instantiate_slot(
     lv2: &Host,
     vst3: &vibemix_vst3::Host,
+    clap: &vibemix_clap::Host,
     plugin: &PluginSlot,
     sample_rate: f64,
     buffer_size: usize,
@@ -2260,7 +2278,45 @@ pub fn instantiate_slot(
             slot_plugin.load_state(&plugin.state);
             Some((slot_plugin, Some(SlotState::Vst3(handle)), 0))
         }
+        PluginFormat::Clap => {
+            let (mut slot_plugin, handle) =
+                instantiate_clap(clap, plugin, sample_rate, buffer_size)?;
+            slot_plugin.load_state(&plugin.state);
+            Some((slot_plugin, Some(SlotState::Clap(handle)), 0))
+        }
     }
+}
+
+fn instantiate_clap(
+    clap: &vibemix_clap::Host,
+    plugin: &PluginSlot,
+    sample_rate: f64,
+    buffer_size: usize,
+) -> Option<(SlotPlugin, vibemix_clap::InstanceHandle)> {
+    let bundle = plugin.bundle.as_deref()?;
+    let open = |clap: &vibemix_clap::Host| {
+        clap.instantiate(
+            bundle,
+            &plugin.uri,
+            sample_rate,
+            buffer_size,
+            vibemix_clap::PluginInstance::max_frames(),
+        )
+    };
+    let first = open(clap)?;
+    let handle = first.instance_handle();
+    let slot_plugin = match (first.audio_input_count(), first.audio_output_count()) {
+        (2, 2) => SlotPlugin::Stereo(Box::new(first) as Box<dyn PluginNode>),
+        (1, 1) => {
+            let second = open(clap)?;
+            SlotPlugin::Mono(
+                Box::new(first) as Box<dyn PluginNode>,
+                Box::new(second) as Box<dyn PluginNode>,
+            )
+        }
+        _ => return None,
+    };
+    Some((slot_plugin, handle))
 }
 
 fn instantiate_vst3(
@@ -2333,6 +2389,7 @@ fn instantiate_lv2(
 fn build_chains(
     lv2: &Host,
     vst3: &vibemix_vst3::Host,
+    clap: &vibemix_clap::Host,
     model: &mut MixerModel,
     strip_count: usize,
     bus_count: usize,
@@ -2378,7 +2435,7 @@ fn build_chains(
             let mut kept = Vec::new();
             for mut plugin in list.drain(..).take(MAX_PLUGINS) {
                 let slot = strip_chains[index][chain].len();
-                match instantiate_slot(lv2, vst3, &plugin, sample_rate, buffer_size) {
+                match instantiate_slot(lv2, vst3, clap, &plugin, sample_rate, buffer_size) {
                     Some((slot_plugin, proxy, handle)) => {
                         plugin.missing = false;
                         let controls = controls_of(&slot_plugin);
@@ -2423,7 +2480,7 @@ fn build_chains(
         let mut kept = Vec::new();
         for mut plugin in bus.plugins.drain(..).take(MAX_PLUGINS) {
             let slot = bus_chains[index].len();
-            match instantiate_slot(lv2, vst3, &plugin, sample_rate, buffer_size) {
+            match instantiate_slot(lv2, vst3, clap, &plugin, sample_rate, buffer_size) {
                 Some((slot_plugin, proxy, handle)) => {
                     plugin.missing = false;
                     let controls = controls_of(&slot_plugin);

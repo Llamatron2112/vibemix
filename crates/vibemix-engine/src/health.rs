@@ -151,7 +151,7 @@ fn sweepable(entry: &PluginEntry) -> bool {
         PluginFormat::Lv2 => {
             (entry.outputs == 2 && entry.inputs >= 2) || (entry.outputs == 1 && entry.inputs >= 1)
         }
-        PluginFormat::Vst3 => true,
+        PluginFormat::Vst3 | PluginFormat::Clap => true,
     }
 }
 

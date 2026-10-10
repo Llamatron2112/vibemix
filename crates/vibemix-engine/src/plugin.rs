@@ -168,3 +168,65 @@ impl PluginNode for vibemix_vst3::PluginInstance {
         vibemix_vst3::PluginInstance::write_sidechain(self, left, right, left.len());
     }
 }
+
+impl PluginNode for vibemix_clap::PluginInstance {
+    fn input_buffer_mut(&mut self, channel: usize) -> &mut [f32] {
+        self.input_buffer_mut(channel)
+    }
+
+    fn output_buffer(&self, channel: usize) -> &[f32] {
+        self.output_buffer(channel)
+    }
+
+    fn control_count(&self) -> usize {
+        self.control_count()
+    }
+
+    fn control_default(&self, param: usize) -> f32 {
+        self.control_default(param)
+    }
+
+    fn set_control(&mut self, param: usize, value: f32) {
+        self.set_control(param, value)
+    }
+
+    fn write_midi(&mut self, events: &[MidiEvent]) {
+        for event in events {
+            self.midi_event(event.time, event.as_slice());
+        }
+    }
+
+    fn write_position(&mut self, position: &TimePosition) {
+        self.set_position(
+            position.frame,
+            position.beat,
+            position.bar,
+            position.beats_per_minute,
+            position.beats_per_bar,
+            position.speed,
+        );
+    }
+
+    fn run(&mut self, frames: usize) {
+        self.run(frames)
+    }
+
+    fn deliver_responses(&mut self) {}
+
+    fn outputs(&self) -> Option<Arc<SharedOutputs>> {
+        None
+    }
+
+    fn load_state(&mut self, state: &str) {
+        let bytes = vibemix_clap::decode_blob(state);
+        vibemix_clap::PluginInstance::load_state(self, &bytes);
+    }
+
+    fn has_sidechain(&self) -> bool {
+        vibemix_clap::PluginInstance::has_sidechain(self)
+    }
+
+    fn write_sidechain(&mut self, left: &[f32], right: &[f32]) {
+        vibemix_clap::PluginInstance::write_sidechain(self, left, right, left.len());
+    }
+}

@@ -68,6 +68,28 @@ impl From<vibemix_vst3::ControlPort> for ControlInfo {
     }
 }
 
+impl From<vibemix_clap::ControlPort> for ControlInfo {
+    fn from(port: vibemix_clap::ControlPort) -> Self {
+        Self {
+            index: port.index,
+            name: port.name,
+            default: port.default,
+            min: port.min,
+            max: port.max,
+            toggled: port.toggled,
+            integer: port.integer,
+            scale_points: port
+                .scale_points
+                .into_iter()
+                .map(|point| ControlPoint {
+                    value: point.value,
+                    label: point.label,
+                })
+                .collect(),
+        }
+    }
+}
+
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct PluginEntry {
     pub format: PluginFormat,
