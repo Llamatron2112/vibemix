@@ -198,6 +198,11 @@ struct Hosted {
   Atom wm_delete = 0;
   bool gui_created = false;
   bool want_close = false;
+
+  // `start_processing`/`stop_processing` must run on the audio thread, so the
+  // start is deferred to the first `clap_run`.
+  bool want_start_processing = false;
+  bool processing = false;
 };
 
 static Hosted* self(const clap_host_t* host) {
@@ -539,7 +544,9 @@ extern "C" void* clap_open(const char* bundle, const char* plugin_id, double sam
     module_release(bundle);
     return nullptr;
   }
-  if (h->plugin->start_processing) h->plugin->start_processing(h->plugin);
+  // CLAP requires `start_processing` on the audio thread; defer it to the first
+  // `clap_run`.
+  h->want_start_processing = true;
   return h;
 }
 
@@ -547,7 +554,15 @@ extern "C" void clap_close(void* handle) {
   Hosted* h = static_cast<Hosted*>(handle);
   if (!h) return;
   if (h->plugin) {
-    if (h->plugin->stop_processing) h->plugin->stop_processing(h->plugin);
+    if (h->processing) {
+      // The graph is retired from the control thread, but the plugin expects
+      // `stop_processing` on the audio thread; report it for the duration of
+      // the call so the plugin's thread check passes.
+      tls_audio_thread = true;
+      if (h->plugin->stop_processing) h->plugin->stop_processing(h->plugin);
+      tls_audio_thread = false;
+      h->processing = false;
+    }
     if (h->plugin->deactivate) h->plugin->deactivate(h->plugin);
     if (h->plugin->destroy) h->plugin->destroy(h->plugin);
   }
@@ -696,6 +711,11 @@ extern "C" void clap_run(void* handle, int frames) {
   proc.out_events = &out_list;
 
   tls_audio_thread = true;
+  if (h->want_start_processing) {
+    h->want_start_processing = false;
+    if (h->plugin->start_processing) h->plugin->start_processing(h->plugin);
+    h->processing = true;
+  }
   h->plugin->process(h->plugin, &proc);
   tls_audio_thread = false;
 
