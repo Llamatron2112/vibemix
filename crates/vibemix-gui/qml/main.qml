@@ -548,7 +548,17 @@ ApplicationWindow {
         return kind === 2 || kind === 3 || kind === 5 || kind === 9
     }
     // Qt-standard key names so `Shortcut.sequence` parses them back.
+    // Modifier keys deliver their own key-down event; ignore them so a combo
+    // is captured once the real key arrives.
+    function isModifierKey(key) {
+        return key === Qt.Key_Shift || key === Qt.Key_Control || key === Qt.Key_Alt
+            || key === Qt.Key_Meta || key === Qt.Key_AltGr || key === Qt.Key_CapsLock
+            || key === Qt.Key_NumLock
+    }
     function keyName(event) {
+        if (root.isModifierKey(event.key)) {
+            return ""
+        }
         switch (event.key) {
         case Qt.Key_Escape: return "Esc"
         case Qt.Key_Space: return "Space"
@@ -578,12 +588,16 @@ ApplicationWindow {
         return "Key" + event.key
     }
     function keyCombo(event) {
+        var name = root.keyName(event)
+        if (name.length === 0) {
+            return ""
+        }
         var parts = []
         if (event.modifiers & Qt.ControlModifier) parts.push("Ctrl")
         if (event.modifiers & Qt.AltModifier) parts.push("Alt")
         if (event.modifiers & Qt.ShiftModifier) parts.push("Shift")
         if (event.modifiers & Qt.MetaModifier) parts.push("Meta")
-        parts.push(root.keyName(event))
+        parts.push(name)
         return parts.join("+")
     }
     function textEditing() {
@@ -598,6 +612,10 @@ ApplicationWindow {
     // Captures the next key: Esc cancels, Backspace/Delete clears the binding.
     function handleKeyCapture(event) {
         if (root.midiKeyLearnSpec === null) {
+            return
+        }
+        // Wait for a real key: modifier presses are ignored.
+        if (root.isModifierKey(event.key)) {
             return
         }
         event.accepted = true
@@ -621,6 +639,9 @@ ApplicationWindow {
             return
         }
         var combo = root.keyCombo(event)
+        if (combo.length === 0) {
+            return
+        }
         var list = mix.midi_bindings || []
         for (var i = 0; i < list.length; ++i) {
             if (list[i].key === combo) {
