@@ -345,12 +345,19 @@ pub enum MidiTarget {
     PluginBypass,
 }
 
-/// A learned MIDI CC → mixer target binding, saved with the session.
+/// A learned MIDI CC and/or computer-keyboard binding → mixer target, saved
+/// with the session.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct MidiBinding {
     /// 0..15, or 16 for omni.
     pub channel: u8,
-    pub cc: u8,
+    /// Control-change number, when this binding responds to MIDI.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub cc: Option<u8>,
+    /// Normalized key combo (e.g. "M", "Space", "Ctrl+Shift+M"), when this
+    /// binding responds to the keyboard. Only buttons honour keys.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub key: Option<String>,
     #[serde(default)]
     pub relative: bool,
     pub target: MidiTarget,

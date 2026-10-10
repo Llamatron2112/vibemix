@@ -952,6 +952,14 @@ pub mod qobject {
         fn midi_unbind(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32);
 
         #[qinvokable]
+        #[cxx_name = "keyBind"]
+        fn key_bind(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32, key: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "keyTrigger"]
+        fn key_trigger(&self, key: &QString);
+
+        #[qinvokable]
         #[cxx_name = "saveSession"]
         fn save_session(&self, path: &QString, width: i32, height: i32, maximized: bool);
 
@@ -1647,6 +1655,32 @@ impl qobject::Backend {
             target: target as u32,
             slot: slot as u32,
             param: param as u32,
+        });
+    }
+
+    pub fn key_bind(
+        &self,
+        kind: i32,
+        location: i32,
+        target: i32,
+        slot: i32,
+        param: i32,
+        key: &QString,
+    ) {
+        note_action("bind key");
+        send(ControlMessage::KeyBind {
+            kind: kind as u32,
+            location: location as u32,
+            target: target as u32,
+            slot: slot as u32,
+            param: param as u32,
+            key: key.to_string(),
+        });
+    }
+
+    pub fn key_trigger(&self, key: &QString) {
+        send(ControlMessage::KeyTrigger {
+            key: key.to_string(),
         });
     }
 

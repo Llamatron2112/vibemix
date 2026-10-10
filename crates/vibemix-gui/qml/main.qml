@@ -17,6 +17,8 @@ ApplicationWindow {
     property bool forceClose: false
     property var pendingAction: null
     property string sessionError: ""
+    // Mixer button whose keyboard binding is being captured, or null.
+    property var midiKeyLearnSpec: null
 
     Backend {
         id: backend
@@ -514,17 +516,107 @@ ApplicationWindow {
     function channelLabel(channel) {
         return channel === null || channel === undefined ? "any" : ("ch " + (channel + 1))
     }
-    function midiCcFor(kind, location, target, slot, param) {
+    function midiBindingFor(kind, location, target, slot, param) {
         var name = root.midiKindName(kind)
         var list = mix.midi_bindings || []
         for (var i = 0; i < list.length; ++i) {
             var b = list[i]
             if (b.target === name && b.location === location && b.target_id === target
                     && b.slot === slot && b.param === param) {
-                return String(b.cc)
+                return b
             }
         }
-        return ""
+        return null
+    }
+    function midiCcFor(kind, location, target, slot, param) {
+        var b = root.midiBindingFor(kind, location, target, slot, param)
+        return b && b.cc !== undefined && b.cc !== null ? String(b.cc) : ""
+    }
+    function keyFor(kind, location, target, slot, param) {
+        var b = root.midiBindingFor(kind, location, target, slot, param)
+        return b && b.key ? b.key : ""
+    }
+    function bindingLabel(kind, location, target, slot, param) {
+        var cc = root.midiCcFor(kind, location, target, slot, param)
+        var key = root.keyFor(kind, location, target, slot, param)
+        if (cc.length > 0 && key.length > 0) return cc + " / " + key
+        if (cc.length > 0) return cc
+        if (key.length > 0) return key
+        return "—"
+    }
+    function isButtonKind(kind) {
+        return kind === 2 || kind === 3 || kind === 5 || kind === 9
+    }
+    // Qt-standard key names so `Shortcut.sequence` parses them back.
+    function keyName(event) {
+        switch (event.key) {
+        case Qt.Key_Escape: return "Esc"
+        case Qt.Key_Space: return "Space"
+        case Qt.Key_Return: return "Return"
+        case Qt.Key_Enter: return "Enter"
+        case Qt.Key_Tab: return "Tab"
+        case Qt.Key_Backtab: return "Backtab"
+        case Qt.Key_Backspace: return "Backspace"
+        case Qt.Key_Delete: return "Del"
+        case Qt.Key_Insert: return "Ins"
+        case Qt.Key_Home: return "Home"
+        case Qt.Key_End: return "End"
+        case Qt.Key_PageUp: return "PgUp"
+        case Qt.Key_PageDown: return "PgDown"
+        case Qt.Key_Up: return "Up"
+        case Qt.Key_Down: return "Down"
+        case Qt.Key_Left: return "Left"
+        case Qt.Key_Right: return "Right"
+        default: break
+        }
+        if (event.key >= Qt.Key_F1 && event.key <= Qt.Key_F35) {
+            return "F" + (event.key - Qt.Key_F1 + 1)
+        }
+        if (event.text && event.text.length > 0) {
+            return event.text.toUpperCase()
+        }
+        return "Key" + event.key
+    }
+    function keyCombo(event) {
+        var parts = []
+        if (event.modifiers & Qt.ControlModifier) parts.push("Ctrl")
+        if (event.modifiers & Qt.AltModifier) parts.push("Alt")
+        if (event.modifiers & Qt.ShiftModifier) parts.push("Shift")
+        if (event.modifiers & Qt.MetaModifier) parts.push("Meta")
+        parts.push(root.keyName(event))
+        return parts.join("+")
+    }
+    function textEditing() {
+        var item = root.activeFocusItem
+        return !!item && item.cursorPosition !== undefined
+    }
+    function keyBindingsEnabled() {
+        return root.midiKeyLearnSpec === null && !root.textEditing()
+    }
+    function beginKeyLearn(spec) {
+        if (spec) {
+            root.midiKeyLearnSpec = spec
+        }
+    }
+    // Captures the next key: Esc cancels, Backspace/Delete clears the binding.
+    function handleKeyCapture(event) {
+        if (root.midiKeyLearnSpec === null) {
+            return
+        }
+        event.accepted = true
+        if (event.key === Qt.Key_Escape) {
+            root.midiKeyLearnSpec = null
+            return
+        }
+        var spec = root.midiKeyLearnSpec
+        if (event.key === Qt.Key_Backspace || event.key === Qt.Key_Delete) {
+            backend.midiUnbind(spec.kind, spec.location, spec.target, spec.slot, spec.param)
+            root.midiKeyLearnSpec = null
+            return
+        }
+        backend.keyBind(spec.kind, spec.location, spec.target, spec.slot, spec.param,
+            root.keyCombo(event))
+        root.midiKeyLearnSpec = null
     }
     function midiBindFromField(kind, location, target, slot, param, min, max, text) {
         var t = String(text).trim()
@@ -1079,6 +1171,18 @@ ApplicationWindow {
         onActivated: backend.cancelPluginScan()
     }
 
+    // Keyboard bindings for mixer buttons (configured in the MIDI bindings
+    // dialog). Disabled while a text field is focused or while capturing a key.
+    Repeater {
+        model: mix.midi_bindings || []
+
+        Shortcut {
+            sequence: modelData && modelData.key ? modelData.key : ""
+            enabled: root.keyBindingsEnabled()
+            onActivated: backend.keyTrigger(modelData.key)
+        }
+    }
+
     // Waiting-for-host overlay: shown until the engine is connected and has sent
     // its plugin catalog, and while the startup plugin sweep is running.
     Rectangle {
@@ -1192,8 +1296,8 @@ ApplicationWindow {
             anchors.centerIn: parent
             text: cell.spec === null
                 ? ""
-                : (root.midiCcFor(cell.spec.kind, cell.spec.location, cell.spec.target,
-                    cell.spec.slot, cell.spec.param) || "—")
+                : root.bindingLabel(cell.spec.kind, cell.spec.location, cell.spec.target,
+                    cell.spec.slot, cell.spec.param)
             color: root.textColor
             font.pixelSize: 10
         }
@@ -1223,6 +1327,11 @@ ApplicationWindow {
                 onTriggered: backend.midiLearn(cell.spec.kind, cell.spec.location,
                     cell.spec.target, cell.spec.slot, cell.spec.param,
                     cell.spec.min, cell.spec.max)
+            }
+            MenuItem {
+                text: "Learn key"
+                enabled: cell.spec !== null && root.isButtonKind(cell.spec.kind)
+                onTriggered: root.beginKeyLearn(cell.spec)
             }
             MenuItem {
                 text: "Clear"
@@ -3299,6 +3408,9 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.margins: 8
             spacing: 6
+            // Grab keys while capturing a keyboard binding.
+            focus: root.midiKeyLearnSpec !== null
+            Keys.onPressed: (event) => root.handleKeyCapture(event)
 
             RowLayout {
                 Layout.fillWidth: true
@@ -3316,6 +3428,14 @@ ApplicationWindow {
                     text: "close"
                     onClicked: midiBindingsWindow.close()
                 }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                visible: root.midiKeyLearnSpec !== null
+                text: "press a key… (Esc cancels, Backspace clears)"
+                color: root.accentColor
+                font.pixelSize: 11
             }
 
             RowLayout {

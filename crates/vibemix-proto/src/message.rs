@@ -272,6 +272,19 @@ pub enum ControlMessage {
         slot: u32,
         param: u32,
     },
+    /// Bind a keyboard combo to a mixer button target.
+    KeyBind {
+        kind: u32,
+        location: u32,
+        target: u32,
+        slot: u32,
+        param: u32,
+        key: String,
+    },
+    /// A bound keyboard combo was pressed.
+    KeyTrigger {
+        key: String,
+    },
     MissingConnections {
         json: String,
     },
@@ -813,6 +826,28 @@ impl ControlMessage {
                     OscType::Int(*param as i32),
                 ],
             },
+            KeyBind {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+                key,
+            } => OscMessage {
+                addr: addr::MIDI_KEY_BIND.to_string(),
+                args: vec![
+                    OscType::Int(*kind as i32),
+                    OscType::Int(*location as i32),
+                    OscType::Int(*target as i32),
+                    OscType::Int(*slot as i32),
+                    OscType::Int(*param as i32),
+                    OscType::String(key.clone()),
+                ],
+            },
+            KeyTrigger { key } => OscMessage {
+                addr: addr::MIDI_KEY_TRIGGER.to_string(),
+                args: vec![OscType::String(key.clone())],
+            },
             MissingConnections { json } => OscMessage {
                 addr: addr::CONNECTIONS_MISSING.to_string(),
                 args: vec![OscType::String(json.clone())],
@@ -1143,6 +1178,17 @@ impl ControlMessage {
                 target: int(args, 2)? as u32,
                 slot: int(args, 3)? as u32,
                 param: int(args, 4)? as u32,
+            }),
+            addr::MIDI_KEY_BIND => Some(ControlMessage::KeyBind {
+                kind: int(args, 0)? as u32,
+                location: int(args, 1)? as u32,
+                target: int(args, 2)? as u32,
+                slot: int(args, 3)? as u32,
+                param: int(args, 4)? as u32,
+                key: string(args, 5)?,
+            }),
+            addr::MIDI_KEY_TRIGGER => Some(ControlMessage::KeyTrigger {
+                key: string(args, 0)?,
             }),
             addr::CONNECTIONS_MISSING => Some(ControlMessage::MissingConnections {
                 json: string(args, 0)?,
@@ -1710,6 +1756,39 @@ mod tests {
             args: Vec::new(),
         });
         assert_eq!(ControlMessage::from_packet(packet), None);
+    }
+
+    #[test]
+    fn roundtrip_midi_key_bindings() {
+        roundtrip(ControlMessage::MidiBind {
+            kind: 2,
+            location: 0,
+            target: 1,
+            slot: 0,
+            param: 0,
+            min: 0.0,
+            max: 1.0,
+            channel: 16,
+            cc: 20,
+        });
+        roundtrip(ControlMessage::MidiUnbind {
+            kind: 2,
+            location: 0,
+            target: 1,
+            slot: 0,
+            param: 0,
+        });
+        roundtrip(ControlMessage::KeyBind {
+            kind: 2,
+            location: 0,
+            target: 1,
+            slot: 0,
+            param: 0,
+            key: "Ctrl+Shift+M".to_string(),
+        });
+        roundtrip(ControlMessage::KeyTrigger {
+            key: "M".to_string(),
+        });
     }
 
     #[test]

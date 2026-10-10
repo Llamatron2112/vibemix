@@ -119,11 +119,18 @@ impl SharedMidi {
     }
 
     pub fn set_bindings(&self, bindings: &[MidiBinding]) {
-        let count = bindings.len().min(MAX_BINDINGS);
-        for (index, binding) in bindings.iter().take(count).enumerate() {
-            let slot = &self.slots[index];
+        // Key-only bindings never reach the audio-thread map.
+        let mut count = 0usize;
+        for binding in bindings {
+            let Some(cc) = binding.cc else {
+                continue;
+            };
+            if count >= MAX_BINDINGS {
+                break;
+            }
+            let slot = &self.slots[count];
             slot.channel.store(binding.channel as u32, Ordering::Relaxed);
-            slot.cc.store(binding.cc as u32, Ordering::Relaxed);
+            slot.cc.store(cc as u32, Ordering::Relaxed);
             slot.relative.store(binding.relative, Ordering::Relaxed);
             slot.target
                 .store(target_code(binding.target), Ordering::Relaxed);
@@ -134,6 +141,7 @@ impl SharedMidi {
             slot.min.store(binding.min.to_bits(), Ordering::Relaxed);
             slot.max.store(binding.max.to_bits(), Ordering::Relaxed);
             slot.used.store(true, Ordering::Release);
+            count += 1;
         }
         for slot in self.slots.iter().skip(count) {
             slot.used.store(false, Ordering::Release);
@@ -311,7 +319,8 @@ mod tests {
         let midi = SharedMidi::new();
         midi.set_bindings(&[MidiBinding {
             channel: 0,
-            cc: 7,
+            cc: Some(7),
+            key: None,
             relative: false,
             target: MidiTarget::StripGain,
             location: 0,

@@ -461,7 +461,7 @@ impl Controller {
                             binding.slot,
                         )
                         .unwrap_or(crate::midi_map::OMNI as u8);
-                    binding.cc = learned.cc;
+                    binding.cc = Some(learned.cc);
                     let target = binding.target;
                     let location = binding.location;
                     let target_id = binding.target_id;
@@ -1328,7 +1328,8 @@ impl Controller {
                 let expected = self.target_channel(target_kind, location, target, slot);
                 self.pending_learn = Some(MidiBinding {
                     channel: expected.unwrap_or(crate::midi_map::OMNI as u8),
-                    cc: 0,
+                    cc: None,
+                    key: None,
                     relative: false,
                     target: target_kind,
                     location,
@@ -1428,13 +1429,24 @@ impl Controller {
                 let channel = self
                     .target_channel(target_kind, location, target, slot)
                     .unwrap_or(crate::midi_map::OMNI as u8);
+                // Preserve a keyboard binding for the same target.
+                let existing = self
+                    .model
+                    .midi_bindings
+                    .iter()
+                    .find(|binding| {
+                        binding_targets(binding, target_kind, location, target, slot, param)
+                    })
+                    .map(|binding| (binding.key.clone(), binding.relative));
+                let (key, relative) = existing.unwrap_or((None, false));
                 self.model.midi_bindings.retain(|binding| {
                     !binding_targets(binding, target_kind, location, target, slot, param)
                 });
                 self.model.midi_bindings.push(MidiBinding {
                     channel,
-                    cc: cc.min(127) as u8,
-                    relative: false,
+                    cc: Some(cc.min(127) as u8),
+                    key,
+                    relative,
                     target: target_kind,
                     location,
                     target_id: target,
@@ -1463,6 +1475,69 @@ impl Controller {
                 self.rebuild_shared_bindings();
                 Actions {
                     snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::KeyBind {
+                kind,
+                location,
+                target,
+                slot,
+                param,
+                key,
+            } => {
+                let target_kind = target_from_code(kind);
+                let channel = self
+                    .target_channel(target_kind, location, target, slot)
+                    .unwrap_or(crate::midi_map::OMNI as u8);
+                // Keep any MIDI CC / relative flag already bound to this target.
+                let existing = self
+                    .model
+                    .midi_bindings
+                    .iter()
+                    .find(|binding| {
+                        binding_targets(binding, target_kind, location, target, slot, param)
+                    })
+                    .map(|binding| (binding.cc, binding.relative, binding.min, binding.max));
+                let (cc, relative, min, max) = existing.unwrap_or((None, false, 0.0, 1.0));
+                self.model.midi_bindings.retain(|binding| {
+                    !binding_targets(binding, target_kind, location, target, slot, param)
+                });
+                let key = key.trim();
+                // A key-only binding is dropped when the key is cleared and no
+                // CC remains.
+                if !key.is_empty() || cc.is_some() {
+                    self.model.midi_bindings.push(MidiBinding {
+                        channel,
+                        cc,
+                        key: (!key.is_empty()).then(|| key.to_string()),
+                        relative,
+                        target: target_kind,
+                        location,
+                        target_id: target,
+                        slot,
+                        param,
+                        min,
+                        max,
+                    });
+                }
+                self.rebuild_shared_bindings();
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::KeyTrigger { key } => {
+                let mut changed = false;
+                for binding in self.model.midi_bindings.iter() {
+                    if binding.key.as_deref() == Some(key.as_str())
+                        && apply_key_binding(&self.params, binding)
+                    {
+                        changed = true;
+                    }
+                }
+                Actions {
+                    snapshot: changed,
                     catalog: false,
                 }
             }
@@ -3410,6 +3485,38 @@ fn binding_targets(
         && binding.target_id == target_id
         && binding.slot == slot
         && binding.param == param
+}
+
+/// Applies a keyboard-triggered binding by toggling its button target. Returns
+/// false for targets that are not buttons (so keys never touch continuous
+/// controls).
+fn apply_key_binding(params: &SharedParams, binding: &MidiBinding) -> bool {
+    let id = binding.target_id as usize;
+    let slot = binding.slot as usize;
+    match binding.target {
+        MidiTarget::StripMute => {
+            params.set_strip_mute(id, !params.strip_mute(id));
+            true
+        }
+        MidiTarget::StripSolo => {
+            params.set_strip_solo(id, !params.strip_solo(id));
+            true
+        }
+        MidiTarget::BusMute => {
+            params.set_bus_mute(id, !params.bus_mute(id));
+            true
+        }
+        MidiTarget::PluginBypass => {
+            if binding.location <= 1 {
+                let chain = binding.location as usize;
+                params.set_plugin_bypass(id, chain, slot, !params.plugin_bypass(id, chain, slot));
+            } else {
+                params.set_bus_plugin_bypass(id, slot, !params.bus_plugin_bypass(id, slot));
+            }
+            true
+        }
+        _ => false,
+    }
 }
 
 /// Converts a raw control-protocol channel (`0..15`, or `>= OMNI` for "any")
