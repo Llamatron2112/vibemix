@@ -273,12 +273,25 @@ ApplicationWindow {
         if (entry.status === "unsupported") return reason.length > 0 ? reason : "unsupported"
         return ""
     }
-    function filteredCatalog(query, channel, hideFailed) {
+    function filteredCatalog(query, opts) {
         var needle = query ? query.toLowerCase() : ""
+        // When both channels are enabled there is no channel restriction (so
+        // entries with an unknown channel count stay visible); narrowing to one
+        // hides the unknown ones.
+        var bothChannels = opts.showMono && opts.showStereo
         return catalog.filter(function(entry) {
-            if (hideFailed && root.pluginFailed(entry)) return false
-            if (channel === "mono" && entry.inputs !== 1) return false
-            if (channel === "stereo" && entry.inputs !== 2) return false
+            if (!opts.showFailed && root.pluginFailed(entry)) return false
+            if (entry.format === "lv2" && !opts.showLv2) return false
+            if (entry.format === "vst3" && !opts.showVst3) return false
+            if (entry.format === "clap" && !opts.showClap) return false
+            if (opts.scOnly && entry.has_sidechain !== true) return false
+            if (!bothChannels) {
+                var channel = entry.outputs
+                if (channel !== 1 && channel !== 2) return false
+                if (!(channel === 1 && opts.showMono) && !(channel === 2 && opts.showStereo)) {
+                    return false
+                }
+            }
             if (!needle) return true
             return entry.name.toLowerCase().indexOf(needle) >= 0
                 || entry.uri.toLowerCase().indexOf(needle) >= 0
@@ -1022,7 +1035,6 @@ ApplicationWindow {
         pickerWindow.location = location
         pickerWindow.target = target
         pickerFilter.text = ""
-        pickerWindow.channelFilter = ""
         pickerList.currentIndex = 0
         pickerWindow.show()
     }
@@ -1128,6 +1140,16 @@ ApplicationWindow {
         color: root.textColor
         font.pixelSize: 9
         z: 1001
+    }
+
+    // Compact checkbox used by the plugin browser filter rows.
+    component FilterCheck: CheckBox {
+        spacing: 4
+        leftPadding: 4
+        rightPadding: 4
+        topPadding: 0
+        bottomPadding: 0
+        font.pixelSize: 10
     }
 
     component FlatButton: Button {
@@ -2947,10 +2969,17 @@ ApplicationWindow {
         property int location: 0
         property int target: -1
         property bool scanning: false
-        property bool hideFailed: false
-        property string channelFilter: ""
+        // Browser filters — "show" toggles default on; `scOnly` is a filter that
+        // restricts to sidechain-capable plugins.
+        property bool showLv2: true
+        property bool showVst3: true
+        property bool showClap: true
+        property bool showMono: true
+        property bool showStereo: true
+        property bool showFailed: true
+        property bool scOnly: false
         // Model and selection are shared by the list and the details panel.
-        property var filtered: root.filteredCatalog(pickerFilter.text, channelFilter, hideFailed)
+        property var filtered: root.filteredCatalog(pickerFilter.text, pickerWindow)
         property var currentEntry: (pickerList.currentIndex >= 0 && pickerList.currentIndex < filtered.length)
             ? filtered[pickerList.currentIndex] : null
 
@@ -3022,7 +3051,7 @@ ApplicationWindow {
 
             RowLayout {
                 Layout.fillWidth: true
-                spacing: 4
+                spacing: 8
 
                 TextField {
                     id: pickerFilter
@@ -3032,24 +3061,51 @@ ApplicationWindow {
                     placeholderText: "filter..."
                 }
 
-                FlatButton {
-                    text: "all"
-                    enabled: pickerWindow.channelFilter !== ""
-                    onClicked: pickerWindow.channelFilter = ""
+                FilterCheck {
+                    text: "LV2"
+                    checked: pickerWindow.showLv2
+                    onToggled: pickerWindow.showLv2 = checked
                 }
-                FlatButton {
-                    text: "mono"
-                    enabled: pickerWindow.channelFilter !== "mono"
-                    onClicked: pickerWindow.channelFilter = "mono"
+                FilterCheck {
+                    text: "VST3"
+                    checked: pickerWindow.showVst3
+                    onToggled: pickerWindow.showVst3 = checked
                 }
-                FlatButton {
-                    text: "stereo"
-                    enabled: pickerWindow.channelFilter !== "stereo"
-                    onClicked: pickerWindow.channelFilter = "stereo"
+                FilterCheck {
+                    text: "CLAP"
+                    checked: pickerWindow.showClap
+                    onToggled: pickerWindow.showClap = checked
                 }
-                FlatButton {
-                    text: pickerWindow.hideFailed ? "hide failed" : "show failed"
-                    onClicked: pickerWindow.hideFailed = !pickerWindow.hideFailed
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 12
+
+                FilterCheck {
+                    text: "Mono"
+                    checked: pickerWindow.showMono
+                    onToggled: pickerWindow.showMono = checked
+                }
+                FilterCheck {
+                    text: "Stereo"
+                    checked: pickerWindow.showStereo
+                    onToggled: pickerWindow.showStereo = checked
+                }
+                FilterCheck {
+                    text: "SC only"
+                    checked: pickerWindow.scOnly
+                    onToggled: pickerWindow.scOnly = checked
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Show only sidechain-capable plugins"
+                }
+                Item { Layout.fillWidth: true }
+                FilterCheck {
+                    text: "Failed"
+                    checked: pickerWindow.showFailed
+                    onToggled: pickerWindow.showFailed = checked
+                    ToolTip.visible: hovered
+                    ToolTip.text: "Show plugins that failed the smoke test"
                 }
             }
 
@@ -3118,6 +3174,13 @@ ApplicationWindow {
                                 anchors.verticalCenter: parent.verticalCenter
                                 spacing: 6
 
+                                Label {
+                                    text: "SC"
+                                    visible: modelData.has_sidechain === true
+                                    color: root.mutedText
+                                    font.pixelSize: 8
+                                    font.bold: true
+                                }
                                 Label {
                                     text: root.formatLabel(modelData)
                                     color: root.mutedText
