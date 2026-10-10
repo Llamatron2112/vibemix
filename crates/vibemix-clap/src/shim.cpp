@@ -365,30 +365,42 @@ static void scan_one_file(const std::string& path, std::string& json, bool& firs
   module_release(path);
 }
 
-// Enumerates `.clap` entries in `dir` (files, or directories containing one).
+// Recursively enumerates `.clap` entries under `dir` (the CLAP spec requires
+// recursion; u-he nests its bundle in a `u-he/` subdirectory). Each entry may
+// be a plugin file (or a symlink to one) or a bundle directory.
 extern "C" char* clap_scan(const char* dir) {
   std::string json = "[";
   bool first = true;
+  std::error_code ec;
   if (dir) {
-    std::error_code ec;
-    for (const auto& dir_entry : std::filesystem::directory_iterator(dir, ec)) {
-      const auto& path = dir_entry.path();
+    std::filesystem::recursive_directory_iterator it(
+        dir, std::filesystem::directory_options::skip_permission_denied, ec);
+    const std::filesystem::recursive_directory_iterator end;
+    for (; it != end; it.increment(ec)) {
+      if (ec) {
+        ec.clear();
+        continue;
+      }
+      const auto& path = it->path();
+      if (path.extension() != ".clap") continue;
+      // Do not descend into the matched bundle.
+      it.disable_recursion_pending();
       std::string file;
-      if (std::filesystem::is_regular_file(path)) {
-        if (path.extension() != ".clap") continue;
+      std::error_code stat_error;
+      if (std::filesystem::is_regular_file(path, stat_error)) {
         file = path.string();
-      } else if (std::filesystem::is_directory(path)) {
-        if (path.extension() != ".clap") continue;
-        for (const auto& inner : std::filesystem::directory_iterator(path, ec)) {
+      } else if (std::filesystem::is_directory(path, stat_error)) {
+        std::error_code inner_error;
+        for (const auto& inner : std::filesystem::directory_iterator(path, inner_error)) {
           if (std::filesystem::is_regular_file(inner.path())) {
             file = inner.path().string();
             break;
           }
         }
-        if (file.empty()) continue;
       } else {
         continue;
       }
+      if (file.empty()) continue;
       scan_one_file(file, json, first);
     }
   }

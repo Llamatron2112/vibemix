@@ -335,16 +335,26 @@ void vst3_string_free(char* text) {
     std::free(text);
 }
 
-/// Enumerates `*.vst3` bundles in `dir` (non-recursive) and returns a JSON
-/// array string (caller frees with `vst3_string_free`).
+/// Enumerates `*.vst3` bundles under `dir` (recursive — installers such as u-he
+/// nest them in a vendor subdirectory) and returns a JSON array string (caller
+/// frees with `vst3_string_free`).
 char* vst3_scan(const char* dir) {
     std::string json = "[";
     bool first = true;
     std::error_code ec;
     if (dir) {
-        for (const auto& entry : fs::directory_iterator(dir, ec)) {
-            const auto& path = entry.path();
+        fs::recursive_directory_iterator it(
+            dir, fs::directory_options::skip_permission_denied, ec);
+        const fs::recursive_directory_iterator end;
+        for (; it != end; it.increment(ec)) {
+            if (ec) {
+                ec.clear();
+                continue;
+            }
+            const auto& path = it->path();
             if (path.extension() != ".vst3") continue;
+            // Do not descend into the bundle's own Contents directory.
+            it.disable_recursion_pending();
             std::string error;
             auto module = Hosting::Module::create(path.string(), error);
             if (!module) {
