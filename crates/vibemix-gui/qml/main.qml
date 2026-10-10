@@ -590,9 +590,6 @@ ApplicationWindow {
         var item = root.activeFocusItem
         return !!item && item.cursorPosition !== undefined
     }
-    function keyBindingsEnabled() {
-        return root.midiKeyLearnSpec === null && !root.textEditing()
-    }
     function beginKeyLearn(spec) {
         if (spec) {
             root.midiKeyLearnSpec = spec
@@ -617,6 +614,21 @@ ApplicationWindow {
         backend.keyBind(spec.kind, spec.location, spec.target, spec.slot, spec.param,
             root.keyCombo(event))
         root.midiKeyLearnSpec = null
+    }
+    // Fires a bound button for a key press that reaches the main content item.
+    function handleGlobalKey(event) {
+        if (root.midiKeyLearnSpec !== null || root.textEditing()) {
+            return
+        }
+        var combo = root.keyCombo(event)
+        var list = mix.midi_bindings || []
+        for (var i = 0; i < list.length; ++i) {
+            if (list[i].key === combo) {
+                backend.keyTrigger(combo)
+                event.accepted = true
+                return
+            }
+        }
     }
     function midiBindFromField(kind, location, target, slot, param, min, max, text) {
         var t = String(text).trim()
@@ -1171,17 +1183,9 @@ ApplicationWindow {
         onActivated: backend.cancelPluginScan()
     }
 
-    // Keyboard bindings for mixer buttons (configured in the MIDI bindings
-    // dialog). Disabled while a text field is focused or while capturing a key.
-    Repeater {
-        model: mix.midi_bindings || []
-
-        Shortcut {
-            sequence: modelData && modelData.key ? modelData.key : ""
-            enabled: root.keyBindingsEnabled()
-            onActivated: backend.keyTrigger(modelData.key)
-        }
-    }
+    // Keyboard bindings for mixer buttons are handled by the main content
+    // item (see `handleGlobalKey`), so unhandled key events bubble up from the
+    // focused control.
 
     // Waiting-for-host overlay: shown until the engine is connected and has sent
     // its plugin catalog, and while the startup plugin sweep is running.
@@ -3707,6 +3711,8 @@ ApplicationWindow {
         clip: true
         flickableDirection: Flickable.HorizontalAndVerticalFlick
         interactive: !root.sliderHovered && !root.gripDragging
+        focus: true
+        Keys.onPressed: (event) => root.handleGlobalKey(event)
 
         Column {
             id: content
