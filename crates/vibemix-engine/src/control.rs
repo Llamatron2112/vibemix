@@ -23,7 +23,7 @@ use vibemix_proto::ControlMessage;
 use crate::backend_jack::{instantiate_slot, JackEngine};
 use crate::catalog::{ControlInfo, PluginEntry};
 use crate::dsp;
-use crate::health::{HealthStore, Scan, ScanEvent, Status};
+use crate::health::{HealthStore, Scan, ScanEvent, Status, VerdictMeta};
 use crate::params::{
     MeterLevels, SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
 };
@@ -404,8 +404,13 @@ impl Controller {
             for event in self.scan.poll() {
                 match event {
                     ScanEvent::Start { .. } => {}
-                    ScanEvent::Verdict { uri, status, reason } => {
-                        self.health.set(&uri, status, reason);
+                    ScanEvent::Verdict {
+                        uri,
+                        status,
+                        reason,
+                        meta,
+                    } => {
+                        self.health.set(&uri, status, reason, meta);
                         self.health_dirty = true;
                     }
                     ScanEvent::Done { .. } => {
@@ -1560,7 +1565,7 @@ impl Controller {
     }
 
     fn record_health(&mut self, uri: &str, status: Status, reason: String) {
-        self.health.set(uri, status, reason);
+        self.health.set(uri, status, reason, VerdictMeta::default());
         self.health_dirty = true;
         self.health_immediate = true;
     }
@@ -3559,14 +3564,30 @@ fn build_catalog(plugins: &[PluginEntry], health: &HealthStore) -> String {
     let list: Vec<serde_json::Value> = plugins
         .iter()
         .map(|entry| {
+            let verdict = health.get(&entry.id);
             let (status, reason) = if let Some(reason) = &entry.unsupported {
                 (Some("unsupported"), reason.clone())
             } else if !entry.hostable {
                 (Some("unsupported"), "unsupported port layout".to_string())
-            } else if let Some(verdict) = health.get(&entry.id) {
+            } else if let Some(verdict) = verdict {
                 (Some(verdict.status.as_str()), verdict.reason.clone())
             } else {
                 (None, String::new())
+            };
+            // VST3/CLAP port layout and editor availability are only known after
+            // the smoke sweep instantiates the plugin; merge what it reported.
+            let has_sidechain =
+                entry.has_sidechain || verdict.and_then(|v| v.has_sidechain).unwrap_or(false);
+            let has_ui = entry.has_ui || verdict.and_then(|v| v.has_ui).unwrap_or(false);
+            let inputs = if entry.inputs > 0 {
+                entry.inputs
+            } else {
+                verdict.and_then(|v| v.inputs).unwrap_or(0)
+            };
+            let outputs = if entry.outputs > 0 {
+                entry.outputs
+            } else {
+                verdict.and_then(|v| v.outputs).unwrap_or(0)
             };
             serde_json::json!({
                 "uri": entry.id,
@@ -3579,10 +3600,10 @@ fn build_catalog(plugins: &[PluginEntry], health: &HealthStore) -> String {
                 "homepage": entry.homepage,
                 "license": entry.license,
                 "bundle": entry.bundle,
-                "has_ui": entry.has_ui,
-                "has_sidechain": entry.has_sidechain,
-                "inputs": entry.inputs,
-                "outputs": entry.outputs,
+                "has_ui": has_ui,
+                "has_sidechain": has_sidechain,
+                "inputs": inputs,
+                "outputs": outputs,
                 "midi": entry.midi,
                 "status": status,
                 "reason": reason,

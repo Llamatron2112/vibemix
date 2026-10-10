@@ -209,7 +209,8 @@ fn run_smoke(uri: &str) -> ! {
 
 fn run_smoke_vst3(bundle: &str, class_id: &str) -> ! {
     smoke::disable_core_dumps();
-    std::process::exit(smoke::smoke_plugin_vst3(bundle, class_id));
+    let (code, _) = smoke::smoke_plugin_vst3(bundle, class_id);
+    std::process::exit(code);
 }
 
 fn run_smoke_vst3_ui(bundle: &str, class_id: &str) -> ! {
@@ -220,7 +221,8 @@ fn run_smoke_vst3_ui(bundle: &str, class_id: &str) -> ! {
 
 fn run_smoke_clap(bundle: &str, plugin_id: &str) -> ! {
     smoke::disable_core_dumps();
-    std::process::exit(smoke::smoke_plugin_clap(bundle, plugin_id));
+    let (code, _) = smoke::smoke_plugin_clap(bundle, plugin_id);
+    std::process::exit(code);
 }
 
 fn run_smoke_clap_ui(bundle: &str, plugin_id: &str) -> ! {

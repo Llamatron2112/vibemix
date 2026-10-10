@@ -11,7 +11,7 @@ mod worker;
 /// Bump when host-side behavior changes (bug fixes, feature coverage) so that
 /// persisted plugin-health verdicts in the engine are invalidated and plugins
 /// are retested. Increment whenever a host fix could unblock a plugin.
-pub const HOST_ABI_VERSION: u32 = 3;
+pub const HOST_ABI_VERSION: u32 = 4;
 
 pub use atom::{append_atom_event, for_each_event, MidiEvent, TimePosition, EVENT_TRANSFER_URI};
 pub use host::{ControlPort, Host, PluginInfo, PluginInstance};

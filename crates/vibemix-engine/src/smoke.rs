@@ -42,6 +42,21 @@ pub fn lower_priority() {
     }
 }
 
+/// Per-plugin facts learned while the smoke test instantiates it, reported back
+/// across the fork pipe so the health verdict can carry them (VST3/CLAP port
+/// layout and editor availability are otherwise only known after instancing).
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+pub struct PluginMeta {
+    #[serde(default)]
+    pub has_sidechain: bool,
+    #[serde(default)]
+    pub inputs: usize,
+    #[serde(default)]
+    pub outputs: usize,
+    #[serde(default)]
+    pub has_ui: bool,
+}
+
 /// Instantiates `uri` and runs a few blocks of DC input. Returns the smoke exit
 /// code ([`SMOKE_OK`] / [`SMOKE_INSTANTIATE_FAILED`]).
 pub fn smoke_plugin(host: &Host, uri: &str) -> i32 {
@@ -61,7 +76,7 @@ pub fn smoke_plugin(host: &Host, uri: &str) -> i32 {
 }
 
 /// Instantiates a VST3 plugin and runs a few blocks of DC input.
-pub fn smoke_plugin_vst3(bundle: &str, class_id: &str) -> i32 {
+pub fn smoke_plugin_vst3(bundle: &str, class_id: &str) -> (i32, Option<PluginMeta>) {
     let host = vibemix_vst3::Host::new();
     let Some(mut instance) = host.instantiate(
         bundle,
@@ -70,7 +85,13 @@ pub fn smoke_plugin_vst3(bundle: &str, class_id: &str) -> i32 {
         SMOKE_FRAMES,
         vibemix_vst3::PluginInstance::max_frames(),
     ) else {
-        return SMOKE_INSTANTIATE_FAILED;
+        return (SMOKE_INSTANTIATE_FAILED, None);
+    };
+    let meta = PluginMeta {
+        has_sidechain: instance.has_sidechain(),
+        inputs: instance.audio_input_count(),
+        outputs: instance.audio_output_count(),
+        has_ui: instance.has_editor(),
     };
     for _ in 0..SMOKE_BLOCKS {
         for channel in 0..instance.audio_input_count() {
@@ -80,7 +101,7 @@ pub fn smoke_plugin_vst3(bundle: &str, class_id: &str) -> i32 {
         }
         instance.run(SMOKE_FRAMES);
     }
-    SMOKE_OK
+    (SMOKE_OK, Some(meta))
 }
 
 /// Creates and tears down a VST3 plugin's editor headlessly, so a crashing
@@ -104,7 +125,7 @@ pub fn smoke_plugin_vst3_ui(bundle: &str, class_id: &str) -> i32 {
 }
 
 /// Instantiates a CLAP plugin and runs a few blocks of DC input.
-pub fn smoke_plugin_clap(bundle: &str, plugin_id: &str) -> i32 {
+pub fn smoke_plugin_clap(bundle: &str, plugin_id: &str) -> (i32, Option<PluginMeta>) {
     let host = vibemix_clap::Host::new();
     let Some(mut instance) = host.instantiate(
         bundle,
@@ -113,7 +134,13 @@ pub fn smoke_plugin_clap(bundle: &str, plugin_id: &str) -> i32 {
         SMOKE_FRAMES,
         vibemix_clap::PluginInstance::max_frames(),
     ) else {
-        return SMOKE_INSTANTIATE_FAILED;
+        return (SMOKE_INSTANTIATE_FAILED, None);
+    };
+    let meta = PluginMeta {
+        has_sidechain: instance.has_sidechain(),
+        inputs: instance.audio_input_count(),
+        outputs: instance.audio_output_count(),
+        has_ui: instance.has_editor(),
     };
     for _ in 0..SMOKE_BLOCKS {
         for channel in 0..instance.audio_input_count() {
@@ -123,7 +150,7 @@ pub fn smoke_plugin_clap(bundle: &str, plugin_id: &str) -> i32 {
         }
         instance.run(SMOKE_FRAMES);
     }
-    SMOKE_OK
+    (SMOKE_OK, Some(meta))
 }
 
 /// Creates and tears down a CLAP plugin's editor, so a crashing editor is
@@ -178,9 +205,9 @@ impl SmokeTarget {
         }
     }
 
-    fn run(&self, host: &Host) -> i32 {
+    fn run(&self, host: &Host) -> (i32, Option<PluginMeta>) {
         match self {
-            SmokeTarget::Lv2 { uri, .. } => smoke_plugin(host, uri),
+            SmokeTarget::Lv2 { uri, .. } => (smoke_plugin(host, uri), None),
             SmokeTarget::Vst3 {
                 bundle, class_id, ..
             } => smoke_plugin_vst3(bundle, class_id),
@@ -256,7 +283,7 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
 
     let mut failed = 0usize;
     for target in &targets {
-        let outcome = scan_one(&host, target);
+        let (outcome, meta) = scan_one(&host, target);
         if !matches!(outcome, ChildOutcome::Ok) {
             failed += 1;
         }
@@ -266,13 +293,20 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
             ChildOutcome::Failed(reason) => ("failed", reason.clone()),
             ChildOutcome::Timeout => ("failed", "timeout".to_string()),
         };
-        emit(&serde_json::json!({
+        let mut verdict = serde_json::json!({
             "scan": "plugin",
             "uri": target.id(),
             "name": target.name(),
             "status": status,
             "reason": reason,
-        }));
+        });
+        if let Some(meta) = &meta {
+            verdict["has_sidechain"] = serde_json::json!(meta.has_sidechain);
+            verdict["inputs"] = serde_json::json!(meta.inputs);
+            verdict["outputs"] = serde_json::json!(meta.outputs);
+            verdict["has_ui"] = serde_json::json!(meta.has_ui);
+        }
+        emit(&verdict);
     }
 
     emit(&serde_json::json!({
@@ -283,15 +317,23 @@ pub fn scan_plugins(only: Option<Vec<String>>) -> ! {
     std::process::exit(0);
 }
 
-/// Forks, runs the smoke test in the child, and waits with a timeout.
-fn scan_one(host: &Host, target: &SmokeTarget) -> ChildOutcome {
+/// Forks, runs the smoke test in the child, and waits with a timeout. The child
+/// reports the [`PluginMeta`] it learned over a pipe (separate from the
+/// `/dev/null`'d stdout/stderr), which the parent reads after it exits.
+fn scan_one(host: &Host, target: &SmokeTarget) -> (ChildOutcome, Option<PluginMeta>) {
     // Flush so the forked child does not duplicate buffered output.
     let _ = std::io::stdout().flush();
+
+    let mut fds = [-1 as libc::c_int; 2];
+    let have_pipe = unsafe { libc::pipe(fds.as_mut_ptr()) } == 0;
 
     let pid = unsafe { libc::fork() };
     if pid == 0 {
         // Child: silence stdout/stderr and run the plugin, then `_exit` to
         // avoid running inherited atexit handlers.
+        if have_pipe {
+            unsafe { libc::close(fds[0]) };
+        }
         if let Ok(devnull) = std::fs::File::open("/dev/null") {
             use std::os::fd::AsRawFd;
             let fd = devnull.as_raw_fd();
@@ -300,44 +342,92 @@ fn scan_one(host: &Host, target: &SmokeTarget) -> ChildOutcome {
                 libc::dup2(fd, libc::STDERR_FILENO);
             }
         }
-        let code = target.run(host);
+        let (code, meta) = target.run(host);
+        if have_pipe {
+            if let Some(meta) = &meta {
+                if let Ok(bytes) = serde_json::to_vec(meta) {
+                    let mut written = 0usize;
+                    while written < bytes.len() {
+                        let ret = unsafe {
+                            libc::write(
+                                fds[1],
+                                bytes[written..].as_ptr() as *const libc::c_void,
+                                bytes.len() - written,
+                            )
+                        };
+                        if ret <= 0 {
+                            break;
+                        }
+                        written += ret as usize;
+                    }
+                }
+            }
+            unsafe { libc::close(fds[1]) };
+        }
         unsafe { libc::_exit(if code == SMOKE_OK { 0 } else { 2 }) };
     }
+    if have_pipe {
+        // Parent: the child owns the write end.
+        unsafe { libc::close(fds[1]) };
+    }
     if pid < 0 {
-        return ChildOutcome::Failed("fork failed".to_string());
+        if have_pipe {
+            unsafe { libc::close(fds[0]) };
+        }
+        return (ChildOutcome::Failed("fork failed".to_string()), None);
     }
 
     let deadline = Instant::now() + SCAN_TIMEOUT;
     let mut status: libc::c_int = 0;
-    loop {
+    let outcome = loop {
         let ret = unsafe { libc::waitpid(pid, &mut status, libc::WNOHANG) };
         if ret == pid {
-            break;
+            break if libc::WIFSIGNALED(status) {
+                ChildOutcome::Failed(signal_name(libc::WTERMSIG(status)).to_string())
+            } else if libc::WIFEXITED(status) {
+                match libc::WEXITSTATUS(status) {
+                    0 => ChildOutcome::Ok,
+                    2 => ChildOutcome::InstantiateFailed,
+                    code => ChildOutcome::Failed(format!("exit {code}")),
+                }
+            } else {
+                ChildOutcome::Failed("unknown".to_string())
+            };
         }
         if ret < 0 {
-            return ChildOutcome::Failed("waitpid failed".to_string());
+            break ChildOutcome::Failed("waitpid failed".to_string());
         }
         if Instant::now() > deadline {
             unsafe {
                 libc::kill(pid, libc::SIGKILL);
                 libc::waitpid(pid, &mut status, 0);
             }
-            return ChildOutcome::Timeout;
+            break ChildOutcome::Timeout;
         }
         std::thread::sleep(Duration::from_millis(5));
+    };
+
+    let mut meta = None;
+    if have_pipe {
+        // The child has exited, so the read end returns EOF after the payload.
+        let mut buf = Vec::new();
+        let mut chunk = [0u8; 256];
+        loop {
+            let n = unsafe {
+                libc::read(fds[0], chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
+            };
+            if n <= 0 {
+                break;
+            }
+            buf.extend_from_slice(&chunk[..n as usize]);
+        }
+        unsafe { libc::close(fds[0]) };
+        if !buf.is_empty() {
+            meta = serde_json::from_slice(&buf).ok();
+        }
     }
 
-    if libc::WIFSIGNALED(status) {
-        ChildOutcome::Failed(signal_name(libc::WTERMSIG(status)).to_string())
-    } else if libc::WIFEXITED(status) {
-        match libc::WEXITSTATUS(status) {
-            0 => ChildOutcome::Ok,
-            2 => ChildOutcome::InstantiateFailed,
-            code => ChildOutcome::Failed(format!("exit {code}")),
-        }
-    } else {
-        ChildOutcome::Failed("unknown".to_string())
-    }
+    (outcome, meta)
 }
 
 pub fn signal_name(signal: i32) -> &'static str {

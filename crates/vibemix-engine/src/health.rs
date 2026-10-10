@@ -43,6 +43,26 @@ pub struct Verdict {
     pub status: Status,
     #[serde(default)]
     pub reason: String,
+    /// Facts learned while smoke-testing (VST3/CLAP port layout and editor
+    /// availability are otherwise unknown until a plugin is instantiated).
+    #[serde(default)]
+    pub has_sidechain: Option<bool>,
+    #[serde(default)]
+    pub inputs: Option<usize>,
+    #[serde(default)]
+    pub outputs: Option<usize>,
+    #[serde(default)]
+    pub has_ui: Option<bool>,
+}
+
+/// Optional per-plugin facts reported by a sweep verdict. `None` fields leave
+/// any previously recorded value untouched.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct VerdictMeta {
+    pub has_sidechain: Option<bool>,
+    pub inputs: Option<usize>,
+    pub outputs: Option<usize>,
+    pub has_ui: Option<bool>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Default)]
@@ -111,10 +131,23 @@ impl HealthStore {
         self.entries.get(uri)
     }
 
-    pub fn set(&mut self, uri: &str, status: Status, reason: impl Into<String>) {
+    pub fn set(&mut self, uri: &str, status: Status, reason: impl Into<String>, meta: VerdictMeta) {
+        let (prev_sidechain, prev_inputs, prev_outputs, prev_ui) = match self.entries.get(uri) {
+            Some(verdict) => (
+                verdict.has_sidechain,
+                verdict.inputs,
+                verdict.outputs,
+                verdict.has_ui,
+            ),
+            None => (None, None, None, None),
+        };
         let next = Verdict {
             status,
             reason: reason.into(),
+            has_sidechain: meta.has_sidechain.or(prev_sidechain),
+            inputs: meta.inputs.or(prev_inputs),
+            outputs: meta.outputs.or(prev_outputs),
+            has_ui: meta.has_ui.or(prev_ui),
         };
         if self.entries.get(uri) == Some(&next) {
             return;
@@ -158,13 +191,19 @@ fn sweepable(entry: &PluginEntry) -> bool {
 /// One line of the `--scan-plugins` stdout protocol.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ScanEvent {
-    Start { total: usize },
+    Start {
+        total: usize,
+    },
     Verdict {
         uri: String,
         status: Status,
         reason: String,
+        meta: VerdictMeta,
     },
-    Done { total: usize, failed: usize },
+    Done {
+        total: usize,
+        failed: usize,
+    },
 }
 
 pub fn parse_scan_line(line: &str) -> Option<ScanEvent> {
@@ -184,6 +223,18 @@ pub fn parse_scan_line(line: &str) -> Option<ScanEvent> {
                 .and_then(serde_json::Value::as_str)
                 .unwrap_or_default()
                 .to_string(),
+            meta: VerdictMeta {
+                has_sidechain: value.get("has_sidechain").and_then(serde_json::Value::as_bool),
+                inputs: value
+                    .get("inputs")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| n as usize),
+                outputs: value
+                    .get("outputs")
+                    .and_then(serde_json::Value::as_u64)
+                    .map(|n| n as usize),
+                has_ui: value.get("has_ui").and_then(serde_json::Value::as_bool),
+            },
         }),
         "done" => Some(ScanEvent::Done {
             total: value.get("total")?.as_u64()? as usize,
@@ -345,6 +396,23 @@ mod tests {
                 uri: "u".to_string(),
                 status: Status::Failed,
                 reason: "crash SIGSEGV".to_string(),
+                meta: VerdictMeta::default(),
+            })
+        );
+        assert_eq!(
+            parse_scan_line(
+                r#"{"scan":"plugin","uri":"v","status":"ok","has_sidechain":true,"inputs":2,"outputs":2,"has_ui":true}"#
+            ),
+            Some(ScanEvent::Verdict {
+                uri: "v".to_string(),
+                status: Status::Ok,
+                reason: String::new(),
+                meta: VerdictMeta {
+                    has_sidechain: Some(true),
+                    inputs: Some(2),
+                    outputs: Some(2),
+                    has_ui: Some(true),
+                },
             })
         );
         assert_eq!(
@@ -373,6 +441,10 @@ mod tests {
         let verdict = Verdict {
             status: Status::Ok,
             reason: String::new(),
+            has_sidechain: None,
+            inputs: None,
+            outputs: None,
+            has_ui: None,
         };
         let mut entries = HashMap::new();
         entries.insert("u".to_string(), verdict.clone());
@@ -413,6 +485,10 @@ mod tests {
             Verdict {
                 status: Status::Ok,
                 reason: String::new(),
+                has_sidechain: None,
+                inputs: None,
+                outputs: None,
+                has_ui: None,
             },
         );
         let health = store(HOST_ABI_VERSION, entries);
@@ -431,12 +507,12 @@ mod tests {
     #[test]
     fn set_dedups_and_marks_dirty() {
         let mut health = store(HOST_ABI_VERSION, HashMap::new());
-        health.set("u", Status::Ok, "");
+        health.set("u", Status::Ok, "", VerdictMeta::default());
         assert!(health.dirty);
         health.dirty = false;
-        health.set("u", Status::Ok, "");
+        health.set("u", Status::Ok, "", VerdictMeta::default());
         assert!(!health.dirty);
-        health.set("u", Status::Failed, "crash SIGSEGV");
+        health.set("u", Status::Failed, "crash SIGSEGV", VerdictMeta::default());
         assert!(health.dirty);
         assert_eq!(health.get("u").map(|v| v.status), Some(Status::Failed));
     }
