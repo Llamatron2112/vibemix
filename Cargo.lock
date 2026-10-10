@@ -1004,6 +1004,16 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
+name = "vibemix-clap"
+version = "0.1.0"
+dependencies = [
+ "cc",
+ "libc",
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "vibemix-core"
 version = "0.1.0"
 dependencies = [
@@ -1026,6 +1036,7 @@ dependencies = [
  "toml",
  "tracing",
  "tracing-subscriber",
+ "vibemix-clap",
  "vibemix-core",
  "vibemix-lv2",
  "vibemix-proto",

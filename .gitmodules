@@ -1,3 +1,6 @@
 [submodule "vendor/vst3sdk"]
 	path = vendor/vst3sdk
 	url = https://github.com/steinbergmedia/vst3sdk.git
+[submodule "vendor/clap"]
+	path = vendor/clap
+	url = https://github.com/free-audio/clap

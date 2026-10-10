@@ -5,6 +5,7 @@ members = [
     "crates/vibemix-proto",
     "crates/vibemix-lv2",
     "crates/vibemix-vst3",
+    "crates/vibemix-clap",
     "crates/vibemix-engine",
     "crates/vibemix-gui",
 ]
@@ -25,6 +26,7 @@ vibemix-core = { path = "crates/vibemix-core" }
 vibemix-proto = { path = "crates/vibemix-proto" }
 vibemix-lv2 = { path = "crates/vibemix-lv2" }
 vibemix-vst3 = { path = "crates/vibemix-vst3" }
+vibemix-clap = { path = "crates/vibemix-clap" }
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 serde = { version = "1", features = ["derive"] }
