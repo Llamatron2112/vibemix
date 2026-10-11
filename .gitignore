@@ -6,8 +6,10 @@
 .cargo/
 .qmlls.ini
 
-# Local Arch packaging (generated per machine)
-packaging/arch/
+# makepkg build artifacts (the PKGBUILD and .SRCINFO are tracked)
+packaging/arch/pkg/
+packaging/arch/src/
+packaging/arch/*.pkg.tar.*
 
 # Editor / OS
 .idea/
