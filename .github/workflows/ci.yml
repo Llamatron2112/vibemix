@@ -15,13 +15,18 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
+        with:
+          # The vendored VST3 SDK and CLAP headers are submodules (the SDK has
+          # nested ones); the workspace build fails without them.
+          submodules: recursive
 
       - name: Install system dependencies
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake ninja-build pkg-config lld \
-            qt6-base-dev qt6-declarative-dev qt6-quickcontrols2-dev \
+            qt6-base-dev qt6-declarative-dev qt6-declarative-dev-tools \
+            libx11-dev libgl-dev \
             lv2-dev liblilv-dev libserd-dev libsord-dev libsratom-dev libsuil-dev \
             libjack-jackd2-dev
 
@@ -48,6 +53,8 @@ jobs:
             qmllint6 crates/vibemix-gui/qml/main.qml
           elif command -v qmllint-qt6 >/dev/null 2>&1; then
             qmllint-qt6 crates/vibemix-gui/qml/main.qml
+          elif [ -x /usr/lib/qt6/bin/qmllint ]; then
+            /usr/lib/qt6/bin/qmllint crates/vibemix-gui/qml/main.qml
           else
             echo "qmllint not found; skipping"
           fi
