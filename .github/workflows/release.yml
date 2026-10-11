@@ -21,7 +21,7 @@ jobs:
   check:
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -52,13 +52,19 @@ jobs:
     needs: check
     runs-on: ubuntu-24.04
     container: debian:12
+    defaults:
+      run:
+        shell: bash
     steps:
+      # debian:12 ships no bash, so bootstrap it (and the fetch tools) with the
+      # default `sh`; every later step runs under bash.
       - name: Install fetch tools
+        shell: sh
         run: |
           apt-get update
-          apt-get install -y --no-install-recommends git ca-certificates curl
+          apt-get install -y --no-install-recommends bash git ca-certificates curl
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -111,7 +117,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: linux
           path: dist/*
@@ -122,11 +128,14 @@ jobs:
     needs: check
     runs-on: ubuntu-24.04
     container: fedora:43
+    defaults:
+      run:
+        shell: bash
     steps:
       - name: Install fetch tools
         run: dnf install -y git ca-certificates curl tar
 
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
         with:
           submodules: recursive
 
@@ -176,7 +185,7 @@ jobs:
             exit 1
           fi
 
-      - uses: actions/upload-artifact@v4
+      - uses: actions/upload-artifact@v7
         with:
           name: rpm
           path: dist/*
@@ -186,7 +195,7 @@ jobs:
     needs: [linux, rpm]
     runs-on: ubuntu-24.04
     steps:
-      - uses: actions/download-artifact@v4
+      - uses: actions/download-artifact@v8
         with:
           path: dist
           merge-multiple: true
@@ -198,7 +207,7 @@ jobs:
           sha256sum *.deb *.rpm *.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
-      - uses: softprops/action-gh-release@v2
+      - uses: softprops/action-gh-release@v3
         with:
           files: |
             dist/*.deb
