@@ -1,8 +1,14 @@
 # vibemix
 
+[![Release](https://img.shields.io/github/v/release/Llamatron2112/vibemix)](https://github.com/Llamatron2112/vibemix/releases)
+[![CI](https://github.com/Llamatron2112/vibemix/actions/workflows/ci.yml/badge.svg)](https://github.com/Llamatron2112/vibemix/actions/workflows/ci.yml)
+
 A modular audio mixer for JACK/PipeWire with **LV2, VST3 and CLAP** plugin
 support, split into a real-time audio engine and a Qt Quick GUI that talk over a
 small OSC control protocol.
+
+> A vibe-coding experiment: built by an AI assistant with human direction —
+> expect rough edges.
 
 ## Features
 
@@ -87,6 +93,27 @@ engine for the session, then the GUI), a `.desktop` entry and an icon.
   plugin hosting, control protocol, real-time safety rules, milestones.
 - [docs/prerequisites.md](docs/prerequisites.md) — system setup and build env.
 - [docs/backlog.md](docs/backlog.md) — deferred ideas and follow-ups.
+- [CHANGELOG.md](CHANGELOG.md) — release notes.
+
+## Releasing
+
+1. Bump `[workspace.package] version` in `Cargo.toml`.
+2. Refresh the lockfile (`cargo build`, or `cargo metadata`).
+3. Update `packaging/arch/PKGBUILD` `pkgver` and regenerate `.SRCINFO`:
+   `(cd packaging/arch && makepkg --printsrcinfo > .SRCINFO)`.
+4. Add a `CHANGELOG.md` entry.
+5. Commit, tag and push:
+
+   ```bash
+   git commit -am "release: vX.Y.Z"
+   git tag -a vX.Y.Z -m "vibemix X.Y.Z"
+   git push origin main
+   git push origin vX.Y.Z
+   ```
+
+6. The `Release` workflow gates on tests, builds and verifies the `.deb`
+   (Debian 12), `.rpm` (Fedora 43) and a binary tarball, then publishes them to
+   the GitHub Release with SHA-256 checksums.
 
 ## License
 

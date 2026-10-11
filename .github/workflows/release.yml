@@ -195,6 +195,8 @@ jobs:
     needs: [linux, rpm]
     runs-on: ubuntu-24.04
     steps:
+      - uses: actions/checkout@v7
+
       - uses: actions/download-artifact@v8
         with:
           path: dist
@@ -207,8 +209,21 @@ jobs:
           sha256sum *.deb *.rpm *.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
+      - name: Release notes
+        run: |
+          set -euo pipefail
+          version="${GITHUB_REF_NAME#v}"
+          awk -v v="$version" \
+            '$0 ~ "^## \\[" v "\\]" { p=1; next } p && (/^## \[/ || /^\[[^]]*\]: /) { exit } p' \
+            CHANGELOG.md > RELEASE_NOTES.md
+          if [ ! -s RELEASE_NOTES.md ]; then
+            echo "vibemix ${version}" > RELEASE_NOTES.md
+          fi
+          cat RELEASE_NOTES.md
+
       - uses: softprops/action-gh-release@v3
         with:
+          body_path: RELEASE_NOTES.md
           files: |
             dist/*.deb
             dist/*.rpm
