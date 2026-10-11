@@ -1,0 +1,80 @@
+# nfpm packaging for the release workflow (https://nfpm.goreleaser.com).
+#
+# Builds the .deb and .rpm from the release binaries. The version comes from the
+# VIBEMIX_VERSION environment variable (nfpm expands ${...} in this file):
+#   cargo build --release --locked --workspace
+#   VIBEMIX_VERSION=1.0.0 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
+#   VIBEMIX_VERSION=1.0.0 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+#
+# The runtime dependency lists are per-distro on purpose: names differ between
+# Debian and Fedora, and nfpm does not derive them (no dpkg-shlibdeps). The
+# release workflow installs the built package in the matching container, which
+# is what validates these lists.
+name: vibemix
+arch: amd64
+platform: linux
+version: ${VIBEMIX_VERSION}
+section: sound
+priority: optional
+maintainer: "Llamatron2112 <llamatron23@proton.me>"
+vendor: vibemix
+homepage: https://github.com/Llamatron2112/vibemix
+license: MIT OR Apache-2.0
+description: |
+  Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire.
+  A real-time audio engine (JACK/PipeWire) plus a Qt Quick control surface.
+contents:
+  - src: target/release/vibemix-engine
+    dst: /usr/bin/vibemix-engine
+    file_info:
+      mode: 0755
+  - src: target/release/vibemix-gui
+    dst: /usr/bin/vibemix-gui
+    file_info:
+      mode: 0755
+  - src: packaging/vibemix
+    dst: /usr/bin/vibemix
+    file_info:
+      mode: 0755
+  - src: packaging/vibemix.desktop
+    dst: /usr/share/applications/vibemix.desktop
+  - src: packaging/vibemix.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/vibemix.svg
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/vibemix/LICENSE-MIT
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/vibemix/LICENSE-APACHE
+
+overrides:
+  deb:
+    depends:
+      - libc6
+      - libstdc++6
+      - libx11-6
+      - libgl1
+      - liblilv-0-0
+      - libsuil-0-0
+      - libjack-jackd2-0 | pipewire-jack
+      - libqt6core6
+      - libqt6gui6
+      - libqt6qml6
+      - libqt6quick6
+      - qml6-module-qtquick-controls
+      - qml6-module-qtquick-layouts
+      - qml6-module-qtquick-dialogs
+      - qml6-module-qtquick-window
+    recommends:
+      - libgtk-3-0
+  rpm:
+    depends:
+      - glibc
+      - libstdc++
+      - libX11
+      - libglvnd-glx
+      - lilv
+      - suil
+      - pipewire-jack-audio-connection-kit
+      - qt6-qtbase
+      - qt6-qtdeclarative
+    recommends:
+      - gtk3
