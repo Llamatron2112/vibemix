@@ -2,10 +2,10 @@
 Type=Application
 Name=vibemix
 GenericName=Audio Mixer
-Comment=Advanced LV2/VST3 audio mixer
+Comment=Advanced LV2/VST3/CLAP audio mixer
 Exec=vibemix
 Icon=vibemix
 StartupWMClass=vibemix-gui
 Terminal=false
 Categories=AudioVideo;Audio;Mixer;
-Keywords=audio;mixer;jack;pipewire;lv2;vst3;daw;
+Keywords=audio;mixer;jack;pipewire;lv2;vst3;clap;daw;
