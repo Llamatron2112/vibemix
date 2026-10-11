@@ -26,8 +26,10 @@ Notes:
   enough).
 - Do **not** install `jack2`: it conflicts with `pipewire-jack`, which already
   ships the JACK headers, `libjack.so` and `jack.pc`.
-- Optional LV2 test plugins: `sudo pacman -S calf lsp-plugins-lv2 x42-plugins
-  zam-plugins`.
+- Optional test plugins: `sudo pacman -S calf lsp-plugins-lv2 x42-plugins
+  zam-plugins` for LV2, plus `lsp-plugins-vst3` / `lsp-plugins-clap` for
+  VST3/CLAP. Plugins are discovered in the standard user and system directories
+  (`~/.lv2`, `~/.vst3`, `~/.clap`, `/usr/lib/{lv2,vst3,clap}`).
 - Optional **GTK plugin UIs** (e.g. Calf's GTK2 GUI): `gtk3` is in the official
   repos, while `gtk2` is **AUR-only**, so Calf's GTK2 UI needs it built from
   the AUR. Nothing is linked against at build time; the engine `dlopen`s GTK
@@ -102,6 +104,8 @@ Environment variables:
   VST3 plugin and print its buses, parameters, setup/process results and output
   peak, to diagnose a silent plugin without a running JACK session.
   `VIBEMIX_PROBE_PARAMS=1` also pushes every parameter to its default each block.
+- `vibemix-engine --probe-clap <plugin.clap> <plugin-id>` — the same offline
+  probe for a CLAP plugin.
 - `VIBEMIX_GTK` — force the GTK major version used to host plugin UIs:
   `gtk2`, `gtk3`, or unset/`auto` (pick the version that has hostable UIs). GTK2
   and GTK3 cannot coexist in one process, so only one is ever used.
@@ -209,13 +213,15 @@ package. Do not also install `jack2`. Fedora's
 
 ## Submodules
 
-`vendor/vst3sdk` provides the Steinberg VST3 SDK used by `vibemix-vst3`. It is
-**MIT-licensed** (since SDK 3.8; we vendor 3.8.1), so it does not change the
-project license. Fetch it and its nested submodules with:
+Two SDKs are vendored; fetch both, including nested submodules:
 
 ```
-git submodule update --init --recursive vendor/vst3sdk
+git submodule update --init --recursive
 ```
 
-The crate's `build.rs` compiles only the hosting subset it needs (no CMake) and
-builds a small test effect for its tests.
+- `vendor/vst3sdk` provides the Steinberg VST3 SDK used by `vibemix-vst3`. It is
+  **MIT-licensed** (since SDK 3.8; we vendor 3.8.1), so it does not change the
+  project license. The crate's `build.rs` compiles only the hosting subset it
+  needs (no CMake) and builds a small test effect for its tests.
+- `vendor/clap` provides the CLAP headers used by `vibemix-clap`. CLAP is
+  **MIT-licensed**; the shim is header-only and compiled by `build.rs`.

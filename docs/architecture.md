@@ -1,14 +1,14 @@
 # vibemix architecture
 
-`vibemix` is a JACK/ PipeWire audio mixer with LV2 plugin support, split into an
-audio engine and a Qt Quick (QML) control surface.
+`vibemix` is a JACK/ PipeWire audio mixer with LV2, VST3 and CLAP plugin
+support, split into an audio engine and a Qt Quick (QML) control surface.
 
 ```
 ┌─────────────────────────┐         OSC (localhost UDP)        ┌──────────────────────────┐
 │  vibemix-engine (Rust)  │  params/config ────────────────▶    │   vibemix-gui (Rust +    │
 │  - JACK client (RT)     │  ◀──────────── meters/state        │   cxx-qt / Qt Quick QML) │
 │  - mixer graph          │                                    │   - QML surface          │
-│  - LV2 host (lilv)      │                                    │   - Qt event loop        │
+│  - LV2/VST3/CLAP hosts  │                                    │   - Qt event loop        │
 │  - control server       │                                    │   - OSC client (Rust)    │
 └───────────┬─────────────┘                                    └──────────────────────────┘
             │ JACK ports
@@ -27,7 +27,9 @@ cannot cause audio dropouts.
 | `vibemix-core` | Shared model (strips, buses, sends, plugin slots), ids, params, and the `AudioBackend` / `ProcessHandler` traits |
 | `vibemix-proto` | OSC address scheme and `ControlMessage` encode/decode |
 | `vibemix-lv2` | LV2 hosting: `urid:map`/`urid:unmap` host feature, plugin discovery, instances (audio, control in/out, atom sequences), run |
-| `vibemix-engine` | JACK client, RT mixer graph, LV2 host, control server |
+| `vibemix-vst3` | VST3 hosting: vendored-SDK subset shim, discovery, `IComponent`/`IEditController`/`IPlugView` |
+| `vibemix-clap` | CLAP hosting: header-only shim, discovery, `clap_plugin` audio/params/gui |
+| `vibemix-engine` | JACK client, RT mixer graph, plugin hosts, control server |
 | `vibemix-gui` | cxx-qt QML application and OSC client |
 
 ## Audio backend
@@ -60,6 +62,9 @@ PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
 - FTZ/DAZ are enabled on the process thread so plugin tails don't fall into
   denormals. JACK xruns are counted and surfaced in the GUI.
 - LV2 worker communication uses a dedicated non-RT worker thread.
+- MIDI CC bindings are matched on the audio thread against a fixed, lock-free
+  table; keyboard button bindings are resolved on the control thread and only
+  toggle the same atomic state (no audio-thread work).
 - Set `VIBEMIX_RT_GUARD=1` to abort (debug) if any heap operation happens on the
   audio thread — used when testing/auditing.
 
@@ -134,15 +139,21 @@ disconnected first), while entities without info are left alone so auto-connect
 still applies. Connections whose other end is absent at load time are reported to
 the GUI over `/vibemix/connections/missing`, which shows a popup listing them.
 
-## LV2 hosting
+## Plugin hosting
 
-`vibemix-lv2` wraps `lilv` and supplies the host features that `lilv` 0.2.4
-omits. The engine hosts per-strip insert chains (pre- and post-fader) and a
-per-bus insert chain from the session and at runtime. On the development box the
-whole installed mono/stereo set (226 plugins: LSP, Calf, x42, meters.lv2, …)
-passes the isolated smoke sweep; see "Plugin health" below.
+vibemix hosts three plugin formats behind a common `PluginSlot` model and a
+format-agnostic `PluginNode` trait: **LV2** (`vibemix-lv2`, the primary format —
+details below), **VST3** (`vibemix-vst3`, vendored-SDK subset shim) and **CLAP**
+(`vibemix-clap`, header-only shim). All three cover audio effects (MIDI
+passthrough, sidechain where the plugin exposes it); instruments and MIDI-only
+plugins are out of scope. The engine hosts per-strip insert chains (pre- and
+post-fader) and a per-bus insert chain from the session and at runtime. On the
+development box the whole installed mono/stereo LV2 set (LSP, Calf, x42,
+meters.lv2, …) passes the isolated smoke sweep; see "Plugin health" below.
+VST3 and CLAP are covered by the same sweep (`--smoke-vst3`, `--smoke-clap`).
 
-Plugins are discovered by scanning the standard LV2 directories (`lilv`'s
+The LV2 host (`vibemix-lv2`) wraps `lilv` and supplies the host features it
+omits. Plugins are discovered by scanning the standard LV2 directories (`lilv`'s
 `World::load_all`), keeping the hostable mono/stereo ones; the list is persisted
 to `$XDG_CONFIG_HOME/vibemix/catalog.json` (full plugin metadata) on startup and
 after each scan. The GUI's plugin picker (a modal window with a name filter) can
@@ -288,6 +299,8 @@ The smoke test runs headless (the window is never mapped) and also exercises the
 output-forwarding path, so it produces no visible flash. Out-of-process UIs need
 no smoke — the separate process already isolates them.
 
+### VST3 and CLAP
+
 VST3 editors are hosted separately: the plugin's `IPlugView` is embedded into a
 raw X11 window (`kPlatformTypeX11EmbedWindowID`) created per editor, with a
 minimal `IPlugFrame` handling plugin-driven resizes and the window's close
@@ -301,23 +314,32 @@ are logged. Opening an editor is gated by a headless child smoke test
 (`--smoke-vst3-ui`), and the editor button is only shown when the plugin
 reports an X11-editable view.
 
+CLAP editors use the same X11-embedding approach through `clap.gui`: the view is
+created with `CLAP_WINDOW_API_X11` and attached with `set_parent`, with host
+callbacks handling plugin-driven resize, show/hide and close.
+`suggest_title` is only called for floating windows, so embedded views fall back
+to the host window title. Moves made in the editor are folded back into the
+shared parameter state each control-loop pump by reading the plugin's pending
+param events (the control thread never calls `params.flush`); opening an editor
+is gated by a headless child smoke test (`--smoke-clap-ui`).
+
 Every audio bus the plugin declares is presented during processing: bus 0 is
 wired to the strip/bus signal, extra input buses (e.g. a sidechain) are fed
 silence, and extra output buses get throwaway scratch, so a plugin's bus
 topology is preserved even though vibemix only routes the main bus.
 
-**Sidechain routing.** Both formats expose sidechains: VST3 via aux input
-buses, LV2 via extra audio input ports. LV2 sidechain ports are found by tiered
-detection — explicit `pg:sideChainOf`, else the `pg:mainInput` group (ungrouped
-extras are sidechain, as in Calf), else the first `outputs` inputs are main and
-ungrouped extras that are optional or named like a sidechain are sidechain;
-plugins whose main/extras cannot be told apart (A/B testers, mixers) are
-refused. A plugin that has a sidechain can have it **enabled** from its context
-menu (off by default — some plugins expose a sidechain they never use). Once
-enabled it becomes a **send destination**, shown (under a short `sc` label) on
-every strip like a bus send: each strip has a row with its own gain and pre/post
-tap (default pre-fader), and several strips can feed one sidechain at different
-levels. The sources are stored on the plugin
+**Sidechain routing.** All three formats expose sidechains: VST3 via aux input
+buses, LV2 via extra audio input ports, CLAP via named sidechain inputs. LV2
+sidechain ports are found by tiered detection — explicit `pg:sideChainOf`, else
+the `pg:mainInput` group (ungrouped extras are sidechain, as in Calf), else the
+first `outputs` inputs are main and ungrouped extras that are optional or named
+like a sidechain are sidechain; plugins whose main/extras cannot be told apart
+(A/B testers, mixers) are refused. A plugin that has a sidechain can have it
+**enabled** from its context menu (off by default — some plugins expose a
+sidechain they never use). Once enabled it becomes a **send destination**, shown
+(under a short `sc` label) on every strip like a bus send: each strip has a row
+with its own gain and pre/post tap (default pre-fader), and several strips can
+feed one sidechain at different levels. The sources are stored on the plugin
 (`PluginSlot.sidechain: Vec<SidechainSource>`, keyed by stable strip id, so they
 travel with the plugin), and summed into its first non-CV aux input instead of
 silence. The plugin's own strip row is shown but disabled (keeps strips
@@ -345,8 +367,8 @@ defaults; `--example run_plugin <uri>` runs one plugin offline.
 
 ### Plugin health
 
-The engine sweeps every hostable mono/stereo LV2 plugin (and every VST3 effect)
-in an isolated child process and records the verdict, rather than hiding
+The engine sweeps every hostable mono/stereo LV2 plugin (and every VST3/CLAP
+effect) in an isolated child process and records the verdict, rather than hiding
 suspected crashers behind a blacklist. `vibemix-engine --scan-plugins` loads the `lilv` world once, `fork()`s
 per plugin (the child is single-threaded, so this is safe), runs the same
 offline block test, and prints one JSON verdict per line (`ok` /
@@ -365,11 +387,14 @@ thin progress strip with a `testing plugins done/total` counter while it runs.
 
 Verdicts are cached in `$XDG_CONFIG_HOME/vibemix/plugin_health.json`, tagged with
 `HOST_ABI_VERSION` (`vibemix-lv2`); bump it when host behavior changes so fixed
-plugins are retried. The catalog carries `status` (`ok`/`failed`/`unsupported`)
-and a human `reason`; the picker paints failed/unsupported entries red (with the
-reason) and has a "hide failed" toggle. Entries stay clickable — the smoke guard
-still refuses anything that crashes. A plugin requiring a feature the host does
-not implement is listed as `unsupported` with that feature's name. The only
+plugins are retried. Because the sweep already instantiates each plugin, it also
+captures per-plugin metadata (channel counts, sidechain capability, whether a
+native editor exists) that is merged into the catalog. The catalog carries
+`status` (`ok`/`failed`/`unsupported`) and a human `reason`; the picker paints
+failed/unsupported entries red (with the reason) and has a "hide failed" toggle.
+Entries stay clickable — the smoke guard still refuses anything that crashes. A
+plugin requiring a feature the host does not implement is listed as `unsupported`
+with that feature's name. The only
 remaining blacklist is the optional operator escape hatch
 `VIBEMIX_LV2_BLACKLIST=uri1,uri2`.
 
@@ -445,6 +470,13 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/edit/state` | `int undo_depth, int redo_depth, string undo_label, string redo_label` (engine to GUI) |
 | `/vibemix/connections/missing` | `string json` (engine to GUI: saved connections that could not be restored) |
 | `/vibemix/meters` | `int strip_count, in_l…, in_r…, gain_l…, gain_r…, out_l…, out_r…, int bus_count, buses_l…, buses_r…` (linear peak levels, engine to GUI, ~50 Hz) |
+| `/vibemix/midi/key_bind` | `int kind, int location, int target, int slot, int param, string key` (bind a keyboard combo to a button) |
+| `/vibemix/midi/key_trigger` | `string key` (GUI to engine: a bound key/combo was pressed) |
+| `/vibemix/chunk` | `int transfer, int index, int total, blob data` (one part of an oversized message; see below) |
+
+Messages whose encoded form exceeds one UDP datagram (the plugin catalog with
+many plugins installed) are split into ordered `/vibemix/chunk` datagrams and
+reassembled by the receiver.
 
 Meters and state snapshots are sent to the last address that sent a control
 message. State snapshots also carry `window`, `sample_rate` and the `xruns`
@@ -495,8 +527,12 @@ post-fader, `2` bus insert — and `target` (the strip or bus id).
   cancel), plus three host-correctness fixes it surfaced (NULL
   `extension_data`, output-atom re-arm, worker joined before instance free);
   and mixer-UI polish (wider centred cards, reference mini-sliders for
-  trim/pan/send/return, entry-font fixes). Done. See "LV2 hosting" / "Plugin
+  trim/pan/send/return, entry-font fixes). Done. See "Plugin hosting" / "Plugin
   health".
+- **Phase 7** - VST3 and CLAP hosting behind a format-agnostic `PluginNode`
+  trait: discovery, DSP, parameter editing, native editors, sidechain routing,
+  session state and sandboxed loading, plus the plugin-browser filters and
+  keyboard button bindings. Done.
 - **Unscheduled** - a native PipeWire `pw_filter` backend (finalizing the
   `AudioBackend` trait). No arbitrary module graph / port matrix is planned; the
   strip/bus/preset mixer topology is the design.
@@ -528,7 +564,10 @@ CC; a matching `MidiOut` (feedback) is deferred.
   pan, mute, solo, bus fader (gain), bus mute, send gain/delay, and plugin
   parameters/bypass. Absolute and relative encoders are supported, matched CCs
   are consumed (others are forwarded to plugins), and bindings are learnable and
-  saved in the session.
+  saved in the session. Mixer buttons (strip/bus mute, solo, plugin bypass) can
+  also be bound to keyboard combos: the GUI captures the next key or combo and
+  sends `KeyBind`, and a later press sends `KeyTrigger`, which toggles the same
+  target on the control thread.
 - **UI:** the top status bar shows an always-on host-BPM readout (dimmed until
   the clock locks) and a colour-coded clock-stability readout (tempo jitter in
   ±BPM plus a count of glitchy pulses); both are toggled from a right-click
@@ -549,11 +588,11 @@ CC; a matching `MidiOut` (feedback) is deferred.
 - **Out of scope:** instruments and MIDI-only plugins (would drift toward a DAW
   / sequencer); clock generation; MIDI output/feedback (future).
 
-Designations: LV2 remains the primary format. VST3 hosting (Phase 7) is in
-progress behind a format-agnostic `PluginNode` trait: discovery, add, DSP,
-parameter editing, sandboxed loading and session state all work through the
-vendored SDK (MIT since 3.8). CLAP was considered and set aside (thin
-ecosystem); VST2 is not planned. See `docs/backlog.md`.
+Designations: LV2 remains the primary format. VST3 and CLAP hosting sit behind
+the same format-agnostic `PluginNode` trait: discovery, add, DSP, parameter
+editing, sandboxed loading, native editors, sidechain and session state work for
+all three, through the vendored VST3 SDK (MIT since 3.8) and the header-only CLAP
+headers (MIT). VST2 is not planned. See `docs/backlog.md`.
 
 ## Editing history and clipboard
 
