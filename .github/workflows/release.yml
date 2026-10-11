@@ -107,13 +107,24 @@ jobs:
             "https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/nfpm_${v}_Linux_x86_64.tar.gz"
           tar xzf nfpm.tar.gz nfpm
 
-          # Discover the distro's Qt6 library package names (Debian 12 ships
-          # libqt6core6; Debian 13 ships libqt6core6t64) and Qt series.
-          qt_pkg() { dpkg-query -W -f='${binary:Package}\n' "$1*" 2>/dev/null | head -1; }
-          export QT_CORE="$(qt_pkg libqt6core6)"
-          export QT_GUI="$(qt_pkg libqt6gui6)"
-          export QT_QML="$(qt_pkg libqt6qml6)"
-          export QT_QUICK="$(qt_pkg libqt6quick6)"
+          # Find the package that owns each Qt6 library, by file rather than by
+          # name (Debian 12 ships libqt6core6; Debian 13 ships libqt6core6t64).
+          qt_owner() {
+            local real out pkg
+            real="$(readlink -f "/usr/lib/x86_64-linux-gnu/$1")"
+            out="$(dpkg-query -S "$real" 2>/dev/null || true)"
+            pkg="$(printf '%s\n' "$out" | awk -F: 'NR==1 { print $1 }')"
+            if [ -z "$pkg" ]; then
+              echo "error: no installed package owns $1" >&2
+              exit 1
+            fi
+            echo "$pkg"
+          }
+          QT_CORE="$(qt_owner libQt6Core.so.6)"
+          QT_GUI="$(qt_owner libQt6Gui.so.6)"
+          QT_QML="$(qt_owner libQt6Qml.so.6)"
+          QT_QUICK="$(qt_owner libQt6Quick.so.6)"
+          export QT_CORE QT_GUI QT_QML QT_QUICK
           qtver="$(dpkg-query -W -f='${Version}' "$QT_CORE")"
           mm="$(echo "$qtver" | grep -oE '^[0-9]+\.[0-9]+')"
           major="${mm%%.*}"; minor="${mm##*.}"
@@ -121,7 +132,7 @@ jobs:
           export PKG_RELEASE="${{ matrix.release }}"
           export QT_MIN="$mm"
           export QT_MAX="${major}.$((minor + 1))"
-          echo "Qt ${QT_MIN} -> ${QT_MAX} (${QT_CORE}), release ${PKG_RELEASE}"
+          echo "Qt ${QT_MIN} -> ${QT_MAX}; core=$QT_CORE gui=$QT_GUI qml=$QT_QML quick=$QT_QUICK; release ${PKG_RELEASE}"
           ./nfpm package -f packaging/nfpm.yaml -p deb -t dist/
 
       - name: Verify .deb
