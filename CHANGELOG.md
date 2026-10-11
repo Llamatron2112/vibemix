@@ -4,6 +4,24 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.1] - 2026-10-11
+
+### Fixed
+
+- Release packages are now built and verified **per distro release**, against
+  that release's Qt: `.deb` for Debian 12 and 13, `.rpm` for Fedora 43 and 44.
+  The previous single build used Qt *private* API through the ahead-of-time QML
+  compiler (`qmlcachegen`), which Qt only keeps for the exact Qt minor it was
+  built against — so the Fedora 43 package failed to load on Fedora 44
+  (`Qt_6.10_PRIVATE_API` not found).
+- Package metadata pins the Qt series with both a floor and a ceiling, so the
+  package manager refuses to install a build alongside an incompatible Qt.
+
+### Removed
+
+- The standalone binary tarball: it was equally tied to a single Qt and added no
+  portability.
+
 ## [1.0.0] - 2026-10-11
 
 First release.
@@ -32,4 +50,5 @@ First release.
   (Fedora 43) and binary tarballs attached to each release with SHA-256
   checksums.
 
+[1.0.1]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.0

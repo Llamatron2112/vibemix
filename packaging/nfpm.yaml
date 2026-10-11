@@ -1,19 +1,21 @@
 # nfpm packaging for the release workflow (https://nfpm.goreleaser.com).
 #
-# Builds the .deb and .rpm from the release binaries. The version comes from the
-# VIBEMIX_VERSION environment variable (nfpm expands ${...} in this file):
+# The release workflow runs this once per distro release, in that distro's
+# container and against that distro's Qt:
 #   cargo build --release --locked --workspace
-#   VIBEMIX_VERSION=1.0.0 nfpm package -f packaging/nfpm.yaml -p deb -t dist/
-#   VIBEMIX_VERSION=1.0.0 nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
+#   nfpm package -f packaging/nfpm.yaml -p deb -t dist/
 #
-# The runtime dependency lists are per-distro on purpose: names differ between
-# Debian and Fedora, and nfpm does not derive them (no dpkg-shlibdeps). The
-# release workflow installs the built package in the matching container, which
-# is what validates these lists.
+# nfpm expands ${VAR} from the environment:
+#   VIBEMIX_VERSION  the version (from the git tag)
+#   PKG_RELEASE      the package release, distro-tagged (e.g. 1~deb12, 1.fc43)
+#   QT_MIN, QT_MAX   the Qt series to require, derived from the build container
+#   QT_CORE/QT_GUI/QT_QML/QT_QUICK  the distro's Qt6 library package names
+#                    (Debian 12: libqt6core6; Debian 13: libqt6core6t64)
 name: vibemix
 arch: amd64
 platform: linux
 version: ${VIBEMIX_VERSION}
+release: ${PKG_RELEASE}
 section: sound
 priority: optional
 maintainer: "Llamatron2112 <llamatron23@proton.me>"
@@ -45,6 +47,11 @@ contents:
   - src: LICENSE-APACHE
     dst: /usr/share/licenses/vibemix/LICENSE-APACHE
 
+# Why the Qt floor *and* ceiling: cxx-qt compiles the QML ahead-of-time with
+# qmlcachegen, whose output calls Qt *private* API. Qt tags those symbols with a
+# version node for the Qt it was built against and does not carry them across
+# minors, so the binary only runs against the same Qt minor it was built with.
+# Hence a per-distro-release build pinned to that distro's Qt.
 overrides:
   deb:
     depends:
@@ -55,10 +62,14 @@ overrides:
       - liblilv-0-0
       - libsuil-0-0
       - libjack-jackd2-0 | pipewire-jack
-      - libqt6core6
-      - libqt6gui6
-      - libqt6qml6
-      - libqt6quick6
+      - ${QT_CORE} (>= ${QT_MIN})
+      - ${QT_CORE} (<< ${QT_MAX})
+      - ${QT_GUI} (>= ${QT_MIN})
+      - ${QT_GUI} (<< ${QT_MAX})
+      - ${QT_QML} (>= ${QT_MIN})
+      - ${QT_QML} (<< ${QT_MAX})
+      - ${QT_QUICK} (>= ${QT_MIN})
+      - ${QT_QUICK} (<< ${QT_MAX})
       - qml6-module-qtquick-controls
       - qml6-module-qtquick-layouts
       - qml6-module-qtquick-dialogs
@@ -74,7 +85,9 @@ overrides:
       - lilv
       - suil
       - pipewire-jack-audio-connection-kit
-      - qt6-qtbase
-      - qt6-qtdeclarative
+      - qt6-qtbase >= ${QT_MIN}
+      - qt6-qtbase < ${QT_MAX}
+      - qt6-qtdeclarative >= ${QT_MIN}
+      - qt6-qtdeclarative < ${QT_MAX}
     recommends:
       - gtk3

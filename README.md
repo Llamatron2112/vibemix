@@ -111,9 +111,11 @@ engine for the session, then the GUI), a `.desktop` entry and an icon.
    git push origin vX.Y.Z
    ```
 
-6. The `Release` workflow gates on tests, builds and verifies the `.deb`
-   (Debian 12), `.rpm` (Fedora 43) and a binary tarball, then publishes them to
-   the GitHub Release with SHA-256 checksums.
+6. The `Release` workflow gates on tests, then builds and verifies one package
+   per distro release — `.deb` for Debian 12/13 and `.rpm` for Fedora 43/44 —
+   each against that release's Qt, and publishes them with SHA-256 checksums.
+   (The packages are tied to the exact Qt minor, so each distro release gets its
+   own build.)
 
 ## License
 

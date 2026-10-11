@@ -47,11 +47,22 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-  # Oldest supported Debian: .deb + the raw binary tarball.
-  linux:
+  # One .deb per Debian release, built against that release's Qt (see the note
+  # on the Qt version lock in packaging/nfpm.yaml).
+  deb:
     needs: check
     runs-on: ubuntu-24.04
-    container: debian:12
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - container: debian:12
+            suffix: deb12
+            release: 1~deb12
+          - container: debian:13
+            suffix: deb13
+            release: 1~deb13
+    container: ${{ matrix.container }}
     defaults:
       run:
         shell: bash
@@ -87,7 +98,7 @@ jobs:
       - name: Build
         run: cargo build --release --locked --workspace
 
-      - name: Package (.deb + tarball)
+      - name: Package (.deb)
         run: |
           set -euo pipefail
           mkdir -p dist
@@ -96,15 +107,22 @@ jobs:
             "https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/nfpm_${v}_Linux_x86_64.tar.gz"
           tar xzf nfpm.tar.gz nfpm
 
+          # Discover the distro's Qt6 library package names (Debian 12 ships
+          # libqt6core6; Debian 13 ships libqt6core6t64) and Qt series.
+          qt_pkg() { dpkg-query -W -f='${binary:Package}\n' "$1*" 2>/dev/null | head -1; }
+          export QT_CORE="$(qt_pkg libqt6core6)"
+          export QT_GUI="$(qt_pkg libqt6gui6)"
+          export QT_QML="$(qt_pkg libqt6qml6)"
+          export QT_QUICK="$(qt_pkg libqt6quick6)"
+          qtver="$(dpkg-query -W -f='${Version}' "$QT_CORE")"
+          mm="$(echo "$qtver" | grep -oE '^[0-9]+\.[0-9]+')"
+          major="${mm%%.*}"; minor="${mm##*.}"
           export VIBEMIX_VERSION="${GITHUB_REF_NAME#v}"
+          export PKG_RELEASE="${{ matrix.release }}"
+          export QT_MIN="$mm"
+          export QT_MAX="${major}.$((minor + 1))"
+          echo "Qt ${QT_MIN} -> ${QT_MAX} (${QT_CORE}), release ${PKG_RELEASE}"
           ./nfpm package -f packaging/nfpm.yaml -p deb -t dist/
-
-          stage="vibemix-${VIBEMIX_VERSION}"
-          rm -rf "$stage" && mkdir "$stage"
-          cp target/release/vibemix-engine target/release/vibemix-gui "$stage/"
-          cp packaging/vibemix packaging/vibemix.desktop packaging/vibemix.svg "$stage/"
-          cp LICENSE-MIT LICENSE-APACHE README.md "$stage/"
-          tar -czf "dist/${stage}-x86_64-linux-gnu.tar.gz" "$stage"
 
       - name: Verify .deb
         run: |
@@ -119,15 +137,25 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: linux
+          name: deb-${{ matrix.suffix }}
           path: dist/*
           if-no-files-found: error
 
-  # Oldest supported Fedora: .rpm.
+  # One .rpm per Fedora release, built against that release's Qt.
   rpm:
     needs: check
     runs-on: ubuntu-24.04
-    container: fedora:43
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - container: fedora:43
+            suffix: fc43
+            release: 1.fc43
+          - container: fedora:44
+            suffix: fc44
+            release: 1.fc44
+    container: ${{ matrix.container }}
     defaults:
       run:
         shell: bash
@@ -171,7 +199,13 @@ jobs:
           curl -sSL -o nfpm.tar.gz \
             "https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/nfpm_${v}_Linux_x86_64.tar.gz"
           tar xzf nfpm.tar.gz nfpm
+          mm="$(rpm -q --qf '%{VERSION}' qt6-qtbase | grep -oE '^[0-9]+\.[0-9]+')"
+          major="${mm%%.*}"; minor="${mm##*.}"
           export VIBEMIX_VERSION="${GITHUB_REF_NAME#v}"
+          export PKG_RELEASE="${{ matrix.release }}"
+          export QT_MIN="$mm"
+          export QT_MAX="${major}.$((minor + 1))"
+          echo "Qt ${QT_MIN} -> ${QT_MAX}, release ${PKG_RELEASE}"
           ./nfpm package -f packaging/nfpm.yaml -p rpm -t dist/
 
       - name: Verify .rpm
@@ -187,12 +221,12 @@ jobs:
 
       - uses: actions/upload-artifact@v7
         with:
-          name: rpm
+          name: rpm-${{ matrix.suffix }}
           path: dist/*
           if-no-files-found: error
 
   release:
-    needs: [linux, rpm]
+    needs: [deb, rpm]
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v7
@@ -206,7 +240,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum *.deb *.rpm *.tar.gz > sha256sums.txt
+          sha256sum *.deb *.rpm > sha256sums.txt
           cat sha256sums.txt
 
       - name: Release notes
@@ -227,5 +261,4 @@ jobs:
           files: |
             dist/*.deb
             dist/*.rpm
-            dist/*.tar.gz
             dist/sha256sums.txt
