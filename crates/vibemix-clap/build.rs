@@ -18,7 +18,13 @@ fn main() {
         .std("c++17")
         .include(&include)
         .warnings(false)
-        .flag("-fPIC");
+        .flag("-fPIC")
+        // Advertise the host version to plugins (clap_host.version) from the
+        // crate version, so it can never drift from the release.
+        .define(
+            "VIBEMIX_HOST_VERSION",
+            Some(format!("\"{}\"", env!("CARGO_PKG_VERSION")).as_str()),
+        );
     build.file(manifest.join("src/shim.cpp"));
     build.compile("vibemix_clap_shim");
 
@@ -30,4 +36,5 @@ fn main() {
     println!("cargo:rustc-link-lib=dylib=X11");
 
     println!("cargo:rerun-if-changed=src/shim.cpp");
+    println!("cargo:rerun-if-env-changed=CARGO_PKG_VERSION");
 }

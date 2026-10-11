@@ -32,7 +32,9 @@
 #define VIBEMIX_HOST_NAME "vibemix"
 #define VIBEMIX_HOST_VENDOR "vibemix"
 #define VIBEMIX_HOST_URL "https://github.com/vibemix"
-#define VIBEMIX_HOST_VERSION "0.1.0"
+#ifndef VIBEMIX_HOST_VERSION
+#define VIBEMIX_HOST_VERSION "unknown"
+#endif
 
 // WM_CLASS shared with the LV2 host so the desktop groups plugin windows.
 #define VIBEMIX_WM_CLASS "vibemix-gui"
