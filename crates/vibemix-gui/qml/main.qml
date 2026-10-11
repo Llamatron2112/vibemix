@@ -814,6 +814,11 @@ ApplicationWindow {
                 checked: root.transportUi().autosize
                 onTriggered: root.setTransportUi({ autosize: !root.transportUi().autosize })
             }
+            MenuSeparator { }
+            MenuItem {
+                text: "About vibemix…"
+                onTriggered: aboutWindow.show()
+            }
         }
 
         background: Rectangle {
@@ -3593,6 +3598,88 @@ ApplicationWindow {
                         text: "ok"
                         onClicked: midiBindingsWindow.commitEditBinding()
                     }
+                }
+            }
+        }
+    }
+
+    Window {
+        id: aboutWindow
+        title: "About vibemix"
+        modality: Qt.ApplicationModal
+        flags: Qt.Dialog
+        transientParent: root
+        visible: false
+        width: 420
+        height: 330
+        color: palette.window
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 12
+            spacing: 8
+
+            Label {
+                text: "vibemix " + Qt.application.version
+                color: root.textColor
+                font.pixelSize: 16
+                font.bold: true
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "A modular LV2/VST3/CLAP audio mixer for JACK/PipeWire."
+                color: root.textColor
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "A vibe-coding experiment: built by an AI assistant with human direction — expect rough edges."
+                color: root.mutedText
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "License: MIT OR Apache-2.0"
+                color: root.textColor
+                font.pixelSize: 11
+            }
+
+            Label {
+                Layout.fillWidth: true
+                textFormat: Text.RichText
+                text: "<a href=\"https://github.com/Llamatron2112/vibemix\">https://github.com/Llamatron2112/vibemix</a>"
+                onLinkActivated: (link) => Qt.openUrlExternally(link)
+                font.pixelSize: 11
+                wrapMode: Text.WordWrap
+            }
+
+            Label {
+                text: "Built with"
+                color: root.mutedText
+                font.pixelSize: 10
+                font.bold: true
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "Qt 6 / Qt Quick (and cxx-qt)\nLV2 (lilv)\nSteinberg VST3 SDK\nCLAP\nJACK / PipeWire"
+                color: root.textColor
+                font.pixelSize: 11
+            }
+
+            Item { Layout.fillHeight: true }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                FlatButton {
+                    text: "close"
+                    onClicked: aboutWindow.close()
                 }
             }
         }

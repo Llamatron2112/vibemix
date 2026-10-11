@@ -45,6 +45,16 @@ fn main() {
     // whose Icon= resolves to the installed hicolor SVG.
     QGuiApplication::set_desktop_file_name(&QString::from("vibemix"));
 
+    // Application metadata, surfaced to QML as `Qt.application.*` (the About
+    // dialog shows the version).
+    if let Some(mut app) = app.as_mut() {
+        app.as_mut().set_application_name(&QString::from("vibemix"));
+        app.as_mut()
+            .set_application_display_name(&QString::from("vibemix"));
+        app.as_mut()
+            .set_application_version(&QString::from(env!("CARGO_PKG_VERSION")));
+    }
+
     let mut engine = QQmlApplicationEngine::new();
 
     if let Some(engine) = engine.as_mut() {
