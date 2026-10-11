@@ -910,13 +910,6 @@ ApplicationWindow {
                     }
 
                     Label {
-                        text: backend.action
-                        visible: backend.action.length > 0
-                        color: root.mutedText
-                        font.pixelSize: 11
-                    }
-
-                    Label {
                         text: backend.xruns + " xruns"
                         visible: backend.xruns > 0
                         color: "#e53935"

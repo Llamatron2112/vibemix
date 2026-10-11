@@ -14,7 +14,6 @@ use vibemix_proto::{message::ChunkAssembler, ControlMessage};
 static SOCKET: OnceLock<UdpSocket> = OnceLock::new();
 static ENGINE_ADDR: OnceLock<SocketAddr> = OnceLock::new();
 static VIEW: OnceLock<Mutex<View>> = OnceLock::new();
-static ACTION: Mutex<String> = Mutex::new(String::new());
 static PENDING_REPORT: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_SESSION: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
 static SESSION_PATH: Mutex<String> = Mutex::new(String::new());
@@ -111,16 +110,7 @@ fn view() -> &'static Mutex<View> {
 }
 
 fn note_action(action: &str) {
-    if let Ok(mut guard) = ACTION.lock() {
-        *guard = action.to_string();
-    }
-}
-
-fn last_action() -> String {
-    ACTION
-        .lock()
-        .map(|guard| guard.clone())
-        .unwrap_or_default()
+    tracing::debug!(action, "action");
 }
 
 const MAX_RECENT: usize = 10;
@@ -706,7 +696,6 @@ pub mod qobject {
         #[qproperty(QString, values)]
         #[qproperty(QString, meters)]
         #[qproperty(QString, catalog)]
-        #[qproperty(QString, action)]
         #[qproperty(QString, report)]
         #[qproperty(bool, dirty)]
         #[qproperty(QString, session_result)]
@@ -980,7 +969,6 @@ pub struct BackendRust {
     values: QString,
     meters: QString,
     catalog: QString,
-    action: QString,
     report: QString,
     dirty: bool,
     session_result: QString,
@@ -1012,7 +1000,6 @@ impl Default for BackendRust {
             values: QString::from("{\"strips\":{},\"buses\":{},\"params\":{}}"),
             meters: QString::from("{\"strips\":{},\"buses\":{}}"),
             catalog: QString::from("[]"),
-            action: QString::from(""),
             report: QString::from(""),
             dirty: false,
             session_result: QString::from(""),
@@ -1074,8 +1061,6 @@ impl qobject::Backend {
                 .set_meters(QString::from(build_meters_json().as_str()));
         }
         self.as_mut().set_connected(is_connected());
-        self.as_mut()
-            .set_action(QString::from(last_action().as_str()));
 
         if let Some(report) = PENDING_REPORT.lock().ok().and_then(|mut guard| guard.take()) {
             self.as_mut()
