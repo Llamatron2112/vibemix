@@ -204,6 +204,27 @@ ApplicationWindow {
         return sink && Array.isArray(sink.connections)
             && sink.connections.indexOf(sourceName) >= 0
     }
+    /// Current level (0..1 linear peak) of a vibemix port, from the existing
+    /// strip/bus meter taps. External ports have no tap and report 0.
+    function portLevel(port) {
+        if (!port || !port.role) return 0
+        var channel = port.role.channel === "r" ? 1 : 0
+        if (port.role.kind === "strip_in") return root.stripLevel(port.role.id, "in", channel)
+        if (port.role.kind === "bus_out") return root.busLevel(port.role.id, "out", channel)
+        if (port.role.kind === "bus_ret") return root.busLevel(port.role.id, "ret", channel)
+        return 0
+    }
+    function levelFraction(level) {
+        if (level <= 0.00001) return 0
+        var db = 20 * Math.log(level) / Math.LN10
+        return Math.max(0, Math.min(1, (db + 60) / 60))
+    }
+    function levelColor(level) {
+        var f = root.levelFraction(level)
+        if (f <= 0) return "transparent"
+        if (f < 0.7) return Qt.rgba(f / 0.7, 1, 0, 1)
+        return Qt.rgba(1, 1 - (f - 0.7) / 0.3, 0, 1)
+    }
     function portShortLabel(port) {
         if (!port || !port.role) return port ? port.short : ""
         if (port.role.kind === "midi_in") return "MIDI in"
@@ -3920,6 +3941,8 @@ ApplicationWindow {
         property bool linkPairs: true
         property bool monoToBoth: false
         property bool onlyConnected: false
+        property string hoverSource: ""
+        property string hoverSink: ""
         readonly property var sources: root.patchSources(sourceClient)
         readonly property var sinks: root.patchSinks(sinkClient)
         readonly property int labelWidth: 190
@@ -4018,12 +4041,38 @@ ApplicationWindow {
                                 Label {
                                     width: parent.height - 8
                                     text: root.portShortLabel(modelData)
-                                    color: root.mutedText
+                                    color: patchWindow.hoverSink === modelData.name
+                                        ? root.accentColor : root.mutedText
                                     font.pixelSize: 8
+                                    font.bold: patchWindow.hoverSink === modelData.name
                                     elide: Text.ElideRight
                                     horizontalAlignment: Text.AlignRight
                                     rotation: -90
                                     anchors.centerIn: parent
+                                }
+                            }
+                        }
+                    }
+
+                    Row {
+                        spacing: 2
+                        Item { width: patchWindow.labelWidth; height: 14 }
+                        Repeater {
+                            model: patchWindow.sinks
+                            Item {
+                                width: patchWindow.cellSize
+                                height: 14
+                                Rectangle {
+                                    visible: modelData.role !== undefined && modelData.role !== null
+                                    width: 10
+                                    height: 10
+                                    anchors.centerIn: parent
+                                    property real level: root.portLevel(modelData)
+                                    property real frac: root.levelFraction(level)
+                                    color: frac > 0.01 ? root.levelColor(level) : root.controlColor
+                                    border.color: root.borderColor
+                                    border.width: 1
+                                    opacity: 0.35 + 0.65 * frac
                                 }
                             }
                         }
@@ -4035,14 +4084,34 @@ ApplicationWindow {
                             id: sourceRow
                             spacing: 2
                             property var sourceData: patchWindow.sources[index]
-                            Label {
+                            Row {
                                 width: patchWindow.labelWidth
                                 height: patchWindow.cellSize
-                                text: root.portShortLabel(sourceRow.sourceData)
-                                color: root.textColor
-                                font.pixelSize: 10
-                                verticalAlignment: Text.AlignVCenter
-                                elide: Text.ElideRight
+                                spacing: 4
+                                Label {
+                                    width: parent.width - 14
+                                    height: parent.height
+                                    text: root.portShortLabel(sourceRow.sourceData)
+                                    color: patchWindow.hoverSource === sourceRow.sourceData.name
+                                        ? root.accentColor : root.textColor
+                                    font.pixelSize: 10
+                                    font.bold: patchWindow.hoverSource === sourceRow.sourceData.name
+                                    verticalAlignment: Text.AlignVCenter
+                                    elide: Text.ElideRight
+                                }
+                                Rectangle {
+                                    visible: sourceRow.sourceData.role !== undefined
+                                        && sourceRow.sourceData.role !== null
+                                    width: 10
+                                    height: 10
+                                    anchors.verticalCenter: parent.verticalCenter
+                                    property real level: root.portLevel(sourceRow.sourceData)
+                                    property real frac: root.levelFraction(level)
+                                    color: frac > 0.01 ? root.levelColor(level) : root.controlColor
+                                    border.color: root.borderColor
+                                    border.width: 1
+                                    opacity: 0.35 + 0.65 * frac
+                                }
                             }
                             Repeater {
                                 model: patchWindow.sinks
@@ -4051,17 +4120,39 @@ ApplicationWindow {
                                     property var sinkData: patchWindow.sinks[index]
                                     property bool canConnect: root.patchCanConnect(sourceRow.sourceData, cell.sinkData)
                                     property bool isOn: root.portConnected(sourceRow.sourceData.name, cell.sinkData)
+                                    property bool hovered: patchWindow.hoverSource === sourceRow.sourceData.name
+                                        || patchWindow.hoverSink === cell.sinkData.name
                                     width: patchWindow.cellSize
                                     height: patchWindow.cellSize
                                     color: cell.isOn ? root.accentColor : "transparent"
-                                    border.color: root.borderColor
+                                    border.color: cell.hovered ? root.accentColor : root.borderColor
                                     border.width: 1
                                     opacity: cell.canConnect ? 1.0 : 0.2
                                     MouseArea {
                                         anchors.fill: parent
-                                        enabled: cell.canConnect
-                                        onClicked: root.togglePortCell(
-                                            sourceRow.sourceData, cell.sinkData, !cell.isOn)
+                                        hoverEnabled: true
+                                        onClicked: {
+                                            if (cell.canConnect) {
+                                                root.togglePortCell(
+                                                    sourceRow.sourceData, cell.sinkData, !cell.isOn)
+                                            }
+                                        }
+                                        onEntered: {
+                                            patchWindow.hoverSource = sourceRow.sourceData.name
+                                            patchWindow.hoverSink = cell.sinkData.name
+                                        }
+                                        onExited: {
+                                            if (patchWindow.hoverSource === sourceRow.sourceData.name
+                                                && patchWindow.hoverSink === cell.sinkData.name) {
+                                                patchWindow.hoverSource = ""
+                                                patchWindow.hoverSink = ""
+                                            }
+                                        }
+                                        ToolTip.visible: containsMouse
+                                        ToolTip.delay: 400
+                                        ToolTip.text: root.portShortLabel(sourceRow.sourceData)
+                                            + " → " + root.portShortLabel(cell.sinkData)
+                                            + (cell.isOn ? "  (connected)" : "")
                                     }
                                 }
                             }
