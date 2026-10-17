@@ -172,14 +172,22 @@ ApplicationWindow {
                 clients.push(client)
             }
         }
+        var engine = root.vibemixClient()
         clients.sort(function(a, b) {
-            if (a === "vibemix") return -1
-            if (b === "vibemix") return 1
+            if (a === engine) return -1
+            if (b === engine) return 1
             if (a === "system") return -1
             if (b === "system") return 1
             return a.localeCompare(b)
         })
         return clients
+    }
+    function vibemixClient() {
+        var ports = root.portList()
+        for (var i = 0; i < ports.length; i++) {
+            if (ports[i].role) return ports[i].client
+        }
+        return ""
     }
     function portsFor(client, wantOutput, type) {
         var ports = root.portList()
@@ -293,12 +301,28 @@ ApplicationWindow {
     function ensurePatchClients() {
         var clients = root.portClients()
         if (clients.length === 0) return
+        var engine = root.vibemixClient()
         if (clients.indexOf(patchWindow.sourceClient) < 0) {
-            patchWindow.sourceClient = clients.indexOf("system") >= 0 ? "system" : clients[0]
+            // Prefer the device/app with the most audio outputs (the hardware
+            // client on PipeWire; there is no "system" client there).
+            var best = ""
+            var bestCount = 0
+            var engineCount = 0
+            for (var i = 0; i < clients.length; i++) {
+                var client = clients[i]
+                var count = root.portsFor(client, true, "audio").length
+                if (client === engine) {
+                    engineCount = count
+                } else if (count > bestCount) {
+                    bestCount = count
+                    best = client
+                }
+            }
+            patchWindow.sourceClient = best !== ""
+                ? best : (engine !== "" ? engine : clients[0])
         }
         if (clients.indexOf(patchWindow.sinkClient) < 0) {
-            patchWindow.sinkClient = clients.indexOf("vibemix") >= 0
-                ? "vibemix" : clients[clients.length - 1]
+            patchWindow.sinkClient = engine !== "" ? engine : clients[clients.length - 1]
         }
     }
     function midiInputPort() {
@@ -3891,8 +3915,8 @@ ApplicationWindow {
         height: 620
         color: palette.window
 
-        property string sourceClient: "system"
-        property string sinkClient: "vibemix"
+        property string sourceClient: ""
+        property string sinkClient: ""
         property bool linkPairs: true
         property bool monoToBoth: false
         property bool onlyConnected: false
@@ -3963,7 +3987,8 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 text: backend.connection_error.length > 0
                     ? backend.connection_error
-                    : "Rows are sources (outputs), columns are sinks (inputs). Only connections involving vibemix ports can be edited."
+                    : root.portList().length + " ports from " + root.portClients().length
+                      + " devices. Rows are sources (outputs), columns are sinks (inputs); only vibemix connections are editable."
                 color: backend.connection_error.length > 0 ? "#e53935" : root.mutedText
                 font.pixelSize: 10
                 elide: Text.ElideRight
@@ -4009,7 +4034,7 @@ ApplicationWindow {
                         Row {
                             id: sourceRow
                             spacing: 2
-                            property var sourceData: modelData
+                            property var sourceData: patchWindow.sources[index]
                             Label {
                                 width: patchWindow.labelWidth
                                 height: patchWindow.cellSize
@@ -4023,7 +4048,7 @@ ApplicationWindow {
                                 model: patchWindow.sinks
                                 Rectangle {
                                     id: cell
-                                    property var sinkData: modelData
+                                    property var sinkData: patchWindow.sinks[index]
                                     property bool canConnect: root.patchCanConnect(sourceRow.sourceData, cell.sinkData)
                                     property bool isOn: root.portConnected(sourceRow.sourceData.name, cell.sinkData)
                                     width: patchWindow.cellSize
