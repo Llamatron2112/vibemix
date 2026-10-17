@@ -65,6 +65,11 @@ pub const PLUGIN_MIDI_CHANNEL: &str = "/vibemix/plugin/midi_channel";
 pub const MIDI_BIND: &str = "/vibemix/midi/bind";
 pub const MIDI_UNBIND: &str = "/vibemix/midi/unbind";
 pub const CONNECTIONS_MISSING: &str = "/vibemix/connections/missing";
+pub const PORTS_QUERY: &str = "/vibemix/ports/query";
+pub const PORTS: &str = "/vibemix/ports";
+pub const CONNECT: &str = "/vibemix/connect";
+pub const DISCONNECT: &str = "/vibemix/disconnect";
+pub const CONNECT_RESULT: &str = "/vibemix/connect/result";
 pub const METERS: &str = "/vibemix/meters";
 /// One part of a message too large for a single UDP datagram (see
 /// [`crate::message::ChunkAssembler`]).

@@ -24,6 +24,11 @@ ApplicationWindow {
         id: backend
     }
 
+    Connections {
+        target: backend
+        function onPortsChanged() { root.ensurePatchClients() }
+    }
+
     // Auto-fit (Options menu): while enabled, drive the window size from the
     // mixer content, clamped to the screen's available area. Inactive otherwise
     // so the window stays freely resizable, and while maximized.
@@ -143,6 +148,187 @@ ApplicationWindow {
         var copy = Object.assign({}, busMeterSource)
         copy[id] = next
         busMeterSource = copy
+    }
+
+    // --- Patchbay -----------------------------------------------------------
+    function parsePorts(text) {
+        try {
+            var parsed = JSON.parse(text)
+            return Array.isArray(parsed) ? parsed : []
+        } catch (error) {
+            return []
+        }
+    }
+    readonly property var portCache: root.parsePorts(backend.ports)
+    function portList() { return root.portCache }
+    function portClients() {
+        var ports = root.portList()
+        var seen = ({})
+        var clients = []
+        for (var i = 0; i < ports.length; i++) {
+            var client = ports[i].client
+            if (!seen[client]) {
+                seen[client] = true
+                clients.push(client)
+            }
+        }
+        clients.sort(function(a, b) {
+            if (a === "vibemix") return -1
+            if (b === "vibemix") return 1
+            if (a === "system") return -1
+            if (b === "system") return 1
+            return a.localeCompare(b)
+        })
+        return clients
+    }
+    function portsFor(client, wantOutput, type) {
+        var ports = root.portList()
+        var out = []
+        for (var i = 0; i < ports.length; i++) {
+            var port = ports[i]
+            if (port.client !== client || port.type !== type) continue
+            if (wantOutput ? port.output !== true : port.input !== true) continue
+            out.push(port)
+        }
+        return out
+    }
+    function portConnected(sourceName, sink) {
+        return sink && Array.isArray(sink.connections)
+            && sink.connections.indexOf(sourceName) >= 0
+    }
+    function portShortLabel(port) {
+        if (!port || !port.role) return port ? port.short : ""
+        if (port.role.kind === "midi_in") return "MIDI in"
+        var channel = port.role.channel === "l" ? " L" : (port.role.channel === "r" ? " R" : "")
+        var kind = port.role.kind === "strip_in" ? "in"
+            : (port.role.kind === "bus_out" ? "out" : "ret")
+        return port.role.label + " " + kind + channel
+    }
+    function vibemixSibling(port) {
+        if (!port || !port.role) return null
+        if (port.role.channel !== "l" && port.role.channel !== "r") return null
+        var other = port.role.channel === "l" ? "r" : "l"
+        var ports = root.portList()
+        for (var i = 0; i < ports.length; i++) {
+            var candidate = ports[i]
+            if (candidate.role
+                && candidate.role.kind === port.role.kind
+                && candidate.role.id === port.role.id
+                && candidate.role.channel === other) {
+                return candidate
+            }
+        }
+        return null
+    }
+    function pairedSource(port) {
+        var pairs = [
+            ["_1", "_2"], ["_2", "_1"],
+            ["_l", "_r"], ["_r", "_l"],
+            ["_L", "_R"], ["_R", "_L"],
+            ["left", "right"], ["right", "left"],
+            ["out1", "out2"], ["out2", "out1"]
+        ]
+        var name = port.short
+        var ports = root.portList()
+        for (var i = 0; i < pairs.length; i++) {
+            var from = pairs[i][0]
+            var to = pairs[i][1]
+            if (name.length >= from.length && name.slice(-from.length) === from) {
+                var target = name.slice(0, name.length - from.length) + to
+                for (var j = 0; j < ports.length; j++) {
+                    var candidate = ports[j]
+                    if (candidate.client === port.client
+                        && candidate.short === target
+                        && candidate.output === port.output
+                        && candidate.input === port.input) {
+                        return candidate
+                    }
+                }
+            }
+        }
+        return null
+    }
+    function patchCanConnect(source, sink) {
+        return (source.role !== undefined && source.role !== null)
+            || (sink.role !== undefined && sink.role !== null)
+    }
+    function patchSources(client) {
+        var sources = root.portsFor(client, true, "audio")
+        if (!patchWindow.onlyConnected) return sources
+        var sinks = root.portsFor(patchWindow.sinkClient, false, "audio")
+        return sources.filter(function(source) {
+            for (var i = 0; i < sinks.length; i++) {
+                if (root.portConnected(source.name, sinks[i])) return true
+            }
+            return false
+        })
+    }
+    function patchSinks(client) {
+        var sinks = root.portsFor(client, false, "audio")
+        if (!patchWindow.onlyConnected) return sinks
+        var sources = root.portsFor(patchWindow.sourceClient, true, "audio")
+        return sinks.filter(function(sink) {
+            for (var i = 0; i < sources.length; i++) {
+                if (root.portConnected(sources[i].name, sink)) return true
+            }
+            return false
+        })
+    }
+    function setPortConnection(source, sink, connect) {
+        if (!source || !sink) return
+        if (connect) backend.connectPorts(source.name, sink.name)
+        else backend.disconnectPorts(source.name, sink.name)
+    }
+    function togglePortCell(source, sink, connect) {
+        root.setPortConnection(source, sink, connect)
+        var sinkPair = root.vibemixSibling(sink)
+        var sourcePair = root.pairedSource(source)
+        if (patchWindow.linkPairs && sinkPair && sourcePair) {
+            root.setPortConnection(sourcePair, sinkPair, connect)
+        } else if (patchWindow.monoToBoth && sinkPair && !sourcePair) {
+            root.setPortConnection(source, sinkPair, connect)
+        }
+        patchRefreshTimer.restart()
+    }
+    function ensurePatchClients() {
+        var clients = root.portClients()
+        if (clients.length === 0) return
+        if (clients.indexOf(patchWindow.sourceClient) < 0) {
+            patchWindow.sourceClient = clients.indexOf("system") >= 0 ? "system" : clients[0]
+        }
+        if (clients.indexOf(patchWindow.sinkClient) < 0) {
+            patchWindow.sinkClient = clients.indexOf("vibemix") >= 0
+                ? "vibemix" : clients[clients.length - 1]
+        }
+    }
+    function midiInputPort() {
+        var ports = root.portList()
+        for (var i = 0; i < ports.length; i++) {
+            if (ports[i].role && ports[i].role.kind === "midi_in") return ports[i]
+        }
+        return null
+    }
+    function midiSources() {
+        var ports = root.portList()
+        var out = []
+        for (var i = 0; i < ports.length; i++) {
+            if (ports[i].type === "midi" && ports[i].output === true) out.push(ports[i])
+        }
+        out.sort(function(a, b) {
+            if (a.client !== b.client) return a.client.localeCompare(b.client)
+            return a.short.localeCompare(b.short)
+        })
+        return out
+    }
+    function midiConnected(port) {
+        var input = root.midiInputPort()
+        return input ? root.portConnected(port.name, input) : false
+    }
+    function toggleMidiSource(port, connect) {
+        var input = root.midiInputPort()
+        if (!input) return
+        root.setPortConnection(port, input, connect)
+        midiRefreshTimer.restart()
     }
     function gainText(gain) {
         if (gain <= 1.0e-4) return "-inf dB"
@@ -813,6 +999,15 @@ ApplicationWindow {
                 checkable: true
                 checked: root.transportUi().autosize
                 onTriggered: root.setTransportUi({ autosize: !root.transportUi().autosize })
+            }
+            MenuSeparator { }
+            MenuItem {
+                text: "Patchbay…"
+                onTriggered: patchWindow.show()
+            }
+            MenuItem {
+                text: "MIDI input…"
+                onTriggered: midiWindow.show()
             }
             MenuSeparator { }
             MenuItem {
@@ -3682,6 +3877,281 @@ ApplicationWindow {
                     onClicked: aboutWindow.close()
                 }
             }
+        }
+    }
+
+    Window {
+        id: patchWindow
+        title: "Patchbay"
+        modality: Qt.ApplicationModal
+        flags: Qt.Dialog
+        transientParent: root
+        visible: false
+        width: 940
+        height: 620
+        color: palette.window
+
+        property string sourceClient: "system"
+        property string sinkClient: "vibemix"
+        property bool linkPairs: true
+        property bool monoToBoth: false
+        property bool onlyConnected: false
+        readonly property var sources: root.patchSources(sourceClient)
+        readonly property var sinks: root.patchSinks(sinkClient)
+        readonly property int labelWidth: 190
+        readonly property int cellSize: 22
+        readonly property int headerHeight: 86
+
+        function refreshClients() {
+            root.ensurePatchClients()
+            backend.queryPorts()
+        }
+
+        onVisibleChanged: if (visible) refreshClients()
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Label { text: "Source device"; color: root.mutedText; font.pixelSize: 11 }
+                ComboBox {
+                    Layout.preferredWidth: 150
+                    font.pixelSize: 11
+                    model: root.portClients()
+                    currentIndex: Math.max(0, root.portClients().indexOf(patchWindow.sourceClient))
+                    onActivated: (index) => patchWindow.sourceClient = root.portClients()[index]
+                }
+                Label { text: "Sink device"; color: root.mutedText; font.pixelSize: 11 }
+                ComboBox {
+                    Layout.preferredWidth: 150
+                    font.pixelSize: 11
+                    model: root.portClients()
+                    currentIndex: Math.max(0, root.portClients().indexOf(patchWindow.sinkClient))
+                    onActivated: (index) => patchWindow.sinkClient = root.portClients()[index]
+                }
+                Item { Layout.fillWidth: true }
+                FilterCheck {
+                    text: "Link L/R"
+                    checked: patchWindow.linkPairs
+                    onToggled: patchWindow.linkPairs = checked
+                }
+                FilterCheck {
+                    text: "Mono → L+R"
+                    checked: patchWindow.monoToBoth
+                    onToggled: patchWindow.monoToBoth = checked
+                }
+                FilterCheck {
+                    text: "Only connected"
+                    checked: patchWindow.onlyConnected
+                    onToggled: patchWindow.onlyConnected = checked
+                }
+                FlatButton {
+                    text: "refresh"
+                    onClicked: backend.queryPorts()
+                }
+                FlatButton {
+                    text: "close"
+                    onClicked: patchWindow.close()
+                }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: backend.connection_error.length > 0
+                    ? backend.connection_error
+                    : "Rows are sources (outputs), columns are sinks (inputs). Only connections involving vibemix ports can be edited."
+                color: backend.connection_error.length > 0 ? "#e53935" : root.mutedText
+                font.pixelSize: 10
+                elide: Text.ElideRight
+            }
+
+            Flickable {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                contentWidth: matrix.implicitWidth
+                contentHeight: matrix.implicitHeight
+                ScrollBar.vertical: ScrollBar { }
+                ScrollBar.horizontal: ScrollBar { }
+
+                Column {
+                    id: matrix
+                    spacing: 2
+
+                    Row {
+                        spacing: 2
+                        Item { width: patchWindow.labelWidth; height: patchWindow.headerHeight }
+                        Repeater {
+                            model: patchWindow.sinks
+                            Item {
+                                width: patchWindow.cellSize
+                                height: patchWindow.headerHeight
+                                Label {
+                                    width: parent.height - 8
+                                    text: root.portShortLabel(modelData)
+                                    color: root.mutedText
+                                    font.pixelSize: 8
+                                    elide: Text.ElideRight
+                                    horizontalAlignment: Text.AlignRight
+                                    rotation: -90
+                                    anchors.centerIn: parent
+                                }
+                            }
+                        }
+                    }
+
+                    Repeater {
+                        model: patchWindow.sources
+                        Row {
+                            id: sourceRow
+                            spacing: 2
+                            property var sourceData: modelData
+                            Label {
+                                width: patchWindow.labelWidth
+                                height: patchWindow.cellSize
+                                text: root.portShortLabel(sourceRow.sourceData)
+                                color: root.textColor
+                                font.pixelSize: 10
+                                verticalAlignment: Text.AlignVCenter
+                                elide: Text.ElideRight
+                            }
+                            Repeater {
+                                model: patchWindow.sinks
+                                Rectangle {
+                                    id: cell
+                                    property var sinkData: modelData
+                                    property bool canConnect: root.patchCanConnect(sourceRow.sourceData, cell.sinkData)
+                                    property bool isOn: root.portConnected(sourceRow.sourceData.name, cell.sinkData)
+                                    width: patchWindow.cellSize
+                                    height: patchWindow.cellSize
+                                    color: cell.isOn ? root.accentColor : "transparent"
+                                    border.color: root.borderColor
+                                    border.width: 1
+                                    opacity: cell.canConnect ? 1.0 : 0.2
+                                    MouseArea {
+                                        anchors.fill: parent
+                                        enabled: cell.canConnect
+                                        onClicked: root.togglePortCell(
+                                            sourceRow.sourceData, cell.sinkData, !cell.isOn)
+                                    }
+                                }
+                            }
+                        }
+                    }
+
+                    Label {
+                        visible: patchWindow.sources.length === 0 || patchWindow.sinks.length === 0
+                        text: "No ports to show for this device selection."
+                        color: root.mutedText
+                        font.pixelSize: 11
+                    }
+                }
+            }
+        }
+
+        Timer {
+            id: patchRefreshTimer
+            interval: 300
+            repeat: false
+            onTriggered: backend.queryPorts()
+        }
+        Timer {
+            interval: 1500
+            running: patchWindow.visible
+            repeat: true
+            onTriggered: backend.queryPorts()
+        }
+    }
+
+    Window {
+        id: midiWindow
+        title: "MIDI input"
+        modality: Qt.ApplicationModal
+        flags: Qt.Dialog
+        transientParent: root
+        visible: false
+        width: 480
+        height: 420
+        color: palette.window
+
+        onVisibleChanged: if (visible) backend.queryPorts()
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            Label {
+                Layout.fillWidth: true
+                text: root.midiInputPort()
+                    ? "Ports connected to " + root.midiInputPort().name
+                    : "No MIDI input port (is the engine connected?)"
+                color: root.mutedText
+                font.pixelSize: 10
+                wrapMode: Text.WordWrap
+            }
+
+            Flickable {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+                contentWidth: midiList.width
+                contentHeight: midiList.implicitHeight
+                ScrollBar.vertical: ScrollBar { }
+
+                Column {
+                    id: midiList
+                    width: midiWindow.width - 24
+                    spacing: 2
+
+                    Repeater {
+                        model: root.midiSources()
+                        FilterCheck {
+                            width: midiList.width
+                            text: modelData.client + ": " + modelData.short
+                            checked: root.midiConnected(modelData)
+                            onToggled: root.toggleMidiSource(modelData, checked)
+                        }
+                    }
+
+                    Label {
+                        visible: root.midiSources().length === 0
+                        text: "No MIDI output ports found."
+                        color: root.mutedText
+                        font.pixelSize: 11
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                FlatButton {
+                    text: "refresh"
+                    onClicked: backend.queryPorts()
+                }
+                FlatButton {
+                    text: "close"
+                    onClicked: midiWindow.close()
+                }
+            }
+        }
+
+        Timer {
+            id: midiRefreshTimer
+            interval: 300
+            repeat: false
+            onTriggered: backend.queryPorts()
+        }
+        Timer {
+            interval: 1500
+            running: midiWindow.visible
+            repeat: true
+            onTriggered: backend.queryPorts()
         }
     }
 

@@ -118,6 +118,10 @@ pub struct Controller {
     clap_ui_safe: Arc<Mutex<HashMap<String, bool>>>,
     missing_report: Option<String>,
     pending_session: Option<(bool, String, String)>,
+    /// Port graph JSON requested by the GUI patchbay, sent on the next loop.
+    pending_ports: Option<String>,
+    /// Outcome of a patchbay connect/disconnect, sent on the next loop.
+    pending_connect_result: Option<ControlMessage>,
     sample_rate: u32,
     clipboard: Option<PluginClipboard>,
     clipboard_dirty: bool,
@@ -353,6 +357,8 @@ impl Controller {
             clap_ui_safe: Arc::new(Mutex::new(HashMap::new())),
             missing_report,
             pending_session: None,
+            pending_ports: None,
+            pending_connect_result: None,
             sample_rate,
             clipboard: None,
             clipboard_dirty: false,
@@ -508,6 +514,12 @@ impl Controller {
             }
             if let Some((ok, path, error)) = self.pending_session.take() {
                 self.send_session_result(address, ok, &path, &error);
+            }
+            if let Some(json) = self.pending_ports.take() {
+                self.send_message(&ControlMessage::Ports { json }, address);
+            }
+            if let Some(message) = self.pending_connect_result.take() {
+                self.send_message(&message, address);
             }
             if actions.catalog {
                 self.send_catalog(address);
@@ -1185,11 +1197,30 @@ impl Controller {
                 self.scan.stop();
                 Actions::default()
             }
+            ControlMessage::PortsQuery => {
+                match serde_json::to_string(&self.engine.ports(&self.model)) {
+                    Ok(json) => self.pending_ports = Some(json),
+                    Err(error) => tracing::warn!(%error, "failed to encode the port graph"),
+                }
+                Actions::default()
+            }
+            ControlMessage::Connect { source, sink } => {
+                let outcome = self.engine.connect_port(&source, &sink);
+                self.record_connection(outcome, source, sink);
+                Actions::default()
+            }
+            ControlMessage::Disconnect { source, sink } => {
+                let outcome = self.engine.disconnect_port(&source, &sink);
+                self.record_connection(outcome, source, sink);
+                Actions::default()
+            }
             ControlMessage::Catalog { .. }
             | ControlMessage::State { .. }
             | ControlMessage::PluginScan { .. }
             | ControlMessage::SessionResult { .. }
-            | ControlMessage::MissingConnections { .. } => Actions::default(),
+            | ControlMessage::MissingConnections { .. }
+            | ControlMessage::Ports { .. }
+            | ControlMessage::ConnectResult { .. } => Actions::default(),
             // Chunk envelopes are reassembled by the receiver before dispatch;
             // the engine never expects one inbound, but ignore it if it arrives.
             ControlMessage::Chunk { .. } => Actions::default(),
@@ -2987,6 +3018,33 @@ impl Controller {
         self.undo_coalesce = None;
         self.edit_dirty = true;
         true
+    }
+
+    /// Records the outcome of a patchbay connect/disconnect, keeps the model's
+    /// saved connections current (so a session save captures the live patch),
+    /// and queues a result for the GUI.
+    fn record_connection(
+        &mut self,
+        outcome: anyhow::Result<()>,
+        source: String,
+        sink: String,
+    ) {
+        let (ok, error) = match outcome {
+            Ok(()) => {
+                self.engine.capture_connections(&mut self.model);
+                (true, String::new())
+            }
+            Err(error) => {
+                tracing::warn!(%error, %source, %sink, "JACK connection change failed");
+                (false, error.to_string())
+            }
+        };
+        self.pending_connect_result = Some(ControlMessage::ConnectResult {
+            ok,
+            source,
+            sink,
+            error,
+        });
     }
 
     fn restore_model(&mut self, snapshot: MixerModel) {

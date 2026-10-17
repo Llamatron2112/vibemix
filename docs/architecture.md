@@ -139,6 +139,15 @@ disconnected first), while entities without info are left alone so auto-connect
 still applies. Connections whose other end is absent at load time are reported to
 the GUI over `/vibemix/connections/missing`, which shows a popup listing them.
 
+The GUI **patchbay** (`Options → Patchbay…`) edits the same connections live: it
+queries the JACK port graph (`/vibemix/ports`) and issues
+`/vibemix/connect` / `/vibemix/disconnect` for one source (output) and sink
+(input). The matrix only enables connections involving vibemix's own ports, so
+everything it changes is covered by the saved-connection model above. A separate
+`Options → MIDI input…` window patches the single `midi_in` port. The port graph
+is refreshed on open and periodically while a window is visible, since clients
+come and go.
+
 ## Plugin hosting
 
 vibemix hosts three plugin formats behind a common `PluginSlot` model and a
@@ -469,6 +478,11 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/edit/redo` | none |
 | `/vibemix/edit/state` | `int undo_depth, int redo_depth, string undo_label, string redo_label` (engine to GUI) |
 | `/vibemix/connections/missing` | `string json` (engine to GUI: saved connections that could not be restored) |
+| `/vibemix/ports/query` | none (GUI asks for the JACK port graph) |
+| `/vibemix/ports` | `string json` (engine to GUI: every JACK port with type, flags, connections and vibemix role) |
+| `/vibemix/connect` | `string source, string sink` (connect a JACK output to an input) |
+| `/vibemix/disconnect` | `string source, string sink` |
+| `/vibemix/connect/result` | `int ok, string source, string sink, string error` (engine to GUI) |
 | `/vibemix/meters` | `int strip_count, in_l…, in_r…, gain_l…, gain_r…, out_l…, out_r…, int bus_count, buses_l…, buses_r…` (linear peak levels, engine to GUI, ~50 Hz) |
 | `/vibemix/midi/key_bind` | `int kind, int location, int target, int slot, int param, string key` (bind a keyboard combo to a button) |
 | `/vibemix/midi/key_trigger` | `string key` (GUI to engine: a bound key/combo was pressed) |

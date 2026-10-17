@@ -44,6 +44,10 @@ static LAST_STRUCTURE_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_VALUES_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_CATALOG_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 static LAST_METERS_REV: AtomicU64 = AtomicU64::new(u64::MAX);
+static PORTS_REV: AtomicU64 = AtomicU64::new(0);
+static LAST_PORTS_REV: AtomicU64 = AtomicU64::new(u64::MAX);
+static PORTS: Mutex<String> = Mutex::new(String::new());
+static PENDING_CONNECTION_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static LAST_CLOCK: Mutex<Option<ClockState>> = Mutex::new(None);
 static LAST_SESSION_PATH: Mutex<String> = Mutex::new(String::new());
 static LAST_RECENT: Mutex<String> = Mutex::new(String::new());
@@ -351,6 +355,17 @@ fn receive_loop(socket: UdpSocket) {
                     guard.connected = true;
                     drop(guard);
                     METERS_REV.fetch_add(1, Ordering::Release);
+                }
+                Some(ControlMessage::Ports { json }) => {
+                    if let Ok(mut guard) = PORTS.lock() {
+                        *guard = json;
+                    }
+                    PORTS_REV.fetch_add(1, Ordering::Release);
+                }
+                Some(ControlMessage::ConnectResult { ok, error, .. }) => {
+                    if let Ok(mut guard) = PENDING_CONNECTION_ERROR.lock() {
+                        *guard = Some(if ok { String::new() } else { error });
+                    }
                 }
                 _ => {}
             }
@@ -697,6 +712,8 @@ pub mod qobject {
         #[qproperty(QString, meters)]
         #[qproperty(QString, catalog)]
         #[qproperty(QString, report)]
+        #[qproperty(QString, ports)]
+        #[qproperty(QString, connection_error)]
         #[qproperty(bool, dirty)]
         #[qproperty(QString, session_result)]
         #[qproperty(QString, session_path)]
@@ -735,6 +752,18 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "retestPlugins"]
         fn retest_plugins(&self);
+
+        #[qinvokable]
+        #[cxx_name = "queryPorts"]
+        fn query_ports(&self);
+
+        #[qinvokable]
+        #[cxx_name = "connectPorts"]
+        fn connect_ports(&self, source: &QString, sink: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "disconnectPorts"]
+        fn disconnect_ports(&self, source: &QString, sink: &QString);
 
         #[qinvokable]
         #[cxx_name = "cancelPluginScan"]
@@ -970,6 +999,8 @@ pub struct BackendRust {
     meters: QString,
     catalog: QString,
     report: QString,
+    ports: QString,
+    connection_error: QString,
     dirty: bool,
     session_result: QString,
     session_path: QString,
@@ -1001,6 +1032,8 @@ impl Default for BackendRust {
             meters: QString::from("{\"strips\":{},\"buses\":{}}"),
             catalog: QString::from("[]"),
             report: QString::from(""),
+            ports: QString::from("[]"),
+            connection_error: QString::from(""),
             dirty: false,
             session_result: QString::from(""),
             session_path: QString::from(""),
@@ -1059,6 +1092,24 @@ impl qobject::Backend {
             LAST_METERS_REV.store(meters_rev, Ordering::Relaxed);
             self.as_mut()
                 .set_meters(QString::from(build_meters_json().as_str()));
+        }
+
+        let ports_rev = PORTS_REV.load(Ordering::Acquire);
+        if ports_rev != LAST_PORTS_REV.load(Ordering::Relaxed) {
+            LAST_PORTS_REV.store(ports_rev, Ordering::Relaxed);
+            let ports = PORTS
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
+            self.as_mut().set_ports(QString::from(ports.as_str()));
+        }
+        if let Some(error) = PENDING_CONNECTION_ERROR
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+        {
+            self.as_mut()
+                .set_connection_error(QString::from(error.as_str()));
         }
         self.as_mut().set_connected(is_connected());
 
@@ -1186,6 +1237,24 @@ impl qobject::Backend {
     pub fn retest_plugins(&self) {
         note_action("testing plugins");
         send(ControlMessage::RetestPlugins);
+    }
+
+    pub fn query_ports(&self) {
+        send(ControlMessage::PortsQuery);
+    }
+
+    pub fn connect_ports(&self, source: &QString, sink: &QString) {
+        send(ControlMessage::Connect {
+            source: source.to_string(),
+            sink: sink.to_string(),
+        });
+    }
+
+    pub fn disconnect_ports(&self, source: &QString, sink: &QString) {
+        send(ControlMessage::Disconnect {
+            source: source.to_string(),
+            sink: sink.to_string(),
+        });
     }
 
     pub fn cancel_plugin_scan(&self) {

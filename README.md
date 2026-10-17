@@ -44,6 +44,12 @@ small OSC control protocol.
   strip/bus sidechain panel.
 - **Meters**: click a meter to cycle its tap (strip IN/GAIN/OUT; bus
   IN/SEND/RET/OUT).
+- **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
+  matrix; pick the device on each axis. Tick a cell to connect. **Link L/R**
+  pairs the channels and **Mono → L+R** feeds one source to both; only
+  connections involving vibemix ports are editable.
+- **MIDI input**: `Options → MIDI input…` chooses which MIDI outputs feed
+  vibemix.
 - **MIDI bindings…**: right-click a mute/solo cell → Learn (MIDI CC) or
   **Learn key** (press a key or combo; Esc cancels, Backspace clears).
 

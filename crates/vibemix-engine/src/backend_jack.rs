@@ -158,6 +158,35 @@ pub struct MissingConnection {
     pub port: String,
 }
 
+/// A JACK port as exposed to the GUI patchbay.
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortInfo {
+    pub name: String,
+    pub client: String,
+    pub short: String,
+    /// `"audio"` or `"midi"`.
+    pub r#type: String,
+    pub input: bool,
+    pub output: bool,
+    pub physical: bool,
+    /// Ports connected to this one (sources for an input, sinks for an output).
+    pub connections: Vec<String>,
+    /// Set for vibemix's own ports so the GUI can label them nicely.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub role: Option<PortRole>,
+}
+
+#[derive(Debug, Clone, serde::Serialize)]
+pub struct PortRole {
+    /// `"strip_in"`, `"bus_out"`, `"bus_ret"` or `"midi_in"`.
+    pub kind: &'static str,
+    pub id: u32,
+    /// `"l"`, `"r"`, or empty for MIDI.
+    pub channel: &'static str,
+    /// The strip/bus display name (or "MIDI").
+    pub label: String,
+}
+
 /// Forwards JACK notifications we care about to the engine/control thread.
 pub struct Notifications {
     pending_rate: Arc<AtomicU32>,
@@ -2086,6 +2115,147 @@ impl JackEngine {
 
     pub fn take_missing_connections(&mut self) -> Vec<MissingConnection> {
         std::mem::take(&mut self.pending_missing)
+    }
+
+    /// Every JACK port with its flags, current connections and (for vibemix's
+    /// own ports) its role. Used by the GUI patchbay. Not RT safe: allocates
+    /// and talks to the server, so call it from the control thread.
+    pub fn ports(&self, model: &MixerModel) -> Vec<PortInfo> {
+        let roles = {
+            let mut roles: std::collections::HashMap<String, PortRole> =
+                std::collections::HashMap::new();
+            let mut add = |port: &Port<Unowned>, role: PortRole| {
+                if let Ok(name) = port.name() {
+                    roles.insert(name, role);
+                }
+            };
+
+            for strip in &model.strips {
+                let index = strip.id.0 as usize;
+                if let Some((in_l, in_r)) = self.strip_ports.get(index).and_then(Option::as_ref) {
+                    add(
+                        in_l,
+                        PortRole {
+                            kind: "strip_in",
+                            id: strip.id.0,
+                            channel: "l",
+                            label: strip.name.clone(),
+                        },
+                    );
+                    add(
+                        in_r,
+                        PortRole {
+                            kind: "strip_in",
+                            id: strip.id.0,
+                            channel: "r",
+                            label: strip.name.clone(),
+                        },
+                    );
+                }
+            }
+
+            for bus in &model.buses {
+                let index = bus.id.0 as usize;
+                if let Some((out_l, out_r)) = self.bus_ports.get(index).and_then(Option::as_ref) {
+                    add(
+                        out_l,
+                        PortRole {
+                            kind: "bus_out",
+                            id: bus.id.0,
+                            channel: "l",
+                            label: bus.name.clone(),
+                        },
+                    );
+                    add(
+                        out_r,
+                        PortRole {
+                            kind: "bus_out",
+                            id: bus.id.0,
+                            channel: "r",
+                            label: bus.name.clone(),
+                        },
+                    );
+                }
+                if let Some((ret_l, ret_r)) = self.bus_return_ports.get(index).and_then(Option::as_ref)
+                {
+                    add(
+                        ret_l,
+                        PortRole {
+                            kind: "bus_ret",
+                            id: bus.id.0,
+                            channel: "l",
+                            label: bus.name.clone(),
+                        },
+                    );
+                    add(
+                        ret_r,
+                        PortRole {
+                            kind: "bus_ret",
+                            id: bus.id.0,
+                            channel: "r",
+                            label: bus.name.clone(),
+                        },
+                    );
+                }
+            }
+
+            add(
+                &self.midi_port,
+                PortRole {
+                    kind: "midi_in",
+                    id: 0,
+                    channel: "",
+                    label: "MIDI".to_string(),
+                },
+            );
+            roles
+        };
+
+        let client = self.active.as_client();
+        let mut ports = Vec::new();
+        for name in client.ports(None, None, jack::PortFlags::empty()) {
+            let Some(port) = client.port_by_name(&name) else {
+                continue;
+            };
+            let flags = port.flags();
+            let kind = match port.port_type() {
+                Ok(kind) if kind.contains("midi") => "midi",
+                _ => "audio",
+            };
+            let (client_name, short) = name
+                .split_once(':')
+                .unwrap_or((name.as_str(), name.as_str()));
+            ports.push(PortInfo {
+                name: name.clone(),
+                client: client_name.to_string(),
+                short: short.to_string(),
+                r#type: kind.to_string(),
+                input: flags.contains(jack::PortFlags::IS_INPUT),
+                output: flags.contains(jack::PortFlags::IS_OUTPUT),
+                physical: flags.contains(jack::PortFlags::IS_PHYSICAL),
+                connections: port.get_connections(),
+                role: roles.get(&name).cloned(),
+            });
+        }
+        ports
+    }
+
+    /// Connects a JACK source (output) to a sink (input).
+    pub fn connect_port(&self, source: &str, sink: &str) -> Result<()> {
+        self.active
+            .as_client()
+            .connect_ports_by_name(source, sink)
+            .with_context(|| format!("connecting {source} -> {sink}"))?;
+        Ok(())
+    }
+
+    /// Disconnects a JACK source (output) from a sink (input).
+    pub fn disconnect_port(&self, source: &str, sink: &str) -> Result<()> {
+        self.active
+            .as_client()
+            .disconnect_ports_by_name(source, sink)
+            .with_context(|| format!("disconnecting {source} -> {sink}"))?;
+        Ok(())
     }
 
     pub fn state_proxy(&self, strip: usize, chain: usize, slot: usize) -> Option<SlotState> {

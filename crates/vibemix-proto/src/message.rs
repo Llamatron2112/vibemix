@@ -288,6 +288,29 @@ pub enum ControlMessage {
     MissingConnections {
         json: String,
     },
+    /// GUI asks for the current JACK port graph (audio and MIDI).
+    PortsQuery,
+    /// Engine to GUI: every JACK port, its flags and current connections.
+    Ports {
+        json: String,
+    },
+    /// Connect a JACK source (output) to a sink (input).
+    Connect {
+        source: String,
+        sink: String,
+    },
+    /// Disconnect a JACK source from a sink.
+    Disconnect {
+        source: String,
+        sink: String,
+    },
+    /// Engine to GUI: outcome of a [`Connect`] or [`Disconnect`].
+    ConnectResult {
+        ok: bool,
+        source: String,
+        sink: String,
+        error: String,
+    },
     /// One part of a message too large for a single UDP datagram. `data` is a
     /// slice of the encoded inner message; the receiver concatenates the parts
     /// (ordered by `index`, grouped by `transfer`) and decodes the result.
@@ -852,6 +875,36 @@ impl ControlMessage {
                 addr: addr::CONNECTIONS_MISSING.to_string(),
                 args: vec![OscType::String(json.clone())],
             },
+            PortsQuery => OscMessage {
+                addr: addr::PORTS_QUERY.to_string(),
+                args: vec![],
+            },
+            Ports { json } => OscMessage {
+                addr: addr::PORTS.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
+            Connect { source, sink } => OscMessage {
+                addr: addr::CONNECT.to_string(),
+                args: vec![OscType::String(source.clone()), OscType::String(sink.clone())],
+            },
+            Disconnect { source, sink } => OscMessage {
+                addr: addr::DISCONNECT.to_string(),
+                args: vec![OscType::String(source.clone()), OscType::String(sink.clone())],
+            },
+            ConnectResult {
+                ok,
+                source,
+                sink,
+                error,
+            } => OscMessage {
+                addr: addr::CONNECT_RESULT.to_string(),
+                args: vec![
+                    OscType::Int(*ok as i32),
+                    OscType::String(source.clone()),
+                    OscType::String(sink.clone()),
+                    OscType::String(error.clone()),
+                ],
+            },
             Chunk {
                 transfer,
                 index,
@@ -1192,6 +1245,24 @@ impl ControlMessage {
             }),
             addr::CONNECTIONS_MISSING => Some(ControlMessage::MissingConnections {
                 json: string(args, 0)?,
+            }),
+            addr::PORTS_QUERY => Some(ControlMessage::PortsQuery),
+            addr::PORTS => Some(ControlMessage::Ports {
+                json: string(args, 0)?,
+            }),
+            addr::CONNECT => Some(ControlMessage::Connect {
+                source: string(args, 0)?,
+                sink: string(args, 1)?,
+            }),
+            addr::DISCONNECT => Some(ControlMessage::Disconnect {
+                source: string(args, 0)?,
+                sink: string(args, 1)?,
+            }),
+            addr::CONNECT_RESULT => Some(ControlMessage::ConnectResult {
+                ok: int(args, 0)? != 0,
+                source: string(args, 1)?,
+                sink: string(args, 2)?,
+                error: string(args, 3)?,
             }),
             addr::CHUNK => Some(ControlMessage::Chunk {
                 transfer: int(args, 0)? as u32,
@@ -1705,6 +1776,28 @@ mod tests {
         });
         roundtrip(ControlMessage::MissingConnections {
             json: "[{\"port\":\"system:capture_9\"}]".to_string(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_ports_and_connect() {
+        roundtrip(ControlMessage::PortsQuery);
+        roundtrip(ControlMessage::Ports {
+            json: "[{\"name\":\"system:capture_1\"}]".to_string(),
+        });
+        roundtrip(ControlMessage::Connect {
+            source: "system:capture_1".to_string(),
+            sink: "vibemix:strip0_in_l".to_string(),
+        });
+        roundtrip(ControlMessage::Disconnect {
+            source: "system:capture_1".to_string(),
+            sink: "vibemix:strip0_in_l".to_string(),
+        });
+        roundtrip(ControlMessage::ConnectResult {
+            ok: false,
+            source: "a".to_string(),
+            sink: "b".to_string(),
+            error: "not found".to_string(),
         });
     }
 
