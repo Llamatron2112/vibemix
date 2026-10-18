@@ -267,6 +267,9 @@ pub struct MixerModel {
     /// Top-bar counter/loop display preferences.
     #[serde(default)]
     pub transport_ui: TransportUi,
+    /// Mixer pane layout (cards per row), saved with the session.
+    #[serde(default)]
+    pub layout: LayoutSettings,
     /// When true, follow the incoming MIDI clock and pass host tempo/transport
     /// to plugins.
     #[serde(default = "default_true")]
@@ -279,6 +282,16 @@ pub struct MixerModel {
 
 fn default_beats_per_bar() -> f32 {
     4.0
+}
+
+/// Mixer pane layout, saved with the session. `0` means "auto" (wrap to the
+/// pane width); any other value is the maximum number of cards per row.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct LayoutSettings {
+    #[serde(default)]
+    pub strips_per_row: u32,
+    #[serde(default)]
+    pub buses_per_row: u32,
 }
 
 /// Top-bar counter/loop display preferences, saved with the session.
@@ -388,6 +401,7 @@ impl MixerModel {
             beats_per_bar: 4.0,
             midi_bindings: Vec::new(),
             transport_ui: TransportUi::default(),
+            layout: LayoutSettings::default(),
             midi_sync: true,
             midi_connections: None,
         }

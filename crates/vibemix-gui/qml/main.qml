@@ -36,16 +36,18 @@ ApplicationWindow {
         target: root
         property: "width"
         when: root.transportUi().autosize && root.visibility !== Window.Maximized
-        value: Math.min(content.implicitWidth, Screen.desktopAvailableWidth)
+        value: Math.min(root.autoFitWidth(), Screen.desktopAvailableWidth)
     }
     Binding {
         target: root
         property: "height"
         when: root.transportUi().autosize && root.visibility !== Window.Maximized
-        value: Math.min(appMenuBar.height + content.implicitHeight, Screen.desktopAvailableHeight)
+        value: Math.min(appMenuBar.height + root.autoFitHeight(), Screen.desktopAvailableHeight)
     }
 
     readonly property int stripBody: 76
+    readonly property int stripCardWidth: stripBody + 12
+    readonly property int busCardWidth: stripBody + 12
     readonly property int pluginRowHeight: 18
     readonly property int pluginFrame: pluginRowHeight * 2 + 6
     readonly property color accentColor: palette.highlight
@@ -99,14 +101,21 @@ ApplicationWindow {
         if (index < 0 || target < 0 || target > mix.buses.length - 2) return
         backend.moveBus(id, target)
     }
-    function dropIndexFor(row, card, dx, kind) {
-        var center = card.x + card.width / 2 + dx
+    function dropIndexFor(row, card, dx, dy, kind) {
+        var cx = card.x + card.width / 2 + dx
+        var cy = card.y + card.height / 2 + dy
         var result = 0
         var kids = row.children
         for (var i = 0; i < kids.length; i++) {
             var child = kids[i]
             if (child === card || child.reorderKind !== kind) continue
-            if (center > child.x + child.width / 2) result++
+            if (child.y + child.height <= cy) {
+                // entirely above the drop point
+                result++
+            } else if (child.y < cy) {
+                // same row as the drop point: count only what is to its left
+                if (child.x + child.width / 2 < cx) result++
+            }
         }
         return result
     }
@@ -374,6 +383,48 @@ ApplicationWindow {
         if (!input) return
         root.setPortConnection(port, input, connect)
         midiRefreshTimer.restart()
+    }
+
+    // --- Mixer layout -------------------------------------------------------
+    function layoutSettings() {
+        var layout = mix.layout
+        return layout ? layout : ({ strips_per_row: 0, buses_per_row: 0 })
+    }
+    function layoutColumns(kind) {
+        var layout = root.layoutSettings()
+        return kind === "strip" ? layout.strips_per_row : layout.buses_per_row
+    }
+    function paneColumns(kind, availableWidth) {
+        var fixed = root.layoutColumns(kind)
+        if (fixed && fixed > 0) return Math.min(32, fixed)
+        var card = kind === "strip" ? root.stripCardWidth : root.busCardWidth
+        return Math.max(1, Math.floor((availableWidth - 8 + 4) / (card + 4)))
+    }
+    function canAddStrip() {
+        var capacity = mix.strip_capacity
+        return !capacity || mix.strips.length < capacity
+    }
+    function canAddBus() {
+        var capacity = mix.bus_capacity
+        return !capacity || mix.buses.length < capacity
+    }
+    function autoFitWidth() {
+        var strips = root.layoutColumns("strip")
+        var buses = root.layoutColumns("bus")
+        if (strips <= 0) strips = 6
+        if (buses <= 0) buses = 4
+        return strips * (root.stripCardWidth + 4)
+            + buses * (root.busCardWidth + 4) + 48
+    }
+    function autoFitHeight() {
+        var h = 0
+        if (stripsRepeater.count > 0 && stripsRepeater.itemAt(0)) {
+            h = Math.max(h, stripsRepeater.itemAt(0).height)
+        }
+        if (busesRepeater.count > 0 && busesRepeater.itemAt(0)) {
+            h = Math.max(h, busesRepeater.itemAt(0).height)
+        }
+        return h + 48
     }
     function gainText(gain) {
         if (gain <= 1.0e-4) return "-inf dB"
@@ -1013,12 +1064,12 @@ ApplicationWindow {
             title: "Add"
             MenuItem {
                 text: "Add strip"
-                enabled: backend.connected
+                enabled: backend.connected && root.canAddStrip()
                 onTriggered: backend.addStrip()
             }
             MenuItem {
                 text: "Add bus"
-                enabled: backend.connected
+                enabled: backend.connected && root.canAddBus()
                 onTriggered: backend.addBus()
             }
         }
@@ -1044,6 +1095,11 @@ ApplicationWindow {
                 checkable: true
                 checked: root.transportUi().autosize
                 onTriggered: root.setTransportUi({ autosize: !root.transportUi().autosize })
+            }
+            MenuSeparator { }
+            MenuItem {
+                text: "Layout…"
+                onTriggered: layoutDialog.open()
             }
             MenuSeparator { }
             MenuItem {
@@ -1689,7 +1745,7 @@ ApplicationWindow {
 
         HoverHandler {
             id: gripHover
-            cursorShape: Qt.SizeHorCursor
+            cursorShape: Qt.OpenHandCursor
         }
 
         TapHandler {
@@ -1701,18 +1757,23 @@ ApplicationWindow {
             id: gripDrag
             target: null
             enabled: grip.reorderEnabled
-            yAxis.enabled: false
             cursorShape: Qt.ClosedHandCursor
-            onTranslationChanged: grip.card.dragOffset = gripDrag.translation.x
+            onTranslationChanged: {
+                grip.card.dragOffset = gripDrag.translation.x
+                grip.card.dragOffsetY = gripDrag.translation.y
+            }
             onActiveChanged: {
                 if (!grip.card) return
                 if (gripDrag.active) {
                     grip.card.dragging = true
                     root.gripDragging = true
                 } else {
-                    var index = root.dropIndexFor(grip.row, grip.card, grip.card.dragOffset, grip.kind)
+                    var index = root.dropIndexFor(
+                        grip.row, grip.card, grip.card.dragOffset,
+                        grip.card.dragOffsetY, grip.kind)
                     grip.card.dragging = false
                     grip.card.dragOffset = 0
+                    grip.card.dragOffsetY = 0
                     root.gripDragging = false
                     if (index !== grip.currentIndex()) grip.dropped(index)
                 }
@@ -4272,6 +4333,61 @@ ApplicationWindow {
     }
 
     Dialog {
+        id: layoutDialog
+        title: "Mixer layout"
+        modal: true
+        anchors.centerIn: parent
+        padding: 10
+        standardButtons: Dialog.Ok | Dialog.Cancel
+
+        onOpened: {
+            stripsPerRowBox.currentIndex = root.layoutColumns("strip")
+            busesPerRowBox.currentIndex = root.layoutColumns("bus")
+        }
+        onAccepted: backend.setLayout(
+            stripsPerRowBox.currentIndex, busesPerRowBox.currentIndex)
+
+        contentItem: ColumnLayout {
+            width: layoutDialog.availableWidth
+            spacing: 8
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Label {
+                    text: "Strips per row"
+                    color: root.textColor
+                    font.pixelSize: 11
+                    Layout.fillWidth: true
+                }
+                ComboBox {
+                    id: stripsPerRowBox
+                    Layout.preferredWidth: 100
+                    font.pixelSize: 11
+                    model: ["Auto", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"]
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                Label {
+                    text: "Buses per row"
+                    color: root.textColor
+                    font.pixelSize: 11
+                    Layout.fillWidth: true
+                }
+                ComboBox {
+                    id: busesPerRowBox
+                    Layout.preferredWidth: 100
+                    font.pixelSize: 11
+                    model: ["Auto", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11", "12"]
+                }
+            }
+        }
+    }
+
+    Dialog {
         id: loopDialog
         title: "loop settings"
         modal: true
@@ -4390,45 +4506,92 @@ ApplicationWindow {
         }
     }
 
-    Flickable {
-        id: flick
+    SplitView {
+        id: mixerPanes
         anchors.fill: parent
-        contentWidth: content.width
-        contentHeight: content.height
-        clip: true
-        flickableDirection: Flickable.HorizontalAndVerticalFlick
-        interactive: !root.sliderHovered && !root.gripDragging
+        orientation: Qt.Horizontal
         focus: true
         Keys.onPressed: (event) => root.handleGlobalKey(event)
 
-        Column {
-            id: content
-            padding: 6
-            spacing: 6
-            width: Math.max(implicitWidth, flick.width)
+        // ---- Strips ----
+        Item {
+            SplitView.fillWidth: true
+            SplitView.minimumWidth: 240
 
-            RowLayout {
-                id: channelRow
-                spacing: 4
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 0
 
-                Repeater {
-                    model: mix.strips
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 24
+                    color: palette.button
 
-                    delegate: Rectangle {
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 8
+                        anchors.rightMargin: 4
+                        spacing: 6
+
+                        Label {
+                            text: "Strips"
+                            color: root.textColor
+                            font.pixelSize: 11
+                            font.bold: true
+                        }
+                        Label {
+                            text: mix.strips.length
+                                + (mix.strip_capacity !== undefined ? " / " + mix.strip_capacity : "")
+                            color: root.mutedText
+                            font.pixelSize: 10
+                        }
+                        Item { Layout.fillWidth: true }
+                        FlatButton {
+                            text: "add"
+                            enabled: backend.connected && root.canAddStrip()
+                            onClicked: backend.addStrip()
+                        }
+                    }
+                }
+
+                Flickable {
+                    id: stripsFlick
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    contentWidth: stripsGrid.implicitWidth + 8
+                    contentHeight: stripsGrid.implicitHeight + 8
+                    clip: true
+                    interactive: !root.sliderHovered && !root.gripDragging
+                    ScrollBar.vertical: ScrollBar { }
+                    ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
+
+                    Grid {
+                        id: stripsGrid
+                        x: 4
+                        y: 4
+                        columns: root.paneColumns("strip", stripsFlick.width)
+                        columnSpacing: 4
+                        rowSpacing: 4
+
+                        Repeater {
+                            id: stripsRepeater
+                            model: mix.strips
+
+                            delegate: Rectangle {
                         id: stripCard
                         property var stripData: modelData
                         property string reorderKind: "strip"
                         property bool dragging: false
                         property real dragOffset: 0
-                        Layout.fillHeight: true
-                        Layout.preferredWidth: stripContent.implicitWidth + 12
-                        implicitHeight: stripContent.implicitHeight + 12
+                        property real dragOffsetY: 0
+                        width: root.stripCardWidth
+                        height: stripContent.implicitHeight + 12
                         color: root.panelColor
                         border.color: stripCard.dragging ? root.accentColor : root.borderColor
                         border.width: 1
                         z: stripCard.dragging ? 5 : 0
                         opacity: stripCard.dragging ? 0.85 : 1
-                        transform: Translate { x: stripCard.dragOffset }
+                        transform: Translate { x: stripCard.dragOffset; y: stripCard.dragOffsetY }
 
                         Menu {
                             id: stripMenu
@@ -4464,7 +4627,7 @@ ApplicationWindow {
                             ReorderGrip {
                                 Layout.fillWidth: true
                                 card: stripCard
-                                row: channelRow
+                                row: stripsGrid
                                 kind: "strip"
                                 onDropped: (index) => backend.moveStrip(stripCard.stripData.id, index)
                                 onMenuRequested: stripMenu.popup()
@@ -4739,33 +4902,92 @@ ApplicationWindow {
                             }
                         }
                     }
+                        }
+                    }
+                }
+            }
+        }
+
+        // ---- Buses ----
+        Item {
+            SplitView.preferredWidth: Math.max(240, root.busCardWidth * 2 + 40)
+            SplitView.minimumWidth: 200
+
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 0
+
+                Rectangle {
+                    Layout.fillWidth: true
+                    implicitHeight: 24
+                    color: palette.button
+
+                    RowLayout {
+                        anchors.fill: parent
+                        anchors.leftMargin: 8
+                        anchors.rightMargin: 4
+                        spacing: 6
+
+                        Label {
+                            text: "Buses"
+                            color: root.textColor
+                            font.pixelSize: 11
+                            font.bold: true
+                        }
+                        Label {
+                            text: mix.buses.length
+                                + (mix.bus_capacity !== undefined ? " / " + mix.bus_capacity : "")
+                            color: root.mutedText
+                            font.pixelSize: 10
+                        }
+                        Item { Layout.fillWidth: true }
+                        FlatButton {
+                            text: "add"
+                            enabled: backend.connected && root.canAddBus()
+                            onClicked: backend.addBus()
+                        }
+                    }
                 }
 
-                Item {
-                    Layout.preferredWidth: 10
+                Flickable {
+                    id: busesFlick
+                    Layout.fillWidth: true
                     Layout.fillHeight: true
-                    visible: mix.strips.length > 0 && mix.buses.length > 0
-                }
+                    contentWidth: busesGrid.implicitWidth + 8
+                    contentHeight: busesGrid.implicitHeight + 8
+                    clip: true
+                    interactive: !root.sliderHovered && !root.gripDragging
+                    ScrollBar.vertical: ScrollBar { }
+                    ScrollBar.horizontal: ScrollBar { policy: ScrollBar.AsNeeded }
 
-                Repeater {
-                    model: mix.buses
+                    Grid {
+                        id: busesGrid
+                        x: 4
+                        y: 4
+                        columns: root.paneColumns("bus", busesFlick.width)
+                        columnSpacing: 4
+                        rowSpacing: 4
 
-                    delegate: Rectangle {
+                        Repeater {
+                            id: busesRepeater
+                            model: mix.buses
+
+                            delegate: Rectangle {
                         id: busCard
                         property var busData: modelData
                         property string reorderKind: "bus"
                         readonly property bool reorderable: busCard.busData.id !== 0
                         property bool dragging: false
                         property real dragOffset: 0
-                        Layout.fillHeight: true
-                        Layout.preferredWidth: busContent.implicitWidth + 12
-                        implicitHeight: busContent.implicitHeight + 12
+                        property real dragOffsetY: 0
+                        width: root.busCardWidth
+                        height: busContent.implicitHeight + 12
                         color: root.panelColor
                         border.color: busCard.dragging ? root.accentColor : root.borderColor
                         border.width: 1
                         z: busCard.dragging ? 5 : 0
                         opacity: busCard.dragging ? 0.85 : 1
-                        transform: Translate { x: busCard.dragOffset }
+                        transform: Translate { x: busCard.dragOffset; y: busCard.dragOffsetY }
 
                         Menu {
                             id: busMenu
@@ -4822,7 +5044,7 @@ ApplicationWindow {
                             ReorderGrip {
                                 Layout.fillWidth: true
                                 card: busCard
-                                row: channelRow
+                                row: busesGrid
                                 kind: "bus"
                                 reorderEnabled: busCard.reorderable
                                 onDropped: (index) => backend.moveBus(busCard.busData.id, index)
@@ -4947,10 +5169,10 @@ ApplicationWindow {
                             }
                         }
                     }
+                        }
+                    }
                 }
             }
         }
-
-        ScrollBar.vertical: ScrollBar { }
     }
 }

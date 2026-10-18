@@ -33,10 +33,10 @@ struct Args {
     #[arg(long, default_value_t = 9000)]
     osc_port: u16,
 
-    #[arg(long, default_value_t = 8)]
+    #[arg(long, default_value_t = 64)]
     strips: usize,
 
-    #[arg(long, default_value_t = 4)]
+    #[arg(long, default_value_t = 32)]
     buses: usize,
 
     #[arg(long)]

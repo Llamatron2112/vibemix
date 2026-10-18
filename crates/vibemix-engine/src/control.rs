@@ -1346,6 +1346,17 @@ impl Controller {
                     catalog: false,
                 }
             }
+            ControlMessage::SetLayout {
+                strips_per_row,
+                buses_per_row,
+            } => {
+                self.model.layout.strips_per_row = strips_per_row;
+                self.model.layout.buses_per_row = buses_per_row;
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
             ControlMessage::MidiLearn {
                 kind,
                 location,
@@ -4219,7 +4230,10 @@ fn build_state_json(
         "beats_per_bar": model.beats_per_bar,
         "midi_bindings": model.midi_bindings,
         "transport_ui": model.transport_ui,
+        "layout": model.layout,
         "midi_sync": model.midi_sync,
+        "strip_capacity": params.strip_count(),
+        "bus_capacity": params.bus_count(),
     })
     .to_string()
 }

@@ -684,6 +684,12 @@ fn split_state(value: &serde_json::Value) -> (String, String) {
         "beats_per_bar": value.get("beats_per_bar").cloned().unwrap_or(serde_json::json!(4.0)),
         "midi_bindings": value.get("midi_bindings").cloned().unwrap_or(serde_json::json!([])),
         "transport_ui": value.get("transport_ui").cloned().unwrap_or(serde_json::json!({})),
+        "layout": value
+            .get("layout")
+            .cloned()
+            .unwrap_or(serde_json::json!({"strips_per_row": 0, "buses_per_row": 0})),
+        "strip_capacity": value.get("strip_capacity").cloned().unwrap_or(serde_json::json!(0)),
+        "bus_capacity": value.get("bus_capacity").cloned().unwrap_or(serde_json::json!(0)),
     })
     .to_string();
     let values = serde_json::json!({
@@ -928,6 +934,10 @@ pub mod qobject {
     #[qinvokable]
     #[cxx_name = "setTransportUi"]
     fn set_transport_ui(&self, json: &QString);
+
+    #[qinvokable]
+    #[cxx_name = "setLayout"]
+    fn set_layout(&self, strips_per_row: i32, buses_per_row: i32);
 
     #[qinvokable]
     #[cxx_name = "setBeatsPerBar"]
@@ -1602,6 +1612,14 @@ impl qobject::Backend {
         note_action("transport ui");
         send(ControlMessage::SetTransportUi {
             json: json.to_string(),
+        });
+    }
+
+    pub fn set_layout(&self, strips_per_row: i32, buses_per_row: i32) {
+        note_action("layout");
+        send(ControlMessage::SetLayout {
+            strips_per_row: strips_per_row.clamp(0, 32) as u32,
+            buses_per_row: buses_per_row.clamp(0, 32) as u32,
         });
     }
 

@@ -53,6 +53,7 @@ pub const EDIT_STATE: &str = "/vibemix/edit/state";
 pub const CLOCK: &str = "/vibemix/clock";
 pub const CLOCK_BEATS_PER_BAR: &str = "/vibemix/clock/beats_per_bar";
 pub const TRANSPORT_UI: &str = "/vibemix/transport/ui";
+pub const LAYOUT: &str = "/vibemix/layout";
 pub const MIDI_LEARN: &str = "/vibemix/midi/learn";
 pub const MIDI_LEARN_CANCEL: &str = "/vibemix/midi/learn_cancel";
 pub const MIDI_BINDINGS_CLEAR: &str = "/vibemix/midi/bindings_clear";

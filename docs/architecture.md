@@ -71,7 +71,10 @@ PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
 ## Mixer model
 
 The engine is built with a fixed capacity of strips and buses (CLI `--strips`,
-`--buses`; default 8 and 4). Strip input port pairs and bus output port pairs are
+`--buses`; default 64 and 32). The capacity is preallocated at startup because
+the RT thread cannot resize the parameter tables; the defaults are generous, and
+the CLI flags raise them further. Strip input port pairs and bus output port
+pairs are
 registered only for active strips/buses and unregistered when they are removed,
 so the JACK graph only shows what exists. Adding/removing strips and buses at
 runtime still just toggles `active` slots for the mixer graph. Audio flow:
@@ -86,6 +89,11 @@ hot inputs attenuated). All levels are measured as **peak dBFS** (`20·log10`);
 the strip has three meter taps — `in` (raw input), `gain` (post-trim, pre-plugin)
 and `out` (post-fader/pan) — and the GUI can select which one each strip's meter
 shows. The numeric readout and the meter's dB scale use `-60..+6 dBFS`.
+
+The GUI lays the strips and buses out in two independently scrollable panes,
+side by side; each pane wraps its cards into rows and scrolls vertically. The
+per-row counts (`layout.strips_per_row` / `layout.buses_per_row`, `0` = auto) are
+saved with the session.
 
 Each strip has one send per bus (`strip.sends`), exposed as a slider per bus in
 the GUI and tapped post-fader by default; a send flagged `pre_fader` taps the

@@ -35,6 +35,8 @@ small OSC control protocol.
 - **Menu bar**: **Add** for strips/buses, **Options** for MIDI sync, MIDI
   bindings… and auto-fit, **File**/**Edit** for sessions and undo. Right-click
   the top bar for the transport readouts, counters and loop settings.
+- **Layout**: `Options → Layout…` sets how many strips/buses per row (or
+  **Auto**). Strips and buses are separate, independently scrolling panes.
 - **Add a plugin**: right-click a strip's insert chain → **Add plugin…**. The
   browser lists LV2/VST3/CLAP; filter by name, or toggle formats, Mono/Stereo,
   SC-only (sidechain-capable) and Failed. Click a row to add it.

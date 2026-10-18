@@ -226,6 +226,10 @@ pub enum ControlMessage {
     SetTransportUi {
         json: String,
     },
+    SetLayout {
+        strips_per_row: u32,
+        buses_per_row: u32,
+    },
     MidiLearn {
         kind: u32,
         location: u32,
@@ -752,6 +756,16 @@ impl ControlMessage {
                 addr: addr::TRANSPORT_UI.to_string(),
                 args: vec![OscType::String(json.clone())],
             },
+            SetLayout {
+                strips_per_row,
+                buses_per_row,
+            } => OscMessage {
+                addr: addr::LAYOUT.to_string(),
+                args: vec![
+                    OscType::Int(*strips_per_row as i32),
+                    OscType::Int(*buses_per_row as i32),
+                ],
+            },
             MidiLearn {
                 kind,
                 location,
@@ -1185,6 +1199,10 @@ impl ControlMessage {
             }),
             addr::TRANSPORT_UI => Some(ControlMessage::SetTransportUi {
                 json: string(args, 0)?,
+            }),
+            addr::LAYOUT => Some(ControlMessage::SetLayout {
+                strips_per_row: int(args, 0)? as u32,
+                buses_per_row: int(args, 1)? as u32,
             }),
             addr::MIDI_LEARN => Some(ControlMessage::MidiLearn {
                 kind: int(args, 0)? as u32,
@@ -1805,6 +1823,10 @@ mod tests {
     fn roundtrip_state_snapshot() {
         roundtrip(ControlMessage::State {
             json: "{\"name\":\"test\"}".to_string(),
+        });
+        roundtrip(ControlMessage::SetLayout {
+            strips_per_row: 6,
+            buses_per_row: 4,
         });
     }
 
