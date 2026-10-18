@@ -22,6 +22,8 @@ ApplicationWindow {
     // Column counts frozen while auto-fit is on (0 = not captured).
     property int autoFitStripColumns: 0
     property int autoFitBusColumns: 0
+    // Card height shared by the bus cards so they line up with the strips.
+    property real mixerCardHeight: 0
 
     Backend {
         id: backend
@@ -4610,6 +4612,16 @@ ApplicationWindow {
                         opacity: stripCard.dragging ? 0.85 : 1
                         transform: Translate { x: stripCard.dragOffset; y: stripCard.dragOffsetY }
 
+                        // All strip cards share the same layout, so the first
+                        // one defines the height used by the bus cards too.
+                        Binding {
+                            target: root
+                            property: "mixerCardHeight"
+                            value: stripCard.height
+                            when: index === 0
+                            restoreMode: Binding.RestoreNone
+                        }
+
                         Menu {
                             id: stripMenu
                             MenuItem {
@@ -5000,7 +5012,9 @@ ApplicationWindow {
                         property real dragOffset: 0
                         property real dragOffsetY: 0
                         width: root.busCardWidth
-                        height: busContent.implicitHeight + 12
+                        height: mix.strips.length > 0
+                            ? Math.max(root.mixerCardHeight, busContent.implicitHeight + 12)
+                            : busContent.implicitHeight + 12
                         color: root.panelColor
                         border.color: busCard.dragging ? root.accentColor : root.borderColor
                         border.width: 1
