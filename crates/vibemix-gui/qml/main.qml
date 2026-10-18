@@ -10,8 +10,8 @@ ApplicationWindow {
     visible: true
     width: 1180
     height: 760
-    minimumWidth: 760
-    minimumHeight: 480
+    minimumWidth: root.transportUi().autosize ? 320 : 760
+    minimumHeight: root.transportUi().autosize ? appMenuBar.height + 220 : 480
     title: root.fileName(backend.session_path) + (backend.dirty ? " *" : "") + " — vibemix"
 
     property bool forceClose: false
@@ -19,6 +19,9 @@ ApplicationWindow {
     property string sessionError: ""
     // Mixer button whose keyboard binding is being captured, or null.
     property var midiKeyLearnSpec: null
+    // Column counts frozen while auto-fit is on (0 = not captured).
+    property int autoFitStripColumns: 0
+    property int autoFitBusColumns: 0
 
     Backend {
         id: backend
@@ -394,10 +397,23 @@ ApplicationWindow {
         var layout = root.layoutSettings()
         return kind === "strip" ? layout.strips_per_row : layout.buses_per_row
     }
-    function paneColumns(kind, availableWidth) {
+    function paneColumns(kind) {
+        var count = kind === "strip" ? mix.strips.length : mix.buses.length
         var fixed = root.layoutColumns(kind)
+        if (root.transportUi().autosize) {
+            // While auto-fit is on the window is sized to the content, so the
+            // column count must not depend on the pane width (that would be a
+            // binding loop). Use the fixed setting or the captured wrap, and
+            // never reserve empty columns.
+            var columns = fixed > 0
+                ? fixed
+                : (kind === "strip" ? root.autoFitStripColumns : root.autoFitBusColumns)
+            if (!columns || columns <= 0) columns = kind === "strip" ? 6 : 4
+            return Math.max(1, Math.min(Math.max(1, count), columns))
+        }
         if (fixed && fixed > 0) return Math.min(32, fixed)
         var card = kind === "strip" ? root.stripCardWidth : root.busCardWidth
+        var availableWidth = kind === "strip" ? stripsFlick.width : busesFlick.width
         return Math.max(1, Math.floor((availableWidth - 8 + 4) / (card + 4)))
     }
     function canAddStrip() {
@@ -409,22 +425,23 @@ ApplicationWindow {
         return !capacity || mix.buses.length < capacity
     }
     function autoFitWidth() {
-        var strips = root.layoutColumns("strip")
-        var buses = root.layoutColumns("bus")
-        if (strips <= 0) strips = 6
-        if (buses <= 0) buses = 4
-        return strips * (root.stripCardWidth + 4)
-            + buses * (root.busCardWidth + 4) + 48
+        var strips = Math.max(160, stripsGrid.implicitWidth + 12)
+        var buses = Math.max(140, busesGrid.implicitWidth + 12)
+        return Math.max(320, strips + buses + 12)
     }
     function autoFitHeight() {
-        var h = 0
-        if (stripsRepeater.count > 0 && stripsRepeater.itemAt(0)) {
-            h = Math.max(h, stripsRepeater.itemAt(0).height)
+        var strips = stripsGrid.implicitHeight + 24 + 10
+        var buses = busesGrid.implicitHeight + 24 + 10
+        return Math.max(220, Math.max(strips, buses))
+    }
+    function toggleAutoFit() {
+        var on = !root.transportUi().autosize
+        if (on) {
+            // Preserve the wrap the user is looking at.
+            root.autoFitStripColumns = Math.max(1, stripsGrid.columns)
+            root.autoFitBusColumns = Math.max(1, busesGrid.columns)
         }
-        if (busesRepeater.count > 0 && busesRepeater.itemAt(0)) {
-            h = Math.max(h, busesRepeater.itemAt(0).height)
-        }
-        return h + 48
+        root.setTransportUi({ autosize: on })
     }
     function gainText(gain) {
         if (gain <= 1.0e-4) return "-inf dB"
@@ -1094,7 +1111,7 @@ ApplicationWindow {
                 text: "Auto-fit window to content"
                 checkable: true
                 checked: root.transportUi().autosize
-                onTriggered: root.setTransportUi({ autosize: !root.transportUi().autosize })
+                onTriggered: root.toggleAutoFit()
             }
             MenuSeparator { }
             MenuItem {
@@ -4516,7 +4533,7 @@ ApplicationWindow {
         // ---- Strips ----
         Item {
             SplitView.fillWidth: true
-            SplitView.minimumWidth: 240
+            SplitView.minimumWidth: root.transportUi().autosize ? 120 : 240
 
             ColumnLayout {
                 anchors.fill: parent
@@ -4569,7 +4586,7 @@ ApplicationWindow {
                         id: stripsGrid
                         x: 4
                         y: 4
-                        columns: root.paneColumns("strip", stripsFlick.width)
+                        columns: root.paneColumns("strip")
                         columnSpacing: 4
                         rowSpacing: 4
 
@@ -4910,8 +4927,10 @@ ApplicationWindow {
 
         // ---- Buses ----
         Item {
-            SplitView.preferredWidth: Math.max(240, root.busCardWidth * 2 + 40)
-            SplitView.minimumWidth: 200
+            SplitView.preferredWidth: root.transportUi().autosize
+                ? Math.max(130, busesGrid.implicitWidth + 12)
+                : Math.max(240, root.busCardWidth * 2 + 40)
+            SplitView.minimumWidth: root.transportUi().autosize ? 120 : 200
 
             ColumnLayout {
                 anchors.fill: parent
@@ -4964,7 +4983,7 @@ ApplicationWindow {
                         id: busesGrid
                         x: 4
                         y: 4
-                        columns: root.paneColumns("bus", busesFlick.width)
+                        columns: root.paneColumns("bus")
                         columnSpacing: 4
                         rowSpacing: 4
 
