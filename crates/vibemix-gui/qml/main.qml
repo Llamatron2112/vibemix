@@ -247,50 +247,6 @@ ApplicationWindow {
             : (port.role.kind === "bus_out" ? "out" : "ret")
         return port.role.label + " " + kind + channel
     }
-    function vibemixSibling(port) {
-        if (!port || !port.role) return null
-        if (port.role.channel !== "l" && port.role.channel !== "r") return null
-        var other = port.role.channel === "l" ? "r" : "l"
-        var ports = root.portList()
-        for (var i = 0; i < ports.length; i++) {
-            var candidate = ports[i]
-            if (candidate.role
-                && candidate.role.kind === port.role.kind
-                && candidate.role.id === port.role.id
-                && candidate.role.channel === other) {
-                return candidate
-            }
-        }
-        return null
-    }
-    function pairedSource(port) {
-        var pairs = [
-            ["_1", "_2"], ["_2", "_1"],
-            ["_l", "_r"], ["_r", "_l"],
-            ["_L", "_R"], ["_R", "_L"],
-            ["left", "right"], ["right", "left"],
-            ["out1", "out2"], ["out2", "out1"]
-        ]
-        var name = port.short
-        var ports = root.portList()
-        for (var i = 0; i < pairs.length; i++) {
-            var from = pairs[i][0]
-            var to = pairs[i][1]
-            if (name.length >= from.length && name.slice(-from.length) === from) {
-                var target = name.slice(0, name.length - from.length) + to
-                for (var j = 0; j < ports.length; j++) {
-                    var candidate = ports[j]
-                    if (candidate.client === port.client
-                        && candidate.short === target
-                        && candidate.output === port.output
-                        && candidate.input === port.input) {
-                        return candidate
-                    }
-                }
-            }
-        }
-        return null
-    }
     function patchCanConnect(source, sink) {
         return (source.role !== undefined && source.role !== null)
             || (sink.role !== undefined && sink.role !== null)
@@ -324,13 +280,6 @@ ApplicationWindow {
     }
     function togglePortCell(source, sink, connect) {
         root.setPortConnection(source, sink, connect)
-        var sinkPair = root.vibemixSibling(sink)
-        var sourcePair = root.pairedSource(source)
-        if (patchWindow.linkPairs && sinkPair && sourcePair) {
-            root.setPortConnection(sourcePair, sinkPair, connect)
-        } else if (patchWindow.monoToBoth && sinkPair && !sourcePair) {
-            root.setPortConnection(source, sinkPair, connect)
-        }
         patchRefreshTimer.restart()
     }
     function ensurePatchClients() {
@@ -4018,8 +3967,6 @@ ApplicationWindow {
 
         property string sourceClient: ""
         property string sinkClient: ""
-        property bool linkPairs: true
-        property bool monoToBoth: false
         property bool onlyConnected: false
         property string hoverSource: ""
         property string hoverSink: ""
@@ -4061,16 +4008,6 @@ ApplicationWindow {
                     onActivated: (index) => patchWindow.sinkClient = root.portClients()[index]
                 }
                 Item { Layout.fillWidth: true }
-                FilterCheck {
-                    text: "Link L/R"
-                    checked: patchWindow.linkPairs
-                    onToggled: patchWindow.linkPairs = checked
-                }
-                FilterCheck {
-                    text: "Mono → L+R"
-                    checked: patchWindow.monoToBoth
-                    onToggled: patchWindow.monoToBoth = checked
-                }
                 FilterCheck {
                     text: "Only connected"
                     checked: patchWindow.onlyConnected
