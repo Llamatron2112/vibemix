@@ -1,0 +1,12 @@
+<services>
+  <!--
+    The release source tarball (Source0) must be committed/uploaded next to
+    this file. Generate it with packaging/opensuse/make-source-tarball.sh.
+  -->
+  <service name="cargo_vendor" mode="manual">
+    <param name="src">vibemix-1.0.2.tar.gz</param>
+    <param name="compression">zst</param>
+    <param name="update">false</param>
+    <param name="respect-lockfile">true</param>
+  </service>
+</services>
