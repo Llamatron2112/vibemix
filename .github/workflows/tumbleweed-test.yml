@@ -1,0 +1,93 @@
+name: Tumbleweed RPM test
+
+# Manual test build: produces a Tumbleweed RPM from the current code state and
+# uploads it as a workflow artifact. Not a release workflow (no tag/Release).
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+  NFPM_VERSION: v2.47.0
+  RUST_VERSION: "1.99.0"
+
+jobs:
+  tumbleweed:
+    runs-on: ubuntu-24.04
+    container: opensuse/tumbleweed
+    defaults:
+      run:
+        shell: bash
+    steps:
+      # The Tumbleweed image has no git, and actions/checkout needs it.
+      - name: Install fetch tools
+        run: |
+          zypper --non-interactive --gpg-auto-import-keys install \
+            git ca-certificates curl tar gzip
+
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install build dependencies
+        run: |
+          zypper --non-interactive --gpg-auto-import-keys install \
+            gcc-c++ cmake ninja pkgconf-pkg-config lld \
+            libX11-devel Mesa-libGL-devel libglvnd-devel \
+            qt6-base-devel qt6-declarative-devel \
+            lv2-devel lilv-devel serd-devel sord-devel sratom-devel suil-devel \
+            pipewire-jack-devel
+
+      - name: Install Rust
+        run: |
+          curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs \
+            | sh -s -- -y --profile minimal --default-toolchain "${RUST_VERSION}"
+          echo "$HOME/.cargo/bin" >> "$GITHUB_PATH"
+          echo "RUSTUP_TOOLCHAIN=${RUST_VERSION}" >> "$GITHUB_ENV"
+
+      - name: Build
+        env:
+          # openSUSE's qmake6 is under /usr/lib64/qt6/bin, not on PATH.
+          QMAKE: /usr/lib64/qt6/bin/qmake6
+        run: |
+          export PATH="/usr/lib64/qt6/bin:$PATH"
+          cargo build --release --locked --workspace
+
+      - name: Package (.rpm)
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          v="${NFPM_VERSION#v}"
+          curl -sSL -o nfpm.tar.gz \
+            "https://github.com/goreleaser/nfpm/releases/download/${NFPM_VERSION}/nfpm_${v}_Linux_x86_64.tar.gz"
+          tar xzf nfpm.tar.gz nfpm
+
+          export VIBEMIX_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          export PKG_RELEASE="1.tw.g${GITHUB_SHA:0:8}"
+          qt="$(rpm -q --qf '%{VERSION}' libQt6Core6)"
+          mm="$(echo "$qt" | grep -oE '^[0-9]+\.[0-9]+')"
+          major="${mm%%.*}"; minor="${mm##*.}"
+          export QT_MIN="$mm"
+          export QT_MAX="${major}.$((minor + 1))"
+          echo "vibemix ${VIBEMIX_VERSION}-${PKG_RELEASE}, Qt ${QT_MIN} -> ${QT_MAX}"
+          ./nfpm package -f packaging/nfpm-opensuse.yaml -p rpm -t dist/
+
+      - name: Verify .rpm
+        run: |
+          set -euo pipefail
+          zypper --non-interactive --no-gpg-checks install ./dist/vibemix-*.rpm
+          vibemix-gui --version
+          vibemix-engine --version
+          if ldd /usr/bin/vibemix-gui | grep -q "not found"; then
+            ldd /usr/bin/vibemix-gui
+            exit 1
+          fi
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vibemix-tumbleweed-rpm
+          path: dist/*.rpm
+          if-no-files-found: error

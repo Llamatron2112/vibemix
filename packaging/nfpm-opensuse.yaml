@@ -1,0 +1,72 @@
+# nfpm packaging for openSUSE Tumbleweed (test build).
+#
+# This is a snapshot build, not a stable repository: Tumbleweed is rolling, and
+# the binary is tied to the Qt minor it was built against. Once this proves out
+# the package should move to OBS, which rebuilds when Tumbleweed's Qt moves.
+#
+# nfpm expands ${VAR} from the environment:
+#   VIBEMIX_VERSION  the version (from Cargo.toml for the test build)
+#   PKG_RELEASE      the package release (e.g. 1.tw.gabc1234)
+#   QT_MIN, QT_MAX   the Qt series to require, from the build container
+name: vibemix
+arch: amd64
+platform: linux
+version: ${VIBEMIX_VERSION}
+release: ${PKG_RELEASE}
+section: sound
+priority: optional
+maintainer: "Llamatron2112 <llamatron23@proton.me>"
+vendor: vibemix
+homepage: https://github.com/Llamatron2112/vibemix
+license: MIT OR Apache-2.0
+description: |
+  Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire.
+  A real-time audio engine (JACK/PipeWire) plus a Qt Quick control surface.
+contents:
+  - src: target/release/vibemix-engine
+    dst: /usr/bin/vibemix-engine
+    file_info:
+      mode: 0755
+  - src: target/release/vibemix-gui
+    dst: /usr/bin/vibemix-gui
+    file_info:
+      mode: 0755
+  - src: packaging/vibemix
+    dst: /usr/bin/vibemix
+    file_info:
+      mode: 0755
+  - src: packaging/vibemix.desktop
+    dst: /usr/share/applications/vibemix.desktop
+  - src: packaging/vibemix.svg
+    dst: /usr/share/icons/hicolor/scalable/apps/vibemix.svg
+  - src: LICENSE-MIT
+    dst: /usr/share/licenses/vibemix/LICENSE-MIT
+  - src: LICENSE-APACHE
+    dst: /usr/share/licenses/vibemix/LICENSE-APACHE
+
+# Same Qt floor/ceiling reasoning as packaging/nfpm.yaml: the AOT-compiled QML
+# uses Qt private API, which is only valid for the Qt minor it was built with.
+overrides:
+  rpm:
+    depends:
+      - glibc
+      - libstdc++6
+      - libX11-6
+      - libglvnd
+      - liblilv-0-0
+      - libsuil-0-0
+      - pipewire-jack
+      - libQt6Core6 >= ${QT_MIN}
+      - libQt6Core6 < ${QT_MAX}
+      - libQt6Gui6 >= ${QT_MIN}
+      - libQt6Gui6 < ${QT_MAX}
+      - libQt6Qml6 >= ${QT_MIN}
+      - libQt6Qml6 < ${QT_MAX}
+      - libQt6DBus6 >= ${QT_MIN}
+      - libQt6DBus6 < ${QT_MAX}
+      - libQt6Network6 >= ${QT_MIN}
+      - libQt6Network6 < ${QT_MAX}
+      # QML modules (QtQuick.Controls/Layouts/Dialogs/Window).
+      - qt6-declarative-imports
+    recommends:
+      - gtk3
