@@ -4,6 +4,35 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.2] - 2026-10-22
+
+### Added
+
+- In-app **patchbay** (`Options → Patchbay…`): a source × sink matrix over the
+  JACK port graph, with a device picker per axis, hover crosshair, cell
+  tooltips and level squares on vibemix ports. Connections are queried and
+  edited over the control protocol; each cell is one source → sink connection.
+- **MIDI input** picker (`Options → MIDI input…`) for the single `midi_in`
+  port.
+- Mixer **layout**: strips and buses live in side-by-side, independently
+  scrolling panes that wrap their cards into rows. `Options → Layout…` chooses
+  Auto or a fixed 1–12 cards per row, saved with the session.
+- Strip/bus capacity defaults raised to **64 / 32** (`--strips`/`--buses`
+  still override); Add is disabled at the limit and the panes show usage.
+- Auto-fit now sizes the window tightly to the actual content and preserves the
+  wrap that was active when enabled.
+
+### Changed
+
+- Bus cards match the strip card height so the panes align.
+- Drag-to-reorder works across wrapped rows (2D drop index).
+- Removed the experimental L/R pairing helpers from the patchbay.
+
+### Packaging
+
+- Added a manually triggered openSUSE Tumbleweed RPM test build (snapshot
+  artifact; OBS is the planned release channel for Tumbleweed).
+
 ## [1.0.1] - 2026-10-11
 
 ### Fixed
@@ -50,5 +79,6 @@ First release.
   (Fedora 43) and binary tarballs attached to each release with SHA-256
   checksums.
 
+[1.0.2]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.2
 [1.0.1]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.0

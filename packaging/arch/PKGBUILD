@@ -9,7 +9,7 @@
 # qt6-quickcontrols2 package on Arch)
 
 pkgname=vibemix-git
-pkgver=1.0.1
+pkgver=1.0.2
 pkgrel=1
 pkgdesc="Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire (real-time engine + Qt Quick GUI)"
 arch=('x86_64')
