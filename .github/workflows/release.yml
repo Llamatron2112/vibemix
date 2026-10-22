@@ -47,6 +47,25 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
+      # Source tarball for the release and for the OBS package. It includes the
+      # vendored VST3/CLAP submodules but not the cargo crates (the OBS
+      # cargo_vendor service produces those).
+      - name: Source tarball
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          stage="vibemix-${version}"
+          mkdir -p "dist/${stage}"
+          tar -cf - --exclude=.git --exclude=target --exclude=dist . \
+            | tar -xf - -C "dist/${stage}"
+          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: source
+          path: dist/*.tar.gz
+          if-no-files-found: error
+
   # One .deb per Debian release, built against that release's Qt (see the note
   # on the Qt version lock in packaging/nfpm.yaml).
   deb:
@@ -251,7 +270,7 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum *.deb *.rpm > sha256sums.txt
+          sha256sum *.deb *.rpm *.tar.gz > sha256sums.txt
           cat sha256sums.txt
 
       - name: Release notes
@@ -272,4 +291,5 @@ jobs:
           files: |
             dist/*.deb
             dist/*.rpm
+            dist/*.tar.gz
             dist/sha256sums.txt
