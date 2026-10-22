@@ -21,7 +21,12 @@ env:
 jobs:
   tumbleweed:
     runs-on: ubuntu-24.04
-    container: opensuse/tumbleweed
+    container:
+      image: opensuse/tumbleweed
+      # The image has no PATH in its config, so the runtime can't resolve the
+      # step shell when exec'ing; set it on the container, not just the steps.
+      env:
+        PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
     defaults:
       run:
         shell: sh
