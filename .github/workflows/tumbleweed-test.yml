@@ -13,6 +13,10 @@ env:
   RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
   NFPM_VERSION: v2.47.0
   RUST_VERSION: "1.99.0"
+  # The opensuse/tumbleweed image has no PATH in its config; without this the
+  # runner's GITHUB_PATH handling leaves only the cargo bin on PATH and even sh
+  # can't be found.
+  PATH: /usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sbin:/bin
 
 jobs:
   tumbleweed:
