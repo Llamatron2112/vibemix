@@ -20,7 +20,7 @@ jobs:
     container: opensuse/tumbleweed
     defaults:
       run:
-        shell: bash
+        shell: sh
     steps:
       # The Tumbleweed image has no git, and actions/checkout needs it.
       - name: Install fetch tools
@@ -62,7 +62,7 @@ jobs:
 
       - name: Package (.rpm)
         run: |
-          set -euo pipefail
+          set -eu
           mkdir -p dist
           v="${NFPM_VERSION#v}"
           curl -sSL -o nfpm.tar.gz \
@@ -70,7 +70,8 @@ jobs:
           tar xzf nfpm.tar.gz nfpm
 
           export VIBEMIX_VERSION="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-          export PKG_RELEASE="1.tw.g${GITHUB_SHA:0:8}"
+          sha="$(echo "$GITHUB_SHA" | cut -c1-8)"
+          export PKG_RELEASE="1.tw.g${sha}"
           qt="$(rpm -q --qf '%{VERSION}' libQt6Core6)"
           mm="$(echo "$qt" | grep -oE '^[0-9]+\.[0-9]+')"
           major="${mm%%.*}"; minor="${mm##*.}"
@@ -81,7 +82,7 @@ jobs:
 
       - name: Verify .rpm
         run: |
-          set -euo pipefail
+          set -eu
           zypper --non-interactive --no-gpg-checks install ./dist/vibemix-*.rpm
           vibemix-gui --version
           vibemix-engine --version
