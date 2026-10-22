@@ -4,11 +4,11 @@ use std::path::PathBuf;
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let include = manifest.join("../../vendor/clap/include");
+    let include = manifest.join("../../third_party/clap/include");
     let include = include.canonicalize().unwrap_or(include);
     assert!(
         include.join("clap/clap.h").is_file(),
-        "CLAP headers missing at {}; run `git submodule update --init --recursive vendor/clap`",
+        "CLAP headers missing at {}; run `git submodule update --init --recursive third_party/clap`",
         include.display()
     );
 

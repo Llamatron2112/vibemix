@@ -1,6 +1,6 @@
 // CLAP host shim.
 //
-// Wraps the CLAP C ABI (vendored under vendor/clap) behind a small, flat C
+// Wraps the CLAP C ABI (vendored under third_party/clap) behind a small, flat C
 // interface that `host.rs` mirrors, the same way `vibemix-vst3` wraps the VST3
 // SDK. Covers audio-effect hosting: discovery, instancing, audio I/O (main bus
 // plus an optional sidechain input), parameters, state, latency, transport and

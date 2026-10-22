@@ -97,12 +97,12 @@ fn sdk_hosting(sdk: &Path) -> Vec<PathBuf> {
 
 fn main() {
     let manifest = PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
-    let sdk = manifest.join("../../vendor/vst3sdk");
+    let sdk = manifest.join("../../third_party/vst3sdk");
     let sdk = sdk.canonicalize().unwrap_or(sdk);
     let out = PathBuf::from(std::env::var("OUT_DIR").unwrap());
     assert!(
         sdk.join("public.sdk").is_dir(),
-        "VST3 SDK submodule missing at {}; run `git submodule update --init --recursive vendor/vst3sdk`",
+        "VST3 SDK submodule missing at {}; run `git submodule update --init --recursive third_party/vst3sdk`",
         sdk.display()
     );
 

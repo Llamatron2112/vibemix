@@ -219,9 +219,9 @@ Two SDKs are vendored; fetch both, including nested submodules:
 git submodule update --init --recursive
 ```
 
-- `vendor/vst3sdk` provides the Steinberg VST3 SDK used by `vibemix-vst3`. It is
+- `third_party/vst3sdk` provides the Steinberg VST3 SDK used by `vibemix-vst3`. It is
   **MIT-licensed** (since SDK 3.8; we vendor 3.8.1), so it does not change the
   project license. The crate's `build.rs` compiles only the hosting subset it
   needs (no CMake) and builds a small test effect for its tests.
-- `vendor/clap` provides the CLAP headers used by `vibemix-clap`. CLAP is
+- `third_party/clap` provides the CLAP headers used by `vibemix-clap`. CLAP is
   **MIT-licensed**; the shim is header-only and compiled by `build.rs`.

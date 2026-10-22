@@ -21,6 +21,8 @@ Source1:        vendor.tar.zst
 
 BuildRequires:  cargo
 BuildRequires:  rust
+BuildRequires:  zstd
+BuildRequires:  hicolor-icon-theme
 BuildRequires:  gcc-c++
 BuildRequires:  cmake
 BuildRequires:  ninja
@@ -60,6 +62,7 @@ Requires:       libsuil-0-0
 Requires:       suil-plugin-x11
 Requires:       pipewire-libjack-0_3
 Requires:       pipewire-jack
+Requires:       hicolor-icon-theme
 Recommends:     gtk3
 Recommends:     suil-plugin-x11-in-gtk3
 
