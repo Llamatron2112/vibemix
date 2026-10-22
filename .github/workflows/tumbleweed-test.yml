@@ -37,9 +37,12 @@ jobs:
           zypper --non-interactive --gpg-auto-import-keys install \
             gcc-c++ cmake ninja pkgconf-pkg-config lld \
             libX11-devel Mesa-libGL-devel libglvnd-devel \
-            qt6-base-devel qt6-declarative-devel \
-            lv2-devel lilv-devel serd-devel sord-devel sratom-devel suil-devel \
-            pipewire-jack-devel
+            qt6-base-common-devel qt6-core-devel qt6-gui-devel qt6-dbus-devel \
+            qt6-network-devel qt6-qml-devel qt6-quick-devel \
+            qt6-quickcontrols2-devel qt6-quickdialogs2-devel \
+            qt6-declarative-tools qt6-declarative-imports \
+            lv2-devel liblilv-0-devel serd-devel sord-devel sratom-devel suil-devel \
+            pipewire-libjack-0_3-devel
 
       - name: Install Rust
         run: |
@@ -50,10 +53,11 @@ jobs:
 
       - name: Build
         env:
-          # openSUSE's qmake6 is under /usr/lib64/qt6/bin, not on PATH.
-          QMAKE: /usr/lib64/qt6/bin/qmake6
+          # openSUSE's qmake6 is at /usr/bin/qmake6 (qt6-base-common-devel);
+          # the QML tools live in /usr/libexec/qt6 and /usr/lib64/qt6/bin.
+          QMAKE: /usr/bin/qmake6
         run: |
-          export PATH="/usr/lib64/qt6/bin:$PATH"
+          export PATH="/usr/libexec/qt6:/usr/lib64/qt6/bin:$PATH"
           cargo build --release --locked --workspace
 
       - name: Package (.rpm)

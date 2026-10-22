@@ -55,6 +55,8 @@ overrides:
       - libglvnd
       - liblilv-0-0
       - libsuil-0-0
+      - suil-plugin-x11
+      - pipewire-libjack-0_3
       - pipewire-jack
       - libQt6Core6 >= ${QT_MIN}
       - libQt6Core6 < ${QT_MAX}
@@ -70,3 +72,4 @@ overrides:
       - qt6-declarative-imports
     recommends:
       - gtk3
+      - suil-plugin-x11-in-gtk3
