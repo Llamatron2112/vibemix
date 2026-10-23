@@ -48,8 +48,8 @@ jobs:
         run: cargo test --workspace
 
       # Source tarball for the release and for the OBS package. It includes the
-      # vendored VST3/CLAP submodules but not the cargo crates (the OBS
-      # cargo_vendor service produces those).
+      # VST3/CLAP submodules but not the cargo crates (see
+      # packaging/opensuse/make-vendor-tarball.sh).
       - name: Source tarball
         run: |
           set -euo pipefail

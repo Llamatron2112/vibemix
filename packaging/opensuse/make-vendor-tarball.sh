@@ -1,9 +1,8 @@
 #!/usr/bin/env bash
 # Build the offline cargo vendor tarball for the OBS package: vendor.tar.zst.
 #
-# Replaces the cargo_vendor source service for local builds. It runs `cargo
-# vendor` against the source tarball produced by make-source-tarball.sh, in a
-# scratch copy, so the repository is never touched.
+# Runs `cargo vendor` against the source tarball produced by
+# make-source-tarball.sh, in a scratch copy, so the repository is never touched.
 #
 # The archive holds vendor/ (the crates) and .cargo/config.toml, which the spec
 # unpacks next to the source with `%autosetup -a1`.

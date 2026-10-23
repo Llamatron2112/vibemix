@@ -1,75 +1,56 @@
 # openSUSE Tumbleweed package (OBS)
 
-This directory holds the OBS package for Tumbleweed. OBS builds offline, so the
-package is built from:
+OBS builds offline, so the package takes two tarballs next to the spec:
 
-- `vibemix-<version>.tar.gz` — the source tree including the VST3 SDK and CLAP
-  submodules under `third_party/` (no cargo crates);
-- `vendor.tar.zst` — the cargo crates in `vendor/` plus `.cargo/config.toml`,
-  produced by `make-vendor-tarball.sh` (or by the `cargo_vendor` source service).
+- `vibemix-<version>.tar.gz`: the source tree with the VST3 SDK and CLAP
+  submodules, from `make-source-tarball.sh <tag>`.
+- `vendor.tar.zst`: the cargo crates in `vendor/` plus `.cargo/config.toml`,
+  from `make-vendor-tarball.sh <version>`.
 
-The spec uses `%autosetup -a1`, which unpacks the vendor tarball next to the
-source. The binary is tied to Tumbleweed's Qt minor; OBS rebuilds the package
-when Qt changes, so it stays in sync.
+The spec unpacks both with `%autosetup -a1`. The binary is tied to Tumbleweed's
+Qt minor; OBS rebuilds the package when Qt changes, so it stays in sync.
+
+The 1.0.2 tag predates the move of the submodules to `third_party/`, so its
+tarball keeps the `vendor/` submodule layout. Later releases use `third_party/`.
 
 ## One-time setup
 
-Install the local tools (Tumbleweed):
-
 ```bash
-sudo zypper install osc obs-service-cargo
-```
-
-Create a project/package (or use an existing one), e.g.:
-
-```bash
+sudo zypper install osc
 osc meta prj home:USERNAME -e        # add <repository name="openSUSE_Tumbleweed"/> etc.
 osc checkout home:USERNAME/vibemix
 ```
 
 ## Each release
 
-1. Bump the version in `Cargo.toml` and update `Version:` in `vibemix.spec`,
-   `src` in `_service`, and add a `vibemix.changes` entry.
-2. Generate the source tarball and the vendor tarball:
+1. Bump the version in `Cargo.toml` and `Version:` in `vibemix.spec`, and add a
+   `vibemix.changes` entry.
+2. Tag the release (`vX.Y.Z`) and push it. The release workflow attaches
+   `vibemix-X.Y.Z.tar.gz` to the GitHub Release.
+3. Build the tarballs from the tag:
    ```bash
-   packaging/opensuse/make-source-tarball.sh
-   # -> dist/vibemix-<version>.tar.gz
-   packaging/opensuse/make-vendor-tarball.sh
-   # -> dist/vendor.tar.zst
+   packaging/opensuse/make-source-tarball.sh vX.Y.Z
+   packaging/opensuse/make-vendor-tarball.sh X.Y.Z
+   # -> dist/vibemix-X.Y.Z.tar.gz, dist/vendor.tar.zst
    ```
-3. Test a local build from the OBS checkout, which skips the local source
-   services:
+4. Test a local build in the OBS checkout (`osc build` needs `sudo`, so run it in
+   an interactive terminal):
    ```bash
-   cp dist/vibemix-<version>.tar.gz dist/vendor.tar.zst vibemix.spec vibemix.changes ~/obs/home:USERNAME/vibemix/
-   osc build --no-service openSUSE_Tumbleweed x86_64
+   cp dist/vibemix-X.Y.Z.tar.gz dist/vendor.tar.zst vibemix.spec vibemix.changes ~/obs/home:USERNAME/vibemix/
+   osc build openSUSE_Tumbleweed x86_64
    ```
-   `osc build` needs `sudo`, so run it in an interactive terminal.
-4. Copy `vibemix.spec`, `vibemix.changes`, `_service` and the tarballs into the
-   OBS checkout, then:
+5. Commit the package:
    ```bash
-   osc add vibemix-<version>.tar.gz vibemix.spec vibemix.changes _service vendor.tar.zst
-   osc commit -m "Update to <version>"
+   osc add vibemix-X.Y.Z.tar.gz vendor.tar.zst vibemix.spec vibemix.changes
+   osc commit -m "Update to X.Y.Z"
    ```
-5. OBS builds for Tumbleweed. When Swift/Qt or the Rust toolchain changes, OBS
-   schedules a rebuild automatically.
-
-From the next tag, the release workflow also attaches
-`vibemix-<version>.tar.gz` to the GitHub Release, so `_service` can use
-`download_files` instead of uploading the tarball by hand:
-
-```xml
-<service name="download_files" mode="manual">
-  <param name="url">https://github.com/Llamatron2112/vibemix/releases/download/v<version>/vibemix-<version>.tar.gz</param>
-</service>
-```
+6. OBS builds for Tumbleweed. It schedules a rebuild automatically when Qt or
+   the Rust toolchain changes.
 
 ## Notes
 
-- `vendor.tar.zst` is built locally with `make-vendor-tarball.sh`, and committed to
-  OBS. `_service` still defines `cargo_vendor` in `manual` mode, so it is not run
-  on commit; that is why the vendor archive is committed directly.
-- The `zstd` build requirement is needed to unpack `vendor.tar.zst` in `%prep`.
-- `_service` and the source tarball must use the same version string.
-- The runtime dependencies list the Qt 6.12 floor; OBS rebuilds against newer
-  Qt minors, so the floor does not need bumping on every Tumbleweed update.
+- `vendor.tar.zst` must be rebuilt whenever `Cargo.lock` changes.
+- The build needs `zstd` (`BuildRequires`), and `make-vendor-tarball.sh` needs it
+  locally.
+- The runtime dependencies list the Qt 6.12 floor. OBS rebuilds against newer Qt
+  minors, so the floor does not need bumping on every Tumbleweed update.
