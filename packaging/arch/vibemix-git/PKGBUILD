@@ -1,0 +1,112 @@
+# Maintainer: vibemix maintainers
+#
+# VCS package built from the upstream git history on `main`.
+#
+# Build:  makepkg -sf        Install: makepkg -sif
+# Deps (all in [extra]): git, rust, cmake, ninja, pkgconf, gcc, lld, libglvnd,
+# libx11, lv2, lilv, serd, sord, sratom, suil, jack, qt6-base,
+# qt6-declarative (Qt Quick Controls 2 ships inside it; there is no
+# qt6-quickcontrols2 package on Arch)
+
+pkgname=vibemix-git
+pkgver=1.0.2
+pkgrel=1
+pkgdesc="Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire (real-time engine + Qt Quick GUI)"
+arch=('x86_64')
+url="https://github.com/Llamatron2112/vibemix"
+license=('MIT' 'Apache')
+depends=(
+  'glibc'
+  'gcc-libs'
+  'libx11'
+  'libglvnd'
+  'lilv'
+  'suil'
+  'jack'
+  'qt6-base'
+  'qt6-declarative'
+)
+# GTK is dlopen()ed at runtime to host GTK2/GTK3 LV2 plugin UIs (e.g. Calf);
+# optional so the package installs without either toolkit.
+optdepends=(
+  'gtk3: host GTK3 plugin UIs'
+  'gtk2: host GTK2 plugin UIs'
+)
+makedepends=(
+  'git'
+  'rust'
+  'cmake'
+  'ninja'
+  'pkgconf'
+  'gcc'
+  'lld'
+  'libglvnd'
+  'libx11'
+  'lv2'
+  'lilv'
+  'serd'
+  'sord'
+  'sratom'
+  'suil'
+  'jack'
+  'qt6-base'
+  'qt6-declarative'
+)
+provides=(
+  'vibemix'
+  'vst3-host'
+  'clap-host'
+  'lv2-host'
+)
+conflicts=('vibemix')
+source=("$pkgname::git+https://github.com/Llamatron2112/vibemix.git")
+sha256sums=('SKIP')
+
+pkgver() {
+  cd "$pkgname"
+  git describe --long --tags --always 2>/dev/null \
+    | sed 's/^v//; s/\([^-]*-g\)/r\1/; s/-/./g' \
+    || echo "$pkgver"
+}
+
+prepare() {
+  cd "$pkgname"
+
+  # makepkg clones the superproject but not its submodules. `vibemix-vst3`
+  # needs the vendored VST3 SDK, which is a submodule with nested submodules
+  # (base, pluginterfaces, public.sdk, ...); fetch them all.
+  git submodule update --init --recursive
+}
+
+build() {
+  cd "$pkgname"
+
+  # cxx-qt-build locates Qt through qmake; Arch ships it as qmake6.
+  # (The repo's checked-out .cargo/config.toml points at a Fedora path and is
+  # untracked, so it is not present in the cloned source.)
+  export QMAKE=/usr/bin/qmake6
+  export QT_VERSION_MAJOR=6
+
+  # Qt's Cargo link step fails with the default ld.bfd; use lld.
+  # Remap the build dir so no $srcdir paths end up embedded in the binaries.
+  export RUSTFLAGS="-C link-arg=-fuse-ld=lld \
+--remap-path-prefix=$srcdir=/usr/src/$pkgname ${RUSTFLAGS:-}"
+
+  cargo build --release --locked --workspace
+}
+
+package() {
+  cd "$pkgname"
+
+  install -Dm755 target/release/vibemix-engine "$pkgdir/usr/bin/vibemix-engine"
+  install -Dm755 target/release/vibemix-gui "$pkgdir/usr/bin/vibemix-gui"
+  install -Dm755 packaging/vibemix "$pkgdir/usr/bin/vibemix"
+
+  install -Dm644 packaging/vibemix.desktop \
+    "$pkgdir/usr/share/applications/vibemix.desktop"
+  install -Dm644 packaging/vibemix.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/vibemix.svg"
+
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}

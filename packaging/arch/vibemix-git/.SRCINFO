@@ -40,7 +40,7 @@ pkgbase = vibemix-git
 	provides = clap-host
 	provides = lv2-host
 	conflicts = vibemix
-	source = vibemix-git::git+https://github.com/Llamatron2112/vibemix.git#tag=v1.0.2
+	source = vibemix-git::git+https://github.com/Llamatron2112/vibemix.git
 	sha256sums = SKIP
 
 pkgname = vibemix-git

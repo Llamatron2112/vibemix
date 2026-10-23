@@ -1,15 +1,13 @@
 # Maintainer: vibemix maintainers
 #
-# Git package pinned to the v1.0.2 tag. For a newer release, change the tag in
-# `source` and the pkgver.
+# Release package built from the vibemix-1.0.2 source tarball (GitHub release
+# asset). The tarball includes the VST3 SDK and CLAP submodules but not the
+# cargo crates, which prepare() fetches from Cargo.lock.
 #
 # Build:  makepkg -sf        Install: makepkg -sif
-# Deps (all in [extra]): git, rust, cmake, ninja, pkgconf, gcc, lld, libglvnd,
-# libx11, lv2, lilv, serd, sord, sratom, suil, jack, qt6-base,
-# qt6-declarative (Qt Quick Controls 2 ships inside it; there is no
-# qt6-quickcontrols2 package on Arch)
+# Deps: see vibemix-git (the same libraries and tools apply).
 
-pkgname=vibemix-git
+pkgname=vibemix
 pkgver=1.0.2
 pkgrel=1
 pkgdesc="Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire (real-time engine + Qt Quick GUI)"
@@ -34,7 +32,6 @@ optdepends=(
   'gtk2: host GTK2 plugin UIs'
 )
 makedepends=(
-  'git'
   'rust'
   'cmake'
   'ninja'
@@ -59,32 +56,21 @@ provides=(
   'clap-host'
   'lv2-host'
 )
-conflicts=('vibemix')
-source=("$pkgname::git+https://github.com/Llamatron2112/vibemix.git#tag=v1.0.2")
-sha256sums=('SKIP')
-
-pkgver() {
-  cd "$pkgname"
-  git describe --long --tags --always 2>/dev/null \
-    | sed 's/^v//; s/\([^-]*-g\)/r\1/; s/-/./g' \
-    || echo "$pkgver"
-}
+conflicts=('vibemix-git')
+source=("vibemix-$pkgver.tar.gz::https://github.com/Llamatron2112/vibemix/releases/download/v$pkgver/vibemix-$pkgver.tar.gz")
+sha256sums=('49d4a2597266de4cf37306c0981945f227d7a91d5e7d5f63db7da25128d40079')
 
 prepare() {
-  cd "$pkgname"
+  cd "$pkgname-$pkgver"
 
-  # makepkg clones the superproject but not its submodules. `vibemix-vst3`
-  # needs the vendored VST3 SDK, which is a submodule with nested submodules
-  # (base, pluginterfaces, public.sdk, ...); fetch them all.
-  git submodule update --init --recursive
+  # The tarball has no crates; fetch the exact versions from Cargo.lock.
+  cargo fetch --locked
 }
 
 build() {
-  cd "$pkgname"
+  cd "$pkgname-$pkgver"
 
   # cxx-qt-build locates Qt through qmake; Arch ships it as qmake6.
-  # (The repo's checked-out .cargo/config.toml points at a Fedora path and is
-  # untracked, so it is not present in the cloned source.)
   export QMAKE=/usr/bin/qmake6
   export QT_VERSION_MAJOR=6
 
@@ -97,7 +83,7 @@ build() {
 }
 
 package() {
-  cd "$pkgname"
+  cd "$pkgname-$pkgver"
 
   install -Dm755 target/release/vibemix-engine "$pkgdir/usr/bin/vibemix-engine"
   install -Dm755 target/release/vibemix-gui "$pkgdir/usr/bin/vibemix-gui"

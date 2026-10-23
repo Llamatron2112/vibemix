@@ -107,8 +107,9 @@ engine for the session, then the GUI), a `.desktop` entry and an icon.
 
 1. Bump `[workspace.package] version` in `Cargo.toml`.
 2. Refresh the lockfile (`cargo build`, or `cargo metadata`).
-3. Update `packaging/arch/PKGBUILD` `pkgver` and regenerate `.SRCINFO`:
-   `(cd packaging/arch && makepkg --printsrcinfo > .SRCINFO)`.
+3. Update `pkgver`, `sha256sums` (of the release tarball) and regenerate `.SRCINFO` in
+   `packaging/arch/vibemix/`: `(cd packaging/arch/vibemix && makepkg --printsrcinfo > .SRCINFO)`.
+   `packaging/arch/vibemix-git/` tracks `main` and needs no bump.
 4. Add a `CHANGELOG.md` entry.
 5. Commit, tag and push:
 
