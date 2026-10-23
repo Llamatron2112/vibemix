@@ -1,6 +1,7 @@
 # Maintainer: vibemix maintainers
 #
-# VCS package built from the upstream git history on `main`.
+# Git package pinned to the v1.0.2 tag. For a newer release, change the tag in
+# `source` and the pkgver.
 #
 # Build:  makepkg -sf        Install: makepkg -sif
 # Deps (all in [extra]): git, rust, cmake, ninja, pkgconf, gcc, lld, libglvnd,
@@ -59,7 +60,7 @@ provides=(
   'lv2-host'
 )
 conflicts=('vibemix')
-source=("$pkgname::git+https://github.com/Llamatron2112/vibemix.git")
+source=("$pkgname::git+https://github.com/Llamatron2112/vibemix.git#tag=v1.0.2")
 sha256sums=('SKIP')
 
 pkgver() {
