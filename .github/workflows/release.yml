@@ -270,7 +270,8 @@ jobs:
         run: |
           set -euo pipefail
           cd dist
-          sha256sum *.deb *.rpm *.tar.gz > sha256sums.txt
+          # GitHub stores "~" in asset names as "."; list the names as published.
+          sha256sum *.deb *.rpm *.tar.gz | sed 's/~/./g' > sha256sums.txt
           cat sha256sums.txt
 
       - name: Release notes
