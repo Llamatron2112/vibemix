@@ -29,7 +29,7 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends \
-            build-essential cmake ninja-build pkg-config lld \
+            build-essential cmake ninja-build pkg-config lld zstd \
             qt6-base-dev qt6-declarative-dev \
             libx11-dev libgl-dev \
             lv2-dev liblilv-dev libserd-dev libsord-dev libsratom-dev libsuil-dev \
@@ -47,23 +47,28 @@ jobs:
       - name: Test
         run: cargo test --workspace
 
-      # Source tarball for the release and for the OBS package. It includes the
-      # VST3/CLAP submodules but not the cargo crates (see
-      # packaging/opensuse/make-vendor-tarball.sh).
+      # Release assets. Source0 is the tree with the VST3/CLAP submodules;
+      # Source1 is the cargo vendor archive (COPR and OBS build offline).
       - name: Source tarball
-        run: |
-          set -euo pipefail
-          version="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
-          stage="vibemix-${version}"
-          mkdir -p "dist/${stage}"
-          tar -cf - --exclude=.git --exclude=target --exclude=dist . \
-            | tar -xf - -C "dist/${stage}"
-          tar -C dist -czf "dist/${stage}.tar.gz" "${stage}"
+        run: packaging/opensuse/make-source-tarball.sh
 
       - uses: actions/upload-artifact@v7
         with:
           name: source
           path: dist/*.tar.gz
+          if-no-files-found: error
+
+      - name: Vendor tarball
+        run: |
+          set -euo pipefail
+          version="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+          packaging/opensuse/make-vendor-tarball.sh "$version"
+          mv dist/vendor.tar.zst "dist/vendor-${version}.tar.zst"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: vendor
+          path: dist/vendor-*.tar.zst
           if-no-files-found: error
 
   # One .deb per Debian release, built against that release's Qt (see the note
@@ -271,7 +276,7 @@ jobs:
           set -euo pipefail
           cd dist
           # GitHub stores "~" in asset names as "."; list the names as published.
-          sha256sum *.deb *.rpm *.tar.gz | sed 's/~/./g' > sha256sums.txt
+          sha256sum *.deb *.rpm *.tar.gz *.tar.zst | sed 's/~/./g' > sha256sums.txt
           cat sha256sums.txt
 
       - name: Release notes
@@ -293,4 +298,5 @@ jobs:
             dist/*.deb
             dist/*.rpm
             dist/*.tar.gz
+            dist/*.tar.zst
             dist/sha256sums.txt

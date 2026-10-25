@@ -110,8 +110,9 @@ engine for the session, then the GUI), a `.desktop` entry and an icon.
 3. Update `pkgver`, `sha256sums` (of the release tarball) and regenerate `.SRCINFO` in
    `packaging/arch/vibemix/`: `(cd packaging/arch/vibemix && makepkg --printsrcinfo > .SRCINFO)`.
    `packaging/arch/vibemix-git/` tracks `main` and needs no bump.
-4. Add a `CHANGELOG.md` entry.
-5. Commit, tag and push:
+4. Update `Version:` and add a `%changelog` entry in `packaging/fedora/vibemix.spec`.
+5. Add a `CHANGELOG.md` entry.
+6. Commit, tag and push:
 
    ```bash
    git commit -am "release: vX.Y.Z"
@@ -120,11 +121,11 @@ engine for the session, then the GUI), a `.desktop` entry and an icon.
    git push origin vX.Y.Z
    ```
 
-6. The `Release` workflow gates on tests, then builds and verifies one package
+7. The `Release` workflow gates on tests, then builds and verifies one package
    per distro release — `.deb` for Debian 12/13 and `.rpm` for Fedora 43/44 —
    each against that release's Qt, and publishes them with SHA-256 checksums.
-   (The packages are tied to the exact Qt minor, so each distro release gets its
-   own build.)
+   It also attaches the source tarball and the cargo vendor archive that the
+   COPR and OBS specs build from.
 
 ## License
 
