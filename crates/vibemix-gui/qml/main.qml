@@ -5702,8 +5702,8 @@ ApplicationWindow {
             var slot = currentSlot()
             var frames = slot && slot.frames ? slot.frames : 1
             var minSpan = Math.min(frames, 16)
-            var span = Math.max(minSpan, Math.min(frames, end - start))
-            var s = Math.max(0, Math.min(frames - span, start))
+            var span = Math.max(minSpan, Math.min(frames, Math.round(end - start)))
+            var s = Math.max(0, Math.min(frames - span, Math.round(start)))
             return { start: s, end: s + span }
         }
         function requestWaveform(nudge, clearPeaks) {
@@ -5714,8 +5714,8 @@ ApplicationWindow {
                 viewEnd = slot.frames
             }
             var view = clampView(viewStart, viewEnd)
-            viewStart = view.start
-            viewEnd = view.end
+            viewStart = Math.round(view.start)
+            viewEnd = Math.round(view.end)
             waveSeq += 1
             if (clearPeaks) {
                 editorPeaks = []
@@ -5765,11 +5765,12 @@ ApplicationWindow {
             if (!slot) return
             var frames = Math.max(1, slot.frames)
             var minSpan = Math.min(frames, 16)
-            var next = Math.max(minSpan, Math.min(frames, span))
+            var next = Math.max(minSpan, Math.min(frames, Math.round(span)))
             var anchor = Math.max(0, Math.min(frames, anchorFrame))
             var start = Math.max(0, Math.min(frames - next, anchor - next * 0.5))
-            viewStart = start
-            viewEnd = start + next
+            var view = clampView(start, start + next)
+            viewStart = view.start
+            viewEnd = view.end
             requestWaveform(null, true)
             ruler.requestPaint()
         }
