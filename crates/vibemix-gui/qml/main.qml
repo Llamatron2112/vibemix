@@ -1189,6 +1189,17 @@ ApplicationWindow {
             }
             MenuSeparator { }
             MenuItem {
+                text: "Recorder…"
+                enabled: backend.connected
+                onTriggered: root.openRecorder()
+            }
+            MenuItem {
+                text: "Loops…"
+                enabled: backend.connected
+                onTriggered: loopsWindow.show()
+            }
+            MenuSeparator { }
+            MenuItem {
                 text: "About vibemix…"
                 onTriggered: aboutWindow.show()
             }
