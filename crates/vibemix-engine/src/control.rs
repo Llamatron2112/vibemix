@@ -76,12 +76,12 @@ struct PendingWaveform {
     slot: u32,
     start: u64,
     end: u64,
-    preview: bool,
+    nudge: Option<i64>,
+    seq: u64,
 }
 
 const LOOP_PEAK_BUCKETS: usize = 512;
 const LOOP_WAVEFORM_BUCKETS: usize = 4096;
-const LOOP_PREVIEW_BUCKETS: usize = 8192;
 
 /// A full mixer-model snapshot for undo/redo.
 struct UndoEntry {
@@ -3636,9 +3636,7 @@ impl Controller {
         if frames == 0 || runtime.raw.len() < frames * 2 {
             return;
         }
-        let (start, end) = if request.preview {
-            (0usize, frames)
-        } else {
+        let (start, end) = {
             let start = (request.start as usize).min(frames - 1);
             let end = (request.end as usize).min(frames);
             if end <= start {
@@ -3647,21 +3645,17 @@ impl Controller {
                 (start, end)
             }
         };
-        let buckets = if request.preview {
-            LOOP_PREVIEW_BUCKETS
-        } else {
-            LOOP_WAVEFORM_BUCKETS
-        };
-        let nudge = if request.preview {
-            0
-        } else {
-            runtime.slot.nudge_samples.rem_euclid(frames as i64) as usize
-        };
+        let nudge = request
+            .nudge
+            .unwrap_or(runtime.slot.nudge_samples)
+            .rem_euclid(frames as i64) as usize;
         let span = end - start;
-        let mut peaks = vec![0.0f32; buckets];
+        let mut peaks = vec![0.0f32; LOOP_WAVEFORM_BUCKETS];
         for (bucket, peak) in peaks.iter_mut().enumerate() {
-            let from = start + span * bucket / buckets;
-            let to = (start + span * (bucket + 1) / buckets).max(from + 1).min(end);
+            let from = start + span * bucket / LOOP_WAVEFORM_BUCKETS;
+            let to = (start + span * (bucket + 1) / LOOP_WAVEFORM_BUCKETS)
+                .max(from + 1)
+                .min(end);
             for frame in from..to {
                 let raw = (nudge + frame) % frames;
                 let index = raw * 2;
@@ -3674,7 +3668,7 @@ impl Controller {
             slot: request.slot,
             start: start as u64,
             end: end as u64,
-            preview: request.preview,
+            seq: request.seq,
             peaks,
         };
         if let Ok(json) = serde_json::to_string(&json) {
@@ -3915,13 +3909,15 @@ impl Controller {
                 slot,
                 start,
                 end,
-                preview,
+                nudge,
+                seq,
             } => {
                 self.pending_waveform = Some(PendingWaveform {
                     slot,
                     start,
                     end,
-                    preview,
+                    nudge,
+                    seq,
                 });
             }
             RecorderAction::LoopSave {

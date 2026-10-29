@@ -211,9 +211,9 @@ pub enum RecorderAction {
     },
     /// Ask the engine for a waveform of a slot.
     ///
-    /// `start`/`end` are frames in loop coordinates (after the current nudge).
-    /// `preview` requests the whole-loop envelope used while dragging; otherwise
-    /// the engine returns a high-resolution window for the editor.
+    /// `start`/`end` are frames in loop coordinates. `nudge` overrides the
+    /// stored nudge for a drag preview (audio is not changed). `seq` is echoed
+    /// so stale replies can be ignored.
     Waveform {
         slot: u32,
         #[serde(default)]
@@ -221,7 +221,9 @@ pub enum RecorderAction {
         #[serde(default)]
         end: u64,
         #[serde(default)]
-        preview: bool,
+        nudge: Option<i64>,
+        #[serde(default)]
+        seq: u64,
     },
 }
 
@@ -234,7 +236,7 @@ pub struct LoopWaveform {
     #[serde(default)]
     pub end: u64,
     #[serde(default)]
-    pub preview: bool,
+    pub seq: u64,
     #[serde(default)]
     pub peaks: Vec<f32>,
 }

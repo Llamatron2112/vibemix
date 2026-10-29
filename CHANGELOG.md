@@ -16,9 +16,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   play/stop, gain, mute and an editor. The save folder is chosen in the GUI and
   remembered; filenames include a timestamp. The editor requests a
   high-resolution window for the visible range and can zoom to the loop start
-  or end at 8×–512×. Drag the waveform to nudge (Shift = one sample per pixel),
-  or type an exact value. Loops are stored in the session and under
-  `VIBEMIX_CONFIG_DIR/loops/` by default.
+  or end at 8×–2048×. Drag the waveform to nudge (Shift = one sample per pixel),
+  or type an exact value; the visible window is re-requested at the preview
+  nudge while dragging, so it stays sharp. Loops are stored in the session and
+  under `VIBEMIX_CONFIG_DIR/loops/` by default.
 
 ## [1.0.2] - 2026-10-22
 

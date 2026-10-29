@@ -551,11 +551,11 @@ through a separate launcher window.
   float, into the folder chosen in the GUI (default
   `VIBEMIX_CONFIG_DIR/loops/`) with a timestamped name. The session stores loop
   metadata and paths.
-- The editor requests a 4096-bucket envelope for the visible window on demand
-  (and an 8192-bucket whole-loop preview for dragging), so 8×–512× start/end
-  zoom stays detailed; the launcher cards keep the smaller 512-bucket envelope.
-  Dragging the waveform changes the manual nudge and redraws from the preview;
-  the high-resolution window is requested again on release.
+- The editor requests a 4096-bucket envelope for the visible window on demand,
+  so 8×–2048× start/end zoom stays detailed; the launcher cards keep the
+  smaller 512-bucket envelope. Dragging sends throttled window requests with a
+  temporary nudge override (audio is unchanged until release), so the zoomed
+  view keeps its resolution while being dragged.
 
 
 

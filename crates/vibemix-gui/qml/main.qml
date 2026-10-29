@@ -768,9 +768,9 @@ ApplicationWindow {
     function nudgeLoop(delta) {
         var slot = root.loopById(loopEditor.slotId)
         if (!slot) return
-        var manual = slot.manual_nudge + delta
-        loopEditor.previewManual = manual
-        loopEditor.previewing = true
+        var manual = loopEditor.displayManual() + delta
+        loopEditor.dragManual = manual
+        loopEditor.applying = true
         root.sendRecorderAction({ action: "set_nudge", slot: slot.id, manual: manual })
         editorWave.requestPaint()
     }
@@ -5669,22 +5669,29 @@ ApplicationWindow {
         id: loopEditor
         property int slotId: -1
         property var editorPeaks: []
-        property var previewPeaks: []
         property real waveStart: 0
         property real waveEnd: 0
         property string zoomMode: "all"
         property int zoomFactor: 32
-        property int previewManual: 0
+        property int dragManual: 0
         property bool dragging: false
-        property bool previewing: false
+        property bool applying: false
+        property int waveSeq: 0
 
         function currentSlot() { return root.loopById(slotId) }
         function currentManual() {
             var slot = currentSlot()
             return slot ? slot.manual_nudge : 0
         }
-        function displayManual() { return previewing ? previewManual : currentManual() }
-        function requestWaveform() {
+        function displayManual() {
+            return (dragging || applying) ? dragManual : currentManual()
+        }
+        function displayTotal() {
+            var slot = currentSlot()
+            if (!slot) return 0
+            return slot.base_nudge + slot.transient_nudge + displayManual()
+        }
+        function requestWaveform(nudge, clearPeaks) {
             var slot = currentSlot()
             if (!slot || !slot.frames) return
             var frames = slot.frames
@@ -5702,30 +5709,21 @@ ApplicationWindow {
             }
             waveStart = start
             waveEnd = end
-            editorPeaks = []
+            waveSeq += 1
+            if (clearPeaks) editorPeaks = []
             root.sendRecorderAction({
                 action: "waveform",
                 slot: slot.id,
                 start: start,
                 end: end,
-                preview: false
+                nudge: (nudge === undefined || nudge === null) ? null : nudge,
+                seq: waveSeq
             })
             editorWave.requestPaint()
         }
-        function requestPreview() {
-            var slot = currentSlot()
-            if (!slot || !slot.frames) return
-            root.sendRecorderAction({
-                action: "waveform",
-                slot: slot.id,
-                start: 0,
-                end: slot.frames,
-                preview: true
-            })
-        }
         function setZoom(mode) {
             zoomMode = mode
-            requestWaveform()
+            requestWaveform(null, true)
         }
         function nudgeText() {
             var slot = currentSlot()
@@ -5737,16 +5735,15 @@ ApplicationWindow {
         function openFor(id) {
             slotId = id
             editorPeaks = []
-            previewPeaks = []
             waveStart = 0
             waveEnd = 0
             zoomMode = "all"
             zoomFactor = 32
-            previewManual = 0
+            dragManual = 0
             dragging = false
-            previewing = false
-            requestPreview()
-            requestWaveform()
+            applying = false
+            waveSeq = 0
+            requestWaveform(null, true)
             visible = true
         }
 
@@ -5756,19 +5753,18 @@ ApplicationWindow {
                 try {
                     var wave = JSON.parse(backend.waveform)
                     if (wave.slot !== loopEditor.slotId) return
-                    if (wave.preview) {
-                        loopEditor.previewPeaks = wave.peaks || []
-                    } else {
-                        loopEditor.editorPeaks = wave.peaks || []
-                        loopEditor.waveStart = wave.start
-                        loopEditor.waveEnd = wave.end
-                        loopEditor.previewing = false
-                    }
+                    if (wave.seq !== loopEditor.waveSeq) return
+                    loopEditor.editorPeaks = wave.peaks || []
+                    loopEditor.waveStart = wave.start
+                    loopEditor.waveEnd = wave.end
+                    loopEditor.applying = false
                     editorWave.requestPaint()
                 } catch (e) {}
             }
             function onLoopsChanged() {
-                if (loopEditor.visible && !loopEditor.dragging) loopEditor.requestWaveform()
+                if (loopEditor.visible && !loopEditor.dragging) {
+                    loopEditor.requestWaveform(null, false)
+                }
             }
         }
 
@@ -5824,12 +5820,8 @@ ApplicationWindow {
                             viewEnd = frames
                         }
                         var span = Math.max(1, viewEnd - viewStart)
-                        var usePreview = loopEditor.previewing || loopEditor.editorPeaks.length === 0
-                        var peaks = usePreview
-                            ? (loopEditor.previewPeaks.length > 0
-                                ? loopEditor.previewPeaks
-                                : (slot.peaks || []))
-                            : loopEditor.editorPeaks
+                        var full = loopEditor.editorPeaks.length === 0
+                        var peaks = full ? (slot.peaks || []) : loopEditor.editorPeaks
                         if (!peaks || peaks.length === 0) return
 
                         ctx.strokeStyle = root.borderColor
@@ -5838,7 +5830,7 @@ ApplicationWindow {
                         ctx.lineTo(width, height * 0.5)
                         ctx.stroke()
 
-                        var total = slot.base_nudge + slot.transient_nudge + loopEditor.displayManual()
+                        var total = loopEditor.displayTotal()
                         var phase = ((total % frames) + frames) % frames / frames
 
                         ctx.strokeStyle = root.mutedText
@@ -5846,7 +5838,7 @@ ApplicationWindow {
                         for (var x = 0; x < width; x++) {
                             var frame = viewStart + (x / Math.max(1, width - 1)) * span
                             var index
-                            if (usePreview) {
+                            if (full) {
                                 var frac = frame / frames
                                 index = Math.floor(((phase + frac) % 1) * peaks.length) % peaks.length
                             } else {
@@ -5873,6 +5865,18 @@ ApplicationWindow {
                     }
                 }
 
+                Timer {
+                    id: dragTimer
+                    interval: 40
+                    repeat: true
+                    running: false
+                    onTriggered: {
+                        if (loopEditor.dragging && loopEditor.visible) {
+                            loopEditor.requestWaveform(loopEditor.displayTotal(), false)
+                        }
+                    }
+                }
+
                 MouseArea {
                     id: waveDrag
                     anchors.fill: parent
@@ -5889,12 +5893,12 @@ ApplicationWindow {
                         var slot = loopEditor.currentSlot()
                         if (!slot) return
                         pressX = mouse.x
-                        pressManual = slot.manual_nudge
-                        loopEditor.previewManual = pressManual
+                        pressManual = loopEditor.displayManual()
+                        loopEditor.dragManual = pressManual
                         loopEditor.dragging = true
-                        loopEditor.previewing = true
-                        if (loopEditor.previewPeaks.length === 0) loopEditor.requestPreview()
-                        editorWave.requestPaint()
+                        loopEditor.applying = false
+                        loopEditor.requestWaveform(loopEditor.displayTotal(), false)
+                        dragTimer.start()
                     }
                     onPositionChanged: {
                         if (!pressed) return
@@ -5905,31 +5909,37 @@ ApplicationWindow {
                         var delta = (mouse.modifiers & Qt.ShiftModifier)
                             ? -Math.round(dx)
                             : -Math.round(dx * span / Math.max(1, width))
-                        loopEditor.previewManual = pressManual + delta
+                        loopEditor.dragManual = pressManual + delta
                         editorWave.requestPaint()
                     }
                     onReleased: {
+                        dragTimer.stop()
                         var slot = loopEditor.currentSlot()
                         loopEditor.dragging = false
                         if (!slot) {
-                            loopEditor.previewing = false
+                            loopEditor.applying = false
                             return
                         }
-                        if (loopEditor.previewManual !== slot.manual_nudge) {
-                            loopEditor.previewing = true
+                        if (loopEditor.dragManual !== slot.manual_nudge) {
+                            loopEditor.applying = true
                             root.sendRecorderAction({
                                 action: "set_nudge",
                                 slot: slot.id,
-                                manual: loopEditor.previewManual
+                                manual: loopEditor.dragManual
                             })
                         } else {
-                            loopEditor.previewing = false
+                            loopEditor.applying = false
                         }
+                        // Ordered after set_nudge on the same socket: refresh at
+                        // the committed nudge. onLoopsChanged may also request.
+                        loopEditor.requestWaveform(null, false)
                         editorWave.requestPaint()
                     }
                     onCanceled: {
+                        dragTimer.stop()
                         loopEditor.dragging = false
-                        loopEditor.previewing = false
+                        loopEditor.applying = false
+                        loopEditor.requestWaveform(null, false)
                         editorWave.requestPaint()
                     }
                 }
@@ -5961,15 +5971,15 @@ ApplicationWindow {
                 ComboBox {
                     Layout.preferredWidth: 76
                     font.pixelSize: 11
-                    model: ["8×", "32×", "128×", "512×"]
+                    model: ["8×", "32×", "128×", "512×", "2048×"]
                     currentIndex: {
-                        var factors = [8, 32, 128, 512]
+                        var factors = [8, 32, 128, 512, 2048]
                         return Math.max(0, factors.indexOf(loopEditor.zoomFactor))
                     }
                     onActivated: {
-                        var factors = [8, 32, 128, 512]
+                        var factors = [8, 32, 128, 512, 2048]
                         loopEditor.zoomFactor = factors[index]
-                        loopEditor.requestWaveform()
+                        loopEditor.requestWaveform(null, true)
                     }
                 }
                 Label {
@@ -6025,8 +6035,8 @@ ApplicationWindow {
                     editable: true
                     value: loopEditor.displayManual()
                     onValueModified: {
-                        loopEditor.previewing = true
-                        loopEditor.previewManual = value
+                        loopEditor.dragManual = value
+                        loopEditor.applying = true
                         var slot = loopEditor.currentSlot()
                         if (slot) root.sendRecorderAction({
                             action: "set_nudge",
