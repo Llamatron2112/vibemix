@@ -5669,12 +5669,15 @@ ApplicationWindow {
         id: loopEditor
         property int slotId: -1
         property var editorPeaks: []
+        property var waveTransients: []
+        property real viewStart: 0
+        property real viewEnd: 0
         property real waveStart: 0
         property real waveEnd: 0
-        property string zoomMode: "all"
-        property int zoomFactor: 32
+        property real cursorFrame: -1
         property int dragManual: 0
         property bool dragging: false
+        property bool navigating: false
         property bool applying: false
         property int waveSeq: 0
 
@@ -5691,38 +5694,46 @@ ApplicationWindow {
             if (!slot) return 0
             return slot.base_nudge + slot.transient_nudge + displayManual()
         }
+        function clampView(start, end) {
+            var slot = currentSlot()
+            var frames = slot && slot.frames ? slot.frames : 1
+            var minSpan = Math.min(frames, 16)
+            var span = Math.max(minSpan, Math.min(frames, end - start))
+            var s = Math.max(0, Math.min(frames - span, start))
+            return { start: s, end: s + span }
+        }
         function requestWaveform(nudge, clearPeaks) {
             var slot = currentSlot()
             if (!slot || !slot.frames) return
-            var frames = slot.frames
-            var start = 0
-            var end = frames
-            if (zoomMode !== "all") {
-                var span = Math.max(1, Math.floor(frames / zoomFactor))
-                if (zoomMode === "start") {
-                    start = 0
-                    end = span
-                } else {
-                    start = frames - span
-                    end = frames
-                }
+            if (!(viewEnd > viewStart)) {
+                viewStart = 0
+                viewEnd = slot.frames
             }
-            waveStart = start
-            waveEnd = end
+            var view = clampView(viewStart, viewEnd)
+            viewStart = view.start
+            viewEnd = view.end
             waveSeq += 1
-            if (clearPeaks) editorPeaks = []
+            if (clearPeaks) {
+                editorPeaks = []
+                waveStart = view.start
+                waveEnd = view.end
+            }
             root.sendRecorderAction({
                 action: "waveform",
                 slot: slot.id,
-                start: start,
-                end: end,
+                start: view.start,
+                end: view.end,
                 nudge: (nudge === undefined || nudge === null) ? null : nudge,
                 seq: waveSeq
             })
             editorWave.requestPaint()
+            ruler.requestPaint()
         }
-        function setZoom(mode) {
-            zoomMode = mode
+        function fitView() {
+            var slot = currentSlot()
+            if (!slot) return
+            viewStart = 0
+            viewEnd = slot.frames
             requestWaveform(null, true)
         }
         function nudgeText() {
@@ -5732,15 +5743,61 @@ ApplicationWindow {
             var ms = slot.sample_rate > 0 ? total * 1000 / slot.sample_rate : 0
             return total + " smp (" + (ms >= 0 ? "+" : "") + ms.toFixed(2) + " ms)"
         }
+        function cursorText() {
+            var slot = currentSlot()
+            if (!slot || cursorFrame < 0) return ""
+            var frames = Math.max(1, slot.frames)
+            var beats = cursorFrame / frames * Math.max(1, slot.loop_beats || 1)
+            var bpb = Math.max(1, root.beatsPerBar())
+            var bar = Math.floor(beats / bpb) + 1
+            var beat = Math.floor(beats % bpb) + 1
+            var ms = slot.sample_rate > 0 ? cursorFrame * 1000 / slot.sample_rate : 0
+            return bar + "." + beat + " · " + ms.toFixed(1) + " ms · " + Math.round(cursorFrame) + " smp"
+        }
+        function transientDisplayFrame(raw) {
+            var slot = currentSlot()
+            if (!slot) return 0
+            var frames = Math.max(1, slot.frames)
+            return ((raw - displayTotal()) % frames + frames) % frames
+        }
+        function firstTransientFrame() {
+            if (waveTransients.length === 0) return -1
+            var best = waveTransients[0].frame
+            for (var i = 1; i < waveTransients.length; i++) {
+                if (waveTransients[i].frame < best) best = waveTransients[i].frame
+            }
+            return best
+        }
+        function snapTransient(raw) {
+            var slot = currentSlot()
+            if (!slot) return
+            dragManual = raw - slot.base_nudge - slot.transient_nudge
+            applying = true
+            root.sendRecorderAction({ action: "snap_transient", slot: slot.id, frame: raw })
+            editorWave.requestPaint()
+        }
+        function snapFirstTransient() {
+            var frame = firstTransientFrame()
+            if (frame >= 0) snapTransient(frame)
+        }
+        function snapSeam() {
+            var slot = currentSlot()
+            if (!slot) return
+            applying = true
+            root.sendRecorderAction({ action: "snap_seam", slot: slot.id })
+        }
         function openFor(id) {
             slotId = id
             editorPeaks = []
+            waveTransients = []
+            viewStart = 0
+            viewEnd = 0
             waveStart = 0
             waveEnd = 0
-            zoomMode = "all"
-            zoomFactor = 32
+            cursorFrame = -1
             dragManual = 0
             dragging = false
+            navigating = false
             applying = false
             waveSeq = 0
             requestWaveform(null, true)
@@ -5755,14 +5812,16 @@ ApplicationWindow {
                     if (wave.slot !== loopEditor.slotId) return
                     if (wave.seq !== loopEditor.waveSeq) return
                     loopEditor.editorPeaks = wave.peaks || []
+                    loopEditor.waveTransients = wave.transients || []
                     loopEditor.waveStart = wave.start
                     loopEditor.waveEnd = wave.end
                     loopEditor.applying = false
                     editorWave.requestPaint()
+                    ruler.requestPaint()
                 } catch (e) {}
             }
             function onLoopsChanged() {
-                if (loopEditor.visible && !loopEditor.dragging) {
+                if (loopEditor.visible && !loopEditor.dragging && !loopEditor.navigating) {
                     loopEditor.requestWaveform(null, false)
                 }
             }
@@ -5796,9 +5855,49 @@ ApplicationWindow {
                 elide: Text.ElideRight
             }
 
+            Canvas {
+                id: ruler
+                Layout.fillWidth: true
+                Layout.preferredHeight: 18
+                onWidthChanged: requestPaint()
+                onHeightChanged: requestPaint()
+                onPaint: {
+                    var ctx = getContext("2d")
+                    ctx.clearRect(0, 0, width, height)
+                    var slot = loopEditor.currentSlot()
+                    if (!slot || width <= 0) return
+                    var frames = Math.max(1, slot.frames || 1)
+                    var start = loopEditor.viewStart
+                    var end = loopEditor.viewEnd
+                    if (!(end > start)) return
+                    var span = Math.max(1, end - start)
+                    var beats = Math.max(1, slot.loop_beats || 1)
+                    var bpb = Math.max(1, Math.round(root.beatsPerBar()))
+                    var beatPx = width * (frames / beats) / span
+                    ctx.strokeStyle = root.borderColor
+                    ctx.fillStyle = root.mutedText
+                    ctx.font = "9px monospace"
+                    ctx.textBaseline = "middle"
+                    for (var b = 0; b <= beats; b++) {
+                        var frame = b / beats * frames
+                        if (frame < start - 1.0e-6 || frame > end + 1.0e-6) continue
+                        var x = (frame - start) / span * width
+                        ctx.beginPath()
+                        ctx.moveTo(x, 0)
+                        ctx.lineTo(x, height)
+                        ctx.stroke()
+                        var bar = Math.floor(b / bpb) + 1
+                        var beat = (b % bpb) + 1
+                        if (b % bpb === 0 || beatPx >= 34) {
+                            ctx.fillText(bar + "." + beat, x + 2, height * 0.5)
+                        }
+                    }
+                }
+            }
+
             Item {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 220
+                Layout.preferredHeight: 240
 
                 Canvas {
                     id: editorWave
@@ -5862,17 +5961,53 @@ ApplicationWindow {
                             ctx.lineTo(bx, height)
                         }
                         ctx.stroke()
+
+                        // Transient markers, mapped from raw frames by the
+                        // current nudge so they follow the rotated waveform.
+                        for (var t = 0; t < loopEditor.waveTransients.length; t++) {
+                            var transient = loopEditor.waveTransients[t]
+                            var display = ((transient.frame - total) % frames + frames) % frames
+                            if (display < viewStart - 1.0e-6 || display > viewEnd + 1.0e-6) continue
+                            var tx = (display - viewStart) / span * width
+                            var strength = Math.max(0.2, Math.min(1.0, transient.strength || 0.5))
+                            ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25 + 0.55 * strength)
+                            ctx.beginPath()
+                            ctx.moveTo(tx, 0)
+                            ctx.lineTo(tx, height)
+                            ctx.stroke()
+                            ctx.fillStyle = root.accentColor
+                            ctx.beginPath()
+                            ctx.moveTo(tx - 3, 0)
+                            ctx.lineTo(tx + 3, 0)
+                            ctx.lineTo(tx, 5)
+                            ctx.closePath()
+                            ctx.fill()
+                        }
+
+                        if (loopEditor.cursorFrame >= viewStart && loopEditor.cursorFrame <= viewEnd) {
+                            var cx = (loopEditor.cursorFrame - viewStart) / span * width
+                            ctx.strokeStyle = root.textColor
+                            ctx.globalAlpha = 0.4
+                            ctx.beginPath()
+                            ctx.moveTo(cx, 0)
+                            ctx.lineTo(cx, height)
+                            ctx.stroke()
+                            ctx.globalAlpha = 1.0
+                        }
                     }
                 }
 
                 Timer {
-                    id: dragTimer
-                    interval: 40
+                    id: requestTimer
+                    interval: 30
                     repeat: true
                     running: false
                     onTriggered: {
-                        if (loopEditor.dragging && loopEditor.visible) {
+                        if (!loopEditor.visible) return
+                        if (loopEditor.dragging) {
                             loopEditor.requestWaveform(loopEditor.displayTotal(), false)
+                        } else if (loopEditor.navigating) {
+                            loopEditor.requestWaveform(null, true)
                         }
                     }
                 }
@@ -5883,63 +6018,127 @@ ApplicationWindow {
                     hoverEnabled: true
                     cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
                     property real pressX: 0
+                    property real pressY: 0
+                    property real pressViewStart: 0
+                    property real pressViewEnd: 0
                     property int pressManual: 0
+                    property bool moved: false
 
                     ToolTip.visible: containsMouse && !pressed
                     ToolTip.delay: 500
-                    ToolTip.text: "drag to nudge · Shift = 1 sample/px"
+                    ToolTip.text: "drag: pan / vertical zoom · Alt-drag: nudge (Shift = 1 sample/px) · Ctrl+click transient: snap"
 
                     onPressed: {
                         var slot = loopEditor.currentSlot()
                         if (!slot) return
                         pressX = mouse.x
-                        pressManual = loopEditor.displayManual()
-                        loopEditor.dragManual = pressManual
-                        loopEditor.dragging = true
-                        loopEditor.applying = false
-                        loopEditor.requestWaveform(loopEditor.displayTotal(), false)
-                        dragTimer.start()
+                        pressY = mouse.y
+                        moved = false
+                        if (mouse.modifiers & Qt.AltModifier) {
+                            pressManual = loopEditor.displayManual()
+                            loopEditor.dragManual = pressManual
+                            loopEditor.dragging = true
+                            loopEditor.navigating = false
+                            loopEditor.applying = false
+                            loopEditor.requestWaveform(loopEditor.displayTotal(), false)
+                            requestTimer.start()
+                        } else {
+                            loopEditor.navigating = true
+                            loopEditor.dragging = false
+                            pressViewStart = loopEditor.viewStart
+                            pressViewEnd = loopEditor.viewEnd
+                        }
                     }
                     onPositionChanged: {
-                        if (!pressed) return
                         var slot = loopEditor.currentSlot()
                         if (!slot) return
-                        var span = Math.max(1, loopEditor.waveEnd - loopEditor.waveStart)
-                        var dx = mouse.x - pressX
-                        var delta = (mouse.modifiers & Qt.ShiftModifier)
-                            ? -Math.round(dx)
-                            : -Math.round(dx * span / Math.max(1, width))
-                        loopEditor.dragManual = pressManual + delta
+                        var frames = Math.max(1, slot.frames || 1)
+                        var viewSpan = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
+                        loopEditor.cursorFrame = loopEditor.viewStart
+                            + (mouse.x / Math.max(1, width)) * viewSpan
+                        if (pressed) {
+                            var dx = mouse.x - pressX
+                            var dy = mouse.y - pressY
+                            if (Math.abs(dx) + Math.abs(dy) > 2) moved = true
+                            if (loopEditor.dragging) {
+                                var span = Math.max(1, loopEditor.waveEnd - loopEditor.waveStart)
+                                var delta = (mouse.modifiers & Qt.ShiftModifier)
+                                    ? -Math.round(dx)
+                                    : -Math.round(dx * span / Math.max(1, width))
+                                loopEditor.dragManual = pressManual + delta
+                                requestTimer.start()
+                            } else if (loopEditor.navigating) {
+                                var span0 = Math.max(1, pressViewEnd - pressViewStart)
+                                var minSpan = Math.min(frames, 16)
+                                var pan = -dx * span0 / Math.max(1, width)
+                                var zoom = Math.exp(-dy * 0.01)
+                                var newSpan = Math.max(minSpan, Math.min(frames, span0 * zoom))
+                                var frac = mouse.x / Math.max(1, width)
+                                var anchor = pressViewStart + frac * span0 + pan
+                                var newStart = Math.max(0, Math.min(frames - newSpan, anchor - frac * newSpan))
+                                loopEditor.viewStart = newStart
+                                loopEditor.viewEnd = newStart + newSpan
+                                loopEditor.waveStart = loopEditor.viewStart
+                                loopEditor.waveEnd = loopEditor.viewEnd
+                                loopEditor.editorPeaks = []
+                                requestTimer.start()
+                                ruler.requestPaint()
+                            }
+                        }
                         editorWave.requestPaint()
                     }
                     onReleased: {
-                        dragTimer.stop()
+                        requestTimer.stop()
                         var slot = loopEditor.currentSlot()
-                        loopEditor.dragging = false
-                        if (!slot) {
-                            loopEditor.applying = false
-                            return
+                        if (loopEditor.dragging) {
+                            loopEditor.dragging = false
+                            if (slot && loopEditor.dragManual !== slot.manual_nudge) {
+                                loopEditor.applying = true
+                                root.sendRecorderAction({
+                                    action: "set_nudge",
+                                    slot: slot.id,
+                                    manual: loopEditor.dragManual
+                                })
+                            } else {
+                                loopEditor.applying = false
+                            }
+                            loopEditor.requestWaveform(null, false)
+                        } else if (loopEditor.navigating) {
+                            loopEditor.navigating = false
+                            if (!moved && (mouse.modifiers & Qt.ControlModifier)) {
+                                var total = loopEditor.displayTotal()
+                                var frames = Math.max(1, slot ? slot.frames : 1)
+                                var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
+                                var best = -1
+                                var bestDistance = 8
+                                for (var i = 0; i < loopEditor.waveTransients.length; i++) {
+                                    var transient = loopEditor.waveTransients[i]
+                                    var display = ((transient.frame - total) % frames + frames) % frames
+                                    if (display < loopEditor.viewStart || display > loopEditor.viewEnd) continue
+                                    var x = (display - loopEditor.viewStart) / span * width
+                                    var distance = Math.abs(x - mouse.x)
+                                    if (distance < bestDistance) {
+                                        bestDistance = distance
+                                        best = transient.frame
+                                    }
+                                }
+                                if (best >= 0) loopEditor.snapTransient(best)
+                            } else if (moved) {
+                                loopEditor.requestWaveform(null, true)
+                            }
                         }
-                        if (loopEditor.dragManual !== slot.manual_nudge) {
-                            loopEditor.applying = true
-                            root.sendRecorderAction({
-                                action: "set_nudge",
-                                slot: slot.id,
-                                manual: loopEditor.dragManual
-                            })
-                        } else {
-                            loopEditor.applying = false
-                        }
-                        // Ordered after set_nudge on the same socket: refresh at
-                        // the committed nudge. onLoopsChanged may also request.
-                        loopEditor.requestWaveform(null, false)
                         editorWave.requestPaint()
+                        ruler.requestPaint()
                     }
                     onCanceled: {
-                        dragTimer.stop()
+                        requestTimer.stop()
                         loopEditor.dragging = false
+                        loopEditor.navigating = false
                         loopEditor.applying = false
-                        loopEditor.requestWaveform(null, false)
+                        loopEditor.requestWaveform(null, true)
+                    }
+                    onExited: {
+                        loopEditor.cursorFrame = -1
                         editorWave.requestPaint()
                     }
                 }
@@ -5949,48 +6148,47 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 spacing: 4
                 Label {
-                    text: "zoom"
+                    text: "view"
                     color: root.textColor
                     font.pixelSize: 11
                 }
                 FlatButton {
-                    text: "all"
+                    text: "fit"
                     implicitWidth: 34
-                    onClicked: loopEditor.setZoom("all")
-                }
-                FlatButton {
-                    text: "start"
-                    implicitWidth: 42
-                    onClicked: loopEditor.setZoom("start")
-                }
-                FlatButton {
-                    text: "end"
-                    implicitWidth: 36
-                    onClicked: loopEditor.setZoom("end")
-                }
-                ComboBox {
-                    Layout.preferredWidth: 76
-                    font.pixelSize: 11
-                    model: ["8×", "32×", "128×", "512×", "2048×"]
-                    currentIndex: {
-                        var factors = [8, 32, 128, 512, 2048]
-                        return Math.max(0, factors.indexOf(loopEditor.zoomFactor))
-                    }
-                    onActivated: {
-                        var factors = [8, 32, 128, 512, 2048]
-                        loopEditor.zoomFactor = factors[index]
-                        loopEditor.requestWaveform(null, true)
-                    }
+                    onClicked: loopEditor.fitView()
                 }
                 Label {
                     Layout.fillWidth: true
                     text: {
                         var slot = loopEditor.currentSlot()
                         if (!slot) return ""
-                        var span = Math.max(1, loopEditor.waveEnd - loopEditor.waveStart)
+                        var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                         var ms = slot.sample_rate > 0 ? span * 1000 / slot.sample_rate : 0
+                        var cursor = loopEditor.cursorText()
                         return ms.toFixed(2) + " ms · " + Math.round(span) + " smp"
+                            + (cursor.length > 0 ? " · " + cursor : "")
                     }
+                    color: root.mutedText
+                    font.pixelSize: 10
+                    elide: Text.ElideRight
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                FlatButton {
+                    text: "snap first"
+                    enabled: loopEditor.waveTransients.length > 0
+                    onClicked: loopEditor.snapFirstTransient()
+                }
+                FlatButton {
+                    text: "zero seam"
+                    onClicked: loopEditor.snapSeam()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: "Ctrl+click a marker to snap the loop start"
                     color: root.mutedText
                     font.pixelSize: 10
                     elide: Text.ElideRight

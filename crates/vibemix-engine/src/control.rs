@@ -19,8 +19,8 @@ use vibemix_core::model::{
 };
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_core::recorder::{
-    detect_transient, peaks, rotate_interleaved, LoopSlot, LoopWaveform, RecorderAction,
-    RecorderSettings, RecorderSource, RecorderStatus,
+    detect_transient, detect_transients, peaks, rotate_interleaved, snap_seam, LoopSlot,
+    LoopWaveform, RecorderAction, RecorderSettings, RecorderSource, RecorderStatus, Transient,
 };
 use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 
@@ -70,6 +70,7 @@ struct PluginClipboard {
 struct LoopRuntime {
     slot: LoopSlot,
     raw: Vec<f32>,
+    transients: Vec<Transient>,
 }
 
 struct PendingWaveform {
@@ -3668,8 +3669,10 @@ impl Controller {
             slot: request.slot,
             start: start as u64,
             end: end as u64,
+            nudge: nudge as i64,
             seq: request.seq,
             peaks,
+            transients: runtime.transients.clone(),
         };
         if let Ok(json) = serde_json::to_string(&json) {
             self.send_message(&ControlMessage::LoopWaveform { json }, address);
@@ -3726,10 +3729,18 @@ impl Controller {
         } else {
             0
         };
+        let transients = detect_transients(&raw, frames, sample_rate);
         let transient = if self.model.recorder.transient {
-            detect_transient(&raw, frames, sample_rate, base, 100.0)
-                .map(|onset| onset - base)
-                .unwrap_or(0)
+            let window = sample_rate as i64 / 10;
+            transients
+                .iter()
+                .find(|transient| (transient.frame as i64 - base).abs() <= window)
+                .map(|transient| transient.frame as i64 - base)
+                .unwrap_or_else(|| {
+                    detect_transient(&raw, frames, sample_rate, base, 100.0)
+                        .map(|onset| onset - base)
+                        .unwrap_or(0)
+                })
         } else {
             0
         };
@@ -3775,7 +3786,11 @@ impl Controller {
             self.recorder_dirty = true;
             return;
         }
-        self.loops[slot_index] = Some(LoopRuntime { slot, raw });
+        self.loops[slot_index] = Some(LoopRuntime {
+            slot,
+            raw,
+            transients,
+        });
         self.rebuild_model_loops();
         self.loops_dirty = true;
         self.recorder_status = RecorderStatus::default();
@@ -3920,6 +3935,10 @@ impl Controller {
                     seq,
                 });
             }
+            RecorderAction::SnapTransient { slot, frame } => {
+                self.snap_transient(slot, frame);
+            }
+            RecorderAction::SnapSeam { slot } => self.snap_loop_seam(slot),
             RecorderAction::LoopSave {
                 slot,
                 path,
@@ -3929,20 +3948,68 @@ impl Controller {
     }
 
     fn set_loop_nudge(&mut self, slot: u32, manual: i64) {
+        let Some(total) = self
+            .loops
+            .get(slot as usize)
+            .and_then(Option::as_ref)
+            .map(|runtime| runtime.slot.base_nudge + runtime.slot.transient_nudge + manual)
+        else {
+            return;
+        };
+        self.set_loop_total(slot, total);
+    }
+
+    /// Set the total rotation and reinstall the playback buffer.
+    fn set_loop_total(&mut self, slot: u32, total: i64) {
         let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) else {
             return;
         };
-        runtime.slot.manual_nudge = manual;
-        runtime.slot.nudge_samples =
-            runtime.slot.base_nudge + runtime.slot.transient_nudge + manual;
+        runtime.slot.nudge_samples = total;
+        runtime.slot.manual_nudge =
+            total - runtime.slot.base_nudge - runtime.slot.transient_nudge;
         runtime.slot.saved = false;
         let frames = runtime.slot.frames as usize;
-        let rotated = rotate_interleaved(&runtime.raw, frames, runtime.slot.nudge_samples);
+        let rotated = rotate_interleaved(&runtime.raw, frames, total);
         let _ = self
             .engine
             .set_loop(slot as usize, rotated.into_boxed_slice(), frames);
         self.rebuild_model_loops();
         self.loops_dirty = true;
+    }
+
+    fn snap_transient(&mut self, slot: u32, frame: u64) {
+        let Some(runtime) = self.loops.get(slot as usize).and_then(Option::as_ref) else {
+            return;
+        };
+        let frames = runtime.slot.frames as i64;
+        if frames <= 0 {
+            return;
+        }
+        let total = (frame as i64).rem_euclid(frames);
+        self.set_loop_total(slot, total);
+        self.recorder_status.message = format!("snapped transient at {total} samples");
+        self.recorder_dirty = true;
+    }
+
+    fn snap_loop_seam(&mut self, slot: u32) {
+        let Some(runtime) = self.loops.get(slot as usize).and_then(Option::as_ref) else {
+            return;
+        };
+        let frames = runtime.slot.frames as usize;
+        if frames == 0 {
+            return;
+        }
+        let current = runtime.slot.nudge_samples;
+        let sample_rate = runtime.slot.sample_rate;
+        let total = snap_seam(&runtime.raw, frames, current, sample_rate, 2.0);
+        let delta = total - current;
+        self.set_loop_total(slot, total);
+        self.recorder_status.message = if delta == 0 {
+            "seam already aligned".to_string()
+        } else {
+            format!("seam snapped by {delta} samples")
+        };
+        self.recorder_dirty = true;
     }
 
     fn save_loop(&mut self, slot: u32, path: Option<String>, bit_depth: u8) {
@@ -4046,7 +4113,12 @@ impl Controller {
                         .set_loop(index, raw.clone().into_boxed_slice(), frames)
                         .is_ok()
                     {
-                        self.loops[index] = Some(LoopRuntime { slot, raw });
+                        let transients = detect_transients(&raw, frames, sample_rate);
+                        self.loops[index] = Some(LoopRuntime {
+                            slot,
+                            raw,
+                            transients,
+                        });
                     }
                 }
                 Err(error) => {

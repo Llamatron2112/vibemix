@@ -225,6 +225,10 @@ pub enum RecorderAction {
         #[serde(default)]
         seq: u64,
     },
+    /// Make a transient the loop start. `frame` is in raw (unrotated) frames.
+    SnapTransient { slot: u32, frame: u64 },
+    /// Shift the nudge to the nearest low-discontinuity point around the seam.
+    SnapSeam { slot: u32 },
 }
 
 /// Peak envelope for the loop editor.
@@ -235,10 +239,22 @@ pub struct LoopWaveform {
     pub start: u64,
     #[serde(default)]
     pub end: u64,
+    /// Nudge used to rotate the returned peaks.
+    #[serde(default)]
+    pub nudge: i64,
     #[serde(default)]
     pub seq: u64,
     #[serde(default)]
     pub peaks: Vec<f32>,
+    /// Raw (unrotated) detected onsets; the GUI maps them with `nudge`.
+    #[serde(default)]
+    pub transients: Vec<Transient>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Transient {
+    pub frame: u64,
+    pub strength: f32,
 }
 
 /// Rotate an interleaved stereo buffer left by `nudge` samples.
@@ -336,6 +352,150 @@ pub fn detect_transient(
     Some(onset as i64)
 }
 
+/// Detect multiple onsets in a loop, returned in raw frame coordinates.
+///
+/// Uses a short-time amplitude envelope and its positive difference, then picks
+/// local maxima with an adaptive threshold and a 20 ms minimum spacing. This
+/// catches kick attacks and other percussive hits without pulling in a full
+/// spectral analyser.
+pub fn detect_transients(src: &[f32], frames: usize, sample_rate: u32) -> Vec<Transient> {
+    if frames == 0 || sample_rate == 0 {
+        return Vec::new();
+    }
+    let hop = (sample_rate as usize / 1000).max(16);
+    let window = hop * 2;
+    if frames < window * 2 {
+        return Vec::new();
+    }
+
+    let mut positions = Vec::new();
+    let mut envelope = Vec::new();
+    let mut pos = 0;
+    while pos + window <= frames {
+        let mut sum = 0.0f32;
+        for i in pos..pos + window {
+            let mono = (src[i * 2] + src[i * 2 + 1]) * 0.5;
+            sum += mono * mono;
+        }
+        envelope.push((sum / window as f32).sqrt());
+        positions.push(pos);
+        pos += hop;
+    }
+    if envelope.len() < 2 {
+        return Vec::new();
+    }
+
+    let onset: Vec<f32> = envelope
+        .windows(2)
+        .map(|pair| (pair[1] - pair[0]).max(0.0))
+        .collect();
+    let peak = onset.iter().copied().fold(0.0f32, f32::max);
+    if peak <= 1.0e-6 {
+        return Vec::new();
+    }
+    let threshold = peak * 0.08;
+    let min_gap = (sample_rate as usize * 20 / 1000).max(hop);
+    let mut out = Vec::new();
+    let mut last = usize::MAX;
+
+    for i in 0..onset.len() {
+        if onset[i] < threshold {
+            continue;
+        }
+        let from = i.saturating_sub(2);
+        let to = (i + 2).min(onset.len() - 1);
+        if onset[from..=to].iter().any(|value| *value > onset[i]) {
+            continue;
+        }
+        let frame = positions[i + 1];
+        if last != usize::MAX && frame.saturating_sub(last) < min_gap {
+            continue;
+        }
+        // The envelope hop starts before the actual attack; refine to the
+        // first sample above 15 % of the local peak.
+        let scan_start = frame.saturating_sub(hop);
+        let scan_end = (frame + window * 2).min(frames);
+        let mut local_peak = 0.0f32;
+        for i in scan_start..scan_end {
+            let mono = (src[i * 2] + src[i * 2 + 1]) * 0.5;
+            local_peak = local_peak.max(mono.abs());
+        }
+        let refined = if local_peak > 1.0e-6 {
+            let threshold = local_peak * 0.15;
+            (scan_start..scan_end)
+                .find(|i| {
+                    let mono = (src[i * 2] + src[i * 2 + 1]) * 0.5;
+                    mono.abs() >= threshold
+                })
+                .unwrap_or(frame)
+        } else {
+            frame
+        };
+        out.push(Transient {
+            frame: refined as u64,
+            strength: (onset[i] / peak).clamp(0.0, 1.0),
+        });
+        last = refined;
+        if out.len() >= 128 {
+            break;
+        }
+    }
+
+    // A loop that begins with a hit has no rise at frame 0.
+    if envelope[0] > peak * 0.25
+        && out.first().map(|transient| transient.frame > window as u64).unwrap_or(true)
+    {
+        out.insert(
+            0,
+            Transient {
+                frame: 0,
+                strength: 1.0,
+            },
+        );
+    }
+    out
+}
+
+/// Find a nudge near `nudge` that minimises the seam discontinuity.
+///
+/// The loop starts at `nudge` and ends at `nudge + frames - 1`; the score
+/// combines both edge amplitudes and their difference. The search is limited
+/// to `window_ms` so the musical position does not drift.
+pub fn snap_seam(
+    src: &[f32],
+    frames: usize,
+    nudge: i64,
+    sample_rate: u32,
+    window_ms: f32,
+) -> i64 {
+    if frames == 0 || sample_rate == 0 {
+        return nudge;
+    }
+    let radius = (sample_rate as f32 * window_ms / 1000.0).round().max(1.0) as i64;
+    let score_at = |candidate: i64| {
+        let start = candidate.rem_euclid(frames as i64) as usize;
+        let last = (start + frames - 1) % frames;
+        let first = (src[start * 2] + src[start * 2 + 1]) * 0.5;
+        let end = (src[last * 2] + src[last * 2 + 1]) * 0.5;
+        first.abs() + end.abs() + 0.5 * (first - end).abs()
+    };
+    let current = score_at(nudge);
+    if current <= 0.005 {
+        return nudge;
+    }
+    let mut best = nudge;
+    let mut best_score = current;
+    for offset in -radius..=radius {
+        let candidate = nudge + offset;
+        let score = score_at(candidate);
+        if score < best_score {
+            best_score = score;
+            best = candidate;
+        }
+    }
+    best
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -357,6 +517,57 @@ mod tests {
         assert_eq!(p.len(), 2);
         assert!((p[0] - 0.5).abs() < 1e-6);
         assert!((p[1] - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn detects_multiple_onsets() {
+        let frames = 48_000;
+        let mut src = vec![0.0f32; frames * 2];
+        for onset in [4_800usize, 9_600, 14_400] {
+            for i in onset..onset + 32 {
+                src[i * 2] = 0.8;
+                src[i * 2 + 1] = 0.8;
+            }
+        }
+        let found = detect_transients(&src, frames, 48_000);
+        assert!(found.len() >= 3, "found {}", found.len());
+        for expected in [4_800u64, 9_600, 14_400] {
+            assert!(
+                found.iter().any(|t| t.frame.abs_diff(expected) < 256),
+                "missing onset {expected}: {:?}",
+                found.iter().map(|t| t.frame).collect::<Vec<_>>()
+            );
+        }
+    }
+
+    #[test]
+    fn seam_snap_moves_off_a_peak() {
+        let frames = 480;
+        let mut src = vec![0.0f32; frames * 2];
+        for i in 0..frames {
+            let value = (i as f32 * std::f32::consts::TAU / 48.0).sin();
+            src[i * 2] = value;
+            src[i * 2 + 1] = value;
+        }
+        // Frame 12 is a peak; a nearby zero crossing should score better.
+        let snapped = snap_seam(&src, frames, 12, 48_000, 5.0);
+        assert_ne!(snapped, 12);
+        let start = snapped.rem_euclid(frames as i64) as usize;
+        let first = (src[start * 2] + src[start * 2 + 1]) * 0.5;
+        assert!(first.abs() < 0.35, "first={first}");
+    }
+
+    #[test]
+    fn seam_snap_moves_before_an_impulse() {
+        let frames = 48_000;
+        let mut src = vec![0.0f32; frames * 2];
+        for i in 4_800..4_832 {
+            src[i * 2] = 0.8;
+            src[i * 2 + 1] = 0.8;
+        }
+        let snapped = snap_seam(&src, frames, 4_800, 48_000, 2.0);
+        assert!(snapped < 4_800, "snapped={snapped}");
+        assert!(snapped >= 4_800 - 96, "snapped={snapped}");
     }
 
     #[test]

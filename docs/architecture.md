@@ -551,11 +551,16 @@ through a separate launcher window.
   float, into the folder chosen in the GUI (default
   `VIBEMIX_CONFIG_DIR/loops/`) with a timestamped name. The session stores loop
   metadata and paths.
-- The editor requests a 4096-bucket envelope for the visible window on demand,
-  so 8×–2048× start/end zoom stays detailed; the launcher cards keep the
-  smaller 512-bucket envelope. Dragging sends throttled window requests with a
-  temporary nudge override (audio is unchanged until release), so the zoomed
-  view keeps its resolution while being dragged.
+- The editor requests a 4096-bucket envelope for the visible window on demand;
+  the launcher cards keep the smaller 512-bucket envelope. The view is free
+  pan/zoom (horizontal drag pans, vertical drag zooms). Alt-drag sends throttled
+  window requests with a temporary nudge override (audio is unchanged until
+  release), so the zoomed view keeps its resolution while being dragged.
+- The controller caches multiple raw transient onsets per loop. They are sent
+  with each window request; the GUI maps them through the current nudge and
+  draws markers. Ctrl+click on a marker sets the total nudge to that raw frame,
+  making it the loop start. A seam snap searches ±5 ms for the lowest
+  discontinuity/zero-crossing score and applies the shift.
 
 
 
