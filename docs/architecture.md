@@ -525,6 +525,34 @@ there is no separate "+" add button.
 Plugin messages address a chain with `location` — `0` strip pre-fader, `1` strip
 post-fader, `2` bus insert — and `target` (the strip or bus id).
 
+## Loop recorder
+
+The recorder captures bar-aligned loops from the MIDI clock and plays them
+through a separate launcher window.
+
+- **Sources** are a sum of selected strip taps (input, pre-fader, post-fader) or
+  bus outputs. Master (bus 0) is excluded so a playing launcher cannot record
+  itself.
+- The control thread allocates the capture buffer and sends it through the
+  engine command queue. The audio thread fills it from the first bar boundary
+  (the `START` event or a `CLOCK` landing on a multiple of `beats_per_bar`) to
+  the pulse `loop_beats × 24` later, so the loop length comes from the clock's
+  frames rather than a rounded BPM calculation.
+- A finished take is handed back through an `rtrb` queue. The control thread
+  trims it, applies the automatic offset (JACK buffer + plugin latency up to
+  the tap), optionally refines it with transient detection, and applies the
+  manual offset. All offsets are a circular rotation:
+  `out[i] = in[(i + nudge) mod frames]`.
+- The launcher installs the rotated buffer through the command queue; playback
+  is mixed into the master input and starts on the next bar when quantized.
+  Buffers are retired through a garbage queue, so no allocation or free happens
+  on the audio thread.
+- WAV files are written by the control thread at 16-bit, 24-bit or 32-bit
+  float. The session stores loop metadata and paths; the files live in
+  `VIBEMIX_CONFIG_DIR/loops/` by default.
+
+
+
 ## Milestones
 
 - **Phase 0** - prerequisites + spikes (JACK passthrough, lilv host, cxx-qt QML window). Done.

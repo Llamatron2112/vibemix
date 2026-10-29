@@ -43,6 +43,11 @@ pub trait PluginNode: Send {
 
     /// Feeds the plugin's sidechain input (no-op when it has none).
     fn write_sidechain(&mut self, _left: &[f32], _right: &[f32]) {}
+
+    /// Processing latency in samples reported by the plugin.
+    fn latency(&self) -> u32 {
+        0
+    }
 }
 
 impl PluginNode for vibemix_lv2::PluginInstance {
@@ -167,6 +172,10 @@ impl PluginNode for vibemix_vst3::PluginInstance {
     fn write_sidechain(&mut self, left: &[f32], right: &[f32]) {
         vibemix_vst3::PluginInstance::write_sidechain(self, left, right, left.len());
     }
+
+    fn latency(&self) -> u32 {
+        vibemix_vst3::PluginInstance::latency(self)
+    }
 }
 
 impl PluginNode for vibemix_clap::PluginInstance {
@@ -228,5 +237,9 @@ impl PluginNode for vibemix_clap::PluginInstance {
 
     fn write_sidechain(&mut self, left: &[f32], right: &[f32]) {
         vibemix_clap::PluginInstance::write_sidechain(self, left, right, left.len());
+    }
+
+    fn latency(&self) -> u32 {
+        vibemix_clap::PluginInstance::latency(self)
     }
 }

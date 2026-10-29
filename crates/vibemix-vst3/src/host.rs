@@ -356,6 +356,11 @@ impl PluginInstance {
         unsafe { vst3_run(self.handle, frames) };
     }
 
+    /// Processing latency in samples reported by the plugin.
+    pub fn latency(&self) -> u32 {
+        unsafe { vst3_latency(self.handle).max(0) as u32 }
+    }
+
     /// Publishes the host transport for the next [`run`](Self::run): musical
     /// position (quarter notes), tempo, time signature and play state. Plugins
     /// that sync to host tempo read this from the VST3 `ProcessContext`.

@@ -362,6 +362,11 @@ impl PluginInstance {
         unsafe { clap_run(self.handle, frames) };
     }
 
+    /// Processing latency in samples reported by the plugin.
+    pub fn latency(&self) -> u32 {
+        unsafe { clap_latency(self.handle).max(0) as u32 }
+    }
+
     /// Publishes the host transport for the next [`run`](Self::run).
     pub fn set_position(
         &mut self,

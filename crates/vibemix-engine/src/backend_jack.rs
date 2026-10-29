@@ -8,15 +8,19 @@ use jack::{
 };
 use rtrb::{Consumer, Producer};
 use vibemix_core::model::{BusConnections, MixerModel, PluginFormat, PluginSlot, StripConnections};
-use vibemix_lv2::{Host, MidiEvent, PluginInstance, SharedOutputs, SharedUiInputs, StateEntry, StateProxy};
+use vibemix_core::recorder::{RecorderSourceKind, RecorderTap};
+use vibemix_lv2::{
+    Host, MidiEvent, PluginInstance, SharedOutputs, SharedUiInputs, StateEntry, StateProxy,
+};
 
 use crate::plugin::PluginNode;
+use crate::recorder::{bar_boundary_offset, LoopPlayback, RecordedTake, Recorder, MAX_LOOPS};
 
 use crate::dsp;
 use crate::midi::{Clock, MidiBlock};
 use crate::midi_map::SharedMidi;
 use crate::params::{
-    SharedClock, SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
+    SharedClock, SharedMeters, SharedParams, SharedRecorder, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
 };
 
 const SMOOTHING: f32 = 0.005;
@@ -102,6 +106,15 @@ impl SlotPlugin {
                 right.load_state(state);
             }
             SlotPlugin::Missing => {}
+        }
+    }
+
+    /// Processing latency reported by the hosted plugin.
+    fn latency(&self) -> u32 {
+        match self {
+            SlotPlugin::Stereo(instance) => instance.latency(),
+            SlotPlugin::Mono(left, right) => left.latency().max(right.latency()),
+            SlotPlugin::Missing => 0,
         }
     }
 
@@ -278,6 +291,39 @@ pub enum EngineCommand {
         order: Vec<usize>,
         delayed: Vec<Vec<Vec<bool>>>,
     },
+    /// Install the capture buffer and arm the recorder.
+    RecorderArm {
+        buffer: Box<[f32]>,
+        capacity_frames: usize,
+        expected_frames: usize,
+        loop_pulses: u32,
+        latency_frames: u32,
+        loop_beats: f32,
+    },
+    RecorderCancel,
+    SetLoop {
+        slot: usize,
+        buffer: Box<[f32]>,
+        frames: usize,
+    },
+    ClearLoop {
+        slot: usize,
+    },
+    LoopPlay {
+        slot: usize,
+        quantized: bool,
+    },
+    LoopStop {
+        slot: usize,
+    },
+    LoopGain {
+        slot: usize,
+        gain: f32,
+    },
+    LoopMute {
+        slot: usize,
+        mute: bool,
+    },
 }
 
 /// Old strip order, retired on the control thread to keep the RT thread clean
@@ -358,6 +404,20 @@ struct MixerGraph {
     shared_clock: Arc<SharedClock>,
     position: vibemix_lv2::TimePosition,
     midi_map: Arc<SharedMidi>,
+    recorder: Recorder,
+    takes: Producer<RecordedTake>,
+    shared_recorder: Arc<SharedRecorder>,
+    loop_slots: Vec<Option<LoopPlayback>>,
+    loop_garbage: Producer<Box<[f32]>>,
+    buffer_size: usize,
+    /// Strip input tap (after input gain, before the pre-fader insert chain).
+    strip_input: Vec<[Vec<f32>; 2]>,
+    /// Bus output tap (post plugins/fader; includes external returns).
+    bus_out: Vec<[Vec<f32>; 2]>,
+    /// Sum of the selected recorder sources for this block.
+    record_mix: [Vec<f32>; 2],
+    /// Transport-only MIDI events, kept after `midi_sync` filtering.
+    transport_midi: MidiBlock,
 }
 
 impl MixerGraph {
@@ -376,7 +436,9 @@ impl MixerGraph {
                     match target {
                         Some(chain) if chain.len() < MAX_PLUGINS => chain.push(plugin),
                         _ => {
-                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
+                            if let Err(plugin) = self.garbage.push(plugin) {
+                                std::mem::forget(plugin);
+                            }
                         }
                     }
                 }
@@ -388,7 +450,9 @@ impl MixerGraph {
                     {
                         if slot < target.len() {
                             let plugin = target.remove(slot);
-                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
+                            if let Err(plugin) = self.garbage.push(plugin) {
+                                std::mem::forget(plugin);
+                            }
                         }
                     }
                 }
@@ -413,23 +477,27 @@ impl MixerGraph {
                     if let Some(chains) = self.plugin_chains.get_mut(strip) {
                         for chain in chains.iter_mut() {
                             let taken = std::mem::take(chain);
-                            if let Err(chain) = self.garbage_chains.push(taken) { std::mem::forget(chain); }
+                            if let Err(chain) = self.garbage_chains.push(taken) {
+                                std::mem::forget(chain);
+                            }
                         }
                     }
                 }
-                EngineCommand::AddBusPlugin { bus, plugin } => {
-                    match self.bus_chains.get_mut(bus) {
-                        Some(chain) if chain.len() < MAX_PLUGINS => chain.push(plugin),
-                        _ => {
-                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
+                EngineCommand::AddBusPlugin { bus, plugin } => match self.bus_chains.get_mut(bus) {
+                    Some(chain) if chain.len() < MAX_PLUGINS => chain.push(plugin),
+                    _ => {
+                        if let Err(plugin) = self.garbage.push(plugin) {
+                            std::mem::forget(plugin);
                         }
                     }
-                }
+                },
                 EngineCommand::RemoveBusPlugin { bus, slot } => {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
                         if slot < chain.len() {
                             let plugin = chain.remove(slot);
-                            if let Err(plugin) = self.garbage.push(plugin) { std::mem::forget(plugin); }
+                            if let Err(plugin) = self.garbage.push(plugin) {
+                                std::mem::forget(plugin);
+                            }
                         }
                     }
                 }
@@ -444,7 +512,9 @@ impl MixerGraph {
                 EngineCommand::ClearBus { bus } => {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
                         let taken = std::mem::take(chain);
-                        if let Err(chain) = self.garbage_chains.push(taken) { std::mem::forget(chain); }
+                        if let Err(chain) = self.garbage_chains.push(taken) {
+                            std::mem::forget(chain);
+                        }
                     }
                 }
                 EngineCommand::SetStripPorts { strip, in_l, in_r } => {
@@ -477,12 +547,11 @@ impl MixerGraph {
                         *slot = None;
                     }
                 }
-                EngineCommand::Replace {
-                    chains,
-                    bus_chains,
-                } => {
+                EngineCommand::Replace { chains, bus_chains } => {
                     let old = std::mem::replace(&mut self.plugin_chains, chains);
-                    if let Err(chains) = self.garbage_nested.push(old) { std::mem::forget(chains); }
+                    if let Err(chains) = self.garbage_nested.push(old) {
+                        std::mem::forget(chains);
+                    }
                     let old_bus = std::mem::replace(&mut self.bus_chains, bus_chains);
                     if let Err(old_bus) = self.garbage_bus_chains.push(old_bus) {
                         std::mem::forget(old_bus);
@@ -497,7 +566,11 @@ impl MixerGraph {
                         std::mem::forget(old);
                     }
                     let old_rate = self.sample_rate;
-                    let ratio = if old_rate > 0.0 { sample_rate / old_rate } else { 1.0 };
+                    let ratio = if old_rate > 0.0 {
+                        sample_rate / old_rate
+                    } else {
+                        1.0
+                    };
                     for sends in &mut self.send_delay_smooth {
                         for value in sends.iter_mut() {
                             *value *= ratio;
@@ -519,8 +592,121 @@ impl MixerGraph {
                         .iter()
                         .any(|chains| chains.iter().any(|slots| slots.iter().any(|d| *d)));
                 }
+                EngineCommand::RecorderArm {
+                    buffer,
+                    capacity_frames,
+                    expected_frames,
+                    loop_pulses,
+                    latency_frames,
+                    loop_beats,
+                } => {
+                    self.recorder
+                        .cancel(&mut self.loop_garbage, &self.shared_recorder);
+                    let latency =
+                        latency_frames + self.buffer_size as u32 + self.source_latency_frames();
+                    self.recorder.arm(
+                        buffer,
+                        capacity_frames,
+                        expected_frames,
+                        loop_pulses,
+                        latency,
+                        loop_beats,
+                        &self.shared_recorder,
+                    );
+                }
+                EngineCommand::RecorderCancel => {
+                    self.recorder
+                        .cancel(&mut self.loop_garbage, &self.shared_recorder);
+                }
+                EngineCommand::SetLoop {
+                    slot,
+                    buffer,
+                    frames,
+                } => {
+                    if slot < self.loop_slots.len() {
+                        if let Some(old) = self.loop_slots[slot].take() {
+                            self.retire_buffer(old.buffer);
+                        }
+                        self.loop_slots[slot] = Some(LoopPlayback::new(buffer, frames));
+                    } else {
+                        self.retire_buffer(buffer);
+                    }
+                }
+                EngineCommand::ClearLoop { slot } => {
+                    if let Some(old) = self.loop_slots.get_mut(slot).and_then(Option::take) {
+                        self.retire_buffer(old.buffer);
+                    }
+                }
+                EngineCommand::LoopPlay { slot, quantized } => {
+                    if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
+                    {
+                        loop_slot.quantized = quantized;
+                        loop_slot.pending = true;
+                        loop_slot.playing = false;
+                        loop_slot.pos = 0;
+                    }
+                }
+                EngineCommand::LoopStop { slot } => {
+                    if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
+                    {
+                        loop_slot.playing = false;
+                        loop_slot.pending = false;
+                    }
+                }
+                EngineCommand::LoopGain { slot, gain } => {
+                    if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
+                    {
+                        loop_slot.gain = gain.clamp(0.0, 4.0);
+                    }
+                }
+                EngineCommand::LoopMute { slot, mute } => {
+                    if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
+                    {
+                        loop_slot.mute = mute;
+                    }
+                }
             }
         }
+    }
+
+    fn retire_buffer(&mut self, buffer: Box<[f32]>) {
+        if let Err(buffer) = self.loop_garbage.push(buffer) {
+            std::mem::forget(buffer);
+        }
+    }
+
+    fn source_latency_frames(&self) -> u32 {
+        let mut max = 0;
+        for index in 0..self.shared_recorder.source_count() {
+            let Some((kind, tap, id)) = self.shared_recorder.source(index) else {
+                continue;
+            };
+            let id = id as usize;
+            let latency = match kind {
+                RecorderSourceKind::Strip => match tap {
+                    RecorderTap::Input | RecorderTap::Output => 0,
+                    RecorderTap::PreFader => self
+                        .plugin_chains
+                        .get(id)
+                        .map(|chains| chain_latency(&chains[0]))
+                        .unwrap_or(0),
+                    RecorderTap::PostFader => self
+                        .plugin_chains
+                        .get(id)
+                        .map(|chains| chain_latency(&chains[0]) + chain_latency(&chains[1]))
+                        .unwrap_or(0),
+                },
+                RecorderSourceKind::Bus => {
+                    if id != 0 && id < self.bus_chains.len() {
+                        chain_latency(&self.bus_chains[id])
+                    } else {
+                        0
+                    }
+                }
+            };
+            max = max.max(latency);
+        }
+        max
     }
 
     fn run_plugins(&mut self, index: usize, chain: usize, frames: usize) {
@@ -726,6 +912,14 @@ impl MixerGraph {
                 self.meters.store_strip_in(index, 0.0, 0.0);
                 self.meters.store_strip_gain(index, 0.0, 0.0);
                 self.meters.store_strip_out(index, 0.0, 0.0);
+                for tap in [
+                    &mut self.strip_input[index],
+                    &mut self.strip_pre_fader[index],
+                    &mut self.strip_post_fader[index],
+                ] {
+                    tap[0][..frames].fill(0.0);
+                    tap[1][..frames].fill(0.0);
+                }
                 continue;
             }
 
@@ -734,6 +928,14 @@ impl MixerGraph {
                     self.meters.store_strip_in(index, 0.0, 0.0);
                     self.meters.store_strip_gain(index, 0.0, 0.0);
                     self.meters.store_strip_out(index, 0.0, 0.0);
+                    for tap in [
+                        &mut self.strip_input[index],
+                        &mut self.strip_pre_fader[index],
+                        &mut self.strip_post_fader[index],
+                    ] {
+                        tap[0][..frames].fill(0.0);
+                        tap[1][..frames].fill(0.0);
+                    }
                     continue;
                 };
                 let in_l = ports.in_l.as_slice(scope);
@@ -752,11 +954,12 @@ impl MixerGraph {
             let input_gain = *input_smoothed;
             dsp::apply_gain(&mut self.strip_scratch[0][..frames], input_gain);
             dsp::apply_gain(&mut self.strip_scratch[1][..frames], input_gain);
-            self.meters.store_strip_gain(
-                index,
-                in_peak_l * input_gain,
-                in_peak_r * input_gain,
-            );
+            self.meters
+                .store_strip_gain(index, in_peak_l * input_gain, in_peak_r * input_gain);
+
+            // Input tap (after input gain, before the pre-fader insert chain).
+            self.strip_input[index][0][..frames].copy_from_slice(&self.strip_scratch[0][..frames]);
+            self.strip_input[index][1][..frames].copy_from_slice(&self.strip_scratch[1][..frames]);
 
             if !paused {
                 self.run_plugins(index, 0, frames);
@@ -802,7 +1005,8 @@ impl MixerGraph {
 
             let strip_peak_l = dsp::peak(&self.strip_scratch[0][..frames]);
             let strip_peak_r = dsp::peak(&self.strip_scratch[1][..frames]);
-            self.meters.store_strip_out(index, strip_peak_l, strip_peak_r);
+            self.meters
+                .store_strip_out(index, strip_peak_l, strip_peak_r);
 
             for bus in 0..bus_count {
                 let gain_target = self.params.send_gain(index, bus);
@@ -815,8 +1019,7 @@ impl MixerGraph {
                     continue;
                 }
 
-                let delay_target =
-                    self.params.send_delay(index, bus) * self.sample_rate / 1000.0;
+                let delay_target = self.params.send_delay(index, bus) * self.sample_rate / 1000.0;
                 let delay = {
                     let smoothed = &mut self.send_delay_smooth[index][bus];
                     *smoothed += (delay_target - *smoothed) * SMOOTHING;
@@ -891,12 +1094,92 @@ impl MixerGraph {
         self.process_one_bus(0, scope, frames);
     }
 
+    /// Mix launcher playback into the master input. Quantized slots start on
+    /// the next bar boundary in this block; without a running clock they start
+    /// immediately.
+    fn mix_loops(&mut self, frames: usize, beats_before: f64, beats_per_bar: f32, playing: bool) {
+        let bar = bar_boundary_offset(self.transport_midi.as_slice(), beats_before, beats_per_bar);
+        let (slots, [master_l, master_r]) = (&mut self.loop_slots, &mut self.bus_accum[0]);
+        for slot in slots.iter_mut() {
+            let Some(loop_slot) = slot.as_mut() else {
+                continue;
+            };
+            let start = if loop_slot.pending {
+                if loop_slot.quantized && playing {
+                    let Some(offset) = bar else {
+                        continue;
+                    };
+                    loop_slot.pending = false;
+                    loop_slot.playing = true;
+                    loop_slot.pos = 0;
+                    offset
+                } else {
+                    loop_slot.pending = false;
+                    loop_slot.playing = true;
+                    loop_slot.pos = 0;
+                    0
+                }
+            } else if loop_slot.playing {
+                0
+            } else {
+                continue;
+            };
+            loop_slot.mix(
+                &mut master_l[..frames],
+                &mut master_r[..frames],
+                start,
+                frames,
+            );
+        }
+    }
+
+    /// Sum the selected recorder sources for this block.
+    fn build_record_mix(&mut self, frames: usize) {
+        self.record_mix[0][..frames].fill(0.0);
+        self.record_mix[1][..frames].fill(0.0);
+
+        for index in 0..self.shared_recorder.source_count() {
+            let Some((kind, tap, id)) = self.shared_recorder.source(index) else {
+                continue;
+            };
+            let id = id as usize;
+            let source = match kind {
+                RecorderSourceKind::Strip => match tap {
+                    RecorderTap::Input => self.strip_input.get(id).map(|tap| (&tap[0], &tap[1])),
+                    RecorderTap::PreFader => {
+                        self.strip_pre_fader.get(id).map(|tap| (&tap[0], &tap[1]))
+                    }
+                    RecorderTap::PostFader => {
+                        self.strip_post_fader.get(id).map(|tap| (&tap[0], &tap[1]))
+                    }
+                    RecorderTap::Output => None,
+                },
+                RecorderSourceKind::Bus => {
+                    if tap == RecorderTap::Output && id != 0 {
+                        self.bus_out.get(id).map(|tap| (&tap[0], &tap[1]))
+                    } else {
+                        None
+                    }
+                }
+            };
+            let Some((left, right)) = source else {
+                continue;
+            };
+            for i in 0..frames {
+                self.record_mix[0][i] += left[i];
+                self.record_mix[1][i] += right[i];
+            }
+        }
+    }
+
     fn process_one_bus(&mut self, bus: usize, scope: &ProcessScope, frames: usize) {
         if !self.params.bus_active(bus) {
             self.meters.store_bus_in(bus, 0.0, 0.0);
             self.meters.store_bus_gain(bus, 0.0, 0.0);
             self.meters.store_bus_ret(bus, 0.0, 0.0);
             self.meters.store_bus(bus, 0.0, 0.0);
+            self.bus_out[bus][0][..frames].fill(0.0);
+            self.bus_out[bus][1][..frames].fill(0.0);
             return;
         }
 
@@ -925,11 +1208,8 @@ impl MixerGraph {
 
         let gain_peak_l = dsp::peak(&self.bus_scratch[0][..frames]);
         let gain_peak_r = dsp::peak(&self.bus_scratch[1][..frames]);
-        self.meters.store_bus_gain(
-            bus,
-            gain_peak_l * send_gain,
-            gain_peak_r * send_gain,
-        );
+        self.meters
+            .store_bus_gain(bus, gain_peak_l * send_gain, gain_peak_r * send_gain);
 
         if returning {
             if let Some(ports) = self.buses[bus].as_mut() {
@@ -949,11 +1229,8 @@ impl MixerGraph {
                 let in_r = ports.in_r.as_slice(scope);
                 let ret_peak_l = dsp::peak(&in_l[..frames]);
                 let ret_peak_r = dsp::peak(&in_r[..frames]);
-                self.meters.store_bus_ret(
-                    bus,
-                    ret_peak_l * return_gain,
-                    ret_peak_r * return_gain,
-                );
+                self.meters
+                    .store_bus_ret(bus, ret_peak_l * return_gain, ret_peak_r * return_gain);
                 dsp::add_scaled(
                     &mut self.bus_scratch[0][..frames],
                     &in_l[..frames],
@@ -994,6 +1271,11 @@ impl MixerGraph {
                 dsp::scale_into(out_r, &self.bus_scratch[1][..frames], 1.0);
             }
         }
+
+        // Bus output tap for the loop recorder (post plugins and fader; for a
+        // return bus this is the wet return, not the pre-fader send).
+        self.bus_out[bus][0][..frames].copy_from_slice(&self.bus_scratch[0][..frames]);
+        self.bus_out[bus][1][..frames].copy_from_slice(&self.bus_scratch[1][..frames]);
     }
 }
 
@@ -1012,14 +1294,23 @@ impl ProcessHandler for MixerGraph {
         // MIDI: collect the block's events and advance clock/transport state.
         // `raw.time` is the frame offset within the block.
         self.midi.clear();
+        self.transport_midi.clear();
         for raw in self.midi_in.iter(scope) {
-            self.midi.push(MidiEvent::new(raw.time as i64, raw.bytes));
+            let event = MidiEvent::new(raw.time as i64, raw.bytes);
+            self.midi.push(event);
+            let status = event.as_slice().first().copied().unwrap_or(0);
+            if status >= 0xF8 || status == 0xF2 || status == 0xF3 {
+                self.transport_midi.push(event);
+            }
         }
 
         // Clock/transport always tracks the input so the GUI can show position.
-        self.clock.set_beats_per_bar(self.params.beats_per_bar());
+        let beats_before = self.clock.beats;
+        let beats_per_bar = self.params.beats_per_bar();
+        self.clock.set_beats_per_bar(beats_per_bar);
         self.clock.set_sample_rate(self.sample_rate);
         self.clock.process_block(self.midi.as_slice(), frames);
+        let playing = self.clock.playing;
         self.position = self.clock.position();
         self.shared_clock.publish(&self.clock);
 
@@ -1069,7 +1360,22 @@ impl ProcessHandler for MixerGraph {
         }
 
         self.process_strips(scope, frames, paused);
+        self.mix_loops(frames, beats_before, beats_per_bar, playing);
         self.process_buses(scope, frames);
+        self.build_record_mix(frames);
+        self.recorder.process(
+            frames,
+            self.transport_midi.as_slice(),
+            beats_before,
+            beats_per_bar,
+            playing,
+            &self.record_mix[0],
+            &self.record_mix[1],
+            self.sample_rate as u32,
+            &self.shared_recorder,
+            &mut self.takes,
+            &mut self.loop_garbage,
+        );
 
         if raw_frames > frames {
             // Period beyond the fixed buffer capacity: silence the tail of the
@@ -1090,6 +1396,7 @@ impl ProcessHandler for MixerGraph {
 
     fn buffer_size(&mut self, _client: &Client, size: Frames) -> Control {
         let size = size as usize;
+        self.buffer_size = size;
         if size > self.capacity {
             tracing::warn!(
                 size,
@@ -1112,6 +1419,9 @@ pub struct JackEngine {
     garbage_nested: Consumer<Vec<StripChains>>,
     garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
     garbage_order: Consumer<RetiredOrder>,
+    take_rx: Consumer<RecordedTake>,
+    loop_garbage_rx: Consumer<Box<[f32]>>,
+    shared_recorder: Arc<SharedRecorder>,
     pending_rate: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
     clock: Arc<SharedClock>,
@@ -1161,9 +1471,20 @@ impl JackEngine {
         // callback never allocates; periods larger than this are truncated.
         let capacity = buffer_size.max(PluginInstance::max_frames());
         let max_delay_samples =
-            (vibemix_core::model::MAX_SEND_DELAY_MS as f64 / 1000.0 * sample_rate).ceil() as usize + 1;
+            (vibemix_core::model::MAX_SEND_DELAY_MS as f64 / 1000.0 * sample_rate).ceil() as usize
+                + 1;
 
-        let built = build_chains(lv2, vst3, clap, model, strip_count, bus_count, sample_rate, buffer_size, &params);
+        let built = build_chains(
+            lv2,
+            vst3,
+            clap,
+            model,
+            strip_count,
+            bus_count,
+            sample_rate,
+            buffer_size,
+            &params,
+        );
         let Built {
             strip_chains: plugin_chains,
             strip_proxies: state_proxies,
@@ -1220,8 +1541,7 @@ impl JackEngine {
         let shared_clock = Arc::new(SharedClock::new());
         let midi_map = Arc::new(SharedMidi::new());
 
-        let (commands, command_consumer) =
-            rtrb::RingBuffer::<EngineCommand>::new(COMMAND_CAPACITY);
+        let (commands, command_consumer) = rtrb::RingBuffer::<EngineCommand>::new(COMMAND_CAPACITY);
         // Garbage queues are sized so a full command queue's worth of retired
         // objects can never overflow them (the control thread drains each loop).
         let garbage_plugins_capacity = COMMAND_CAPACITY * (strip_count + bus_count + 1);
@@ -1238,6 +1558,9 @@ impl JackEngine {
         let (garbage_delays_producer, garbage_delays) =
             rtrb::RingBuffer::<Vec<Vec<dsp::DelayLine>>>::new(4);
         let (garbage_order_producer, garbage_order) = rtrb::RingBuffer::<RetiredOrder>::new(4);
+        let (takes, take_rx) = rtrb::RingBuffer::<RecordedTake>::new(4);
+        let (loop_garbage, loop_garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(COMMAND_CAPACITY);
+        let shared_recorder = Arc::new(SharedRecorder::new());
 
         let graph = MixerGraph {
             params: Arc::clone(&params),
@@ -1273,6 +1596,9 @@ impl JackEngine {
             strip_pre_fader: (0..strip_count)
                 .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
                 .collect(),
+            strip_input: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
             strip_post_fader: (0..strip_count)
                 .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
                 .collect(),
@@ -1299,13 +1625,24 @@ impl JackEngine {
             bus_accum: (0..bus_count)
                 .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
                 .collect(),
+            bus_out: (0..bus_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
             capacity,
+            buffer_size,
             midi_in,
             midi: MidiBlock::default(),
+            transport_midi: MidiBlock::default(),
             clock: Clock::new(sample_rate as f32, 4.0),
             shared_clock: Arc::clone(&shared_clock),
             position: vibemix_lv2::TimePosition::default(),
             midi_map: Arc::clone(&midi_map),
+            recorder: Recorder::new(),
+            takes,
+            shared_recorder: Arc::clone(&shared_recorder),
+            loop_slots: (0..MAX_LOOPS).map(|_| None).collect(),
+            loop_garbage,
+            record_mix: [vec![0.0; capacity], vec![0.0; capacity]],
         };
 
         let pending_rate = Arc::new(AtomicU32::new(0));
@@ -1333,6 +1670,9 @@ impl JackEngine {
             garbage_nested,
             garbage_delays,
             garbage_order,
+            take_rx,
+            loop_garbage_rx,
+            shared_recorder: Arc::clone(&shared_recorder),
             pending_rate,
             xruns,
             clock: shared_clock,
@@ -1367,6 +1707,80 @@ impl JackEngine {
 
     pub fn buffer_size(&self) -> u32 {
         self.active.as_client().buffer_size()
+    }
+
+    pub fn recorder(&self) -> &Arc<SharedRecorder> {
+        &self.shared_recorder
+    }
+
+    pub fn take_recording(&mut self) -> Option<RecordedTake> {
+        self.take_rx.pop().ok()
+    }
+
+    pub fn arm_recorder(
+        &mut self,
+        buffer: Box<[f32]>,
+        capacity_frames: usize,
+        expected_frames: usize,
+        loop_pulses: u32,
+        loop_beats: f32,
+    ) -> Result<()> {
+        self.commands
+            .push(EngineCommand::RecorderArm {
+                buffer,
+                capacity_frames,
+                expected_frames,
+                loop_pulses,
+                latency_frames: 0,
+                loop_beats,
+            })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn cancel_recorder(&mut self) -> Result<()> {
+        self.commands
+            .push(EngineCommand::RecorderCancel)
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn set_loop(&mut self, slot: usize, buffer: Box<[f32]>, frames: usize) -> Result<()> {
+        self.commands
+            .push(EngineCommand::SetLoop {
+                slot,
+                buffer,
+                frames,
+            })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn clear_loop(&mut self, slot: usize) -> Result<()> {
+        self.commands
+            .push(EngineCommand::ClearLoop { slot })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_play(&mut self, slot: usize, quantized: bool) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopPlay { slot, quantized })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_stop(&mut self, slot: usize) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopStop { slot })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_gain(&mut self, slot: usize, gain: f32) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopGain { slot, gain })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_mute(&mut self, slot: usize, mute: bool) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopMute { slot, mute })
+            .map_err(|_| anyhow!("engine command queue full"))
     }
 
     /// Returns and clears a pending sample-rate change reported by JACK.
@@ -1751,7 +2165,11 @@ impl JackEngine {
         if strip >= self.strip_count {
             return Ok(());
         }
-        if self.strip_ports.get(strip).is_some_and(|ports| ports.is_some()) {
+        if self
+            .strip_ports
+            .get(strip)
+            .is_some_and(|ports| ports.is_some())
+        {
             return Ok(());
         }
 
@@ -2064,7 +2482,14 @@ impl JackEngine {
         let mut missing = Vec::new();
 
         if let Some(sources) = &model.midi_connections {
-            restore_input(client, &self.midi_port, "midi_in", "midi in", sources, &mut missing);
+            restore_input(
+                client,
+                &self.midi_port,
+                "midi_in",
+                "midi in",
+                sources,
+                &mut missing,
+            );
         }
 
         for strip in &model.strips {
@@ -2075,8 +2500,22 @@ impl JackEngine {
             let Some((in_l, in_r)) = self.strip_ports.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            restore_input(client, in_l, "in_l", &strip.name, &connections.in_l, &mut missing);
-            restore_input(client, in_r, "in_r", &strip.name, &connections.in_r, &mut missing);
+            restore_input(
+                client,
+                in_l,
+                "in_l",
+                &strip.name,
+                &connections.in_l,
+                &mut missing,
+            );
+            restore_input(
+                client,
+                in_r,
+                "in_r",
+                &strip.name,
+                &connections.in_r,
+                &mut missing,
+            );
         }
 
         for bus in &model.buses {
@@ -2087,8 +2526,22 @@ impl JackEngine {
             let Some((out_l, out_r)) = self.bus_ports.get(index).and_then(Option::as_ref) else {
                 continue;
             };
-            restore_output(client, out_l, "out_l", &bus.name, &connections.out_l, &mut missing);
-            restore_output(client, out_r, "out_r", &bus.name, &connections.out_r, &mut missing);
+            restore_output(
+                client,
+                out_l,
+                "out_l",
+                &bus.name,
+                &connections.out_l,
+                &mut missing,
+            );
+            restore_output(
+                client,
+                out_r,
+                "out_r",
+                &bus.name,
+                &connections.out_r,
+                &mut missing,
+            );
         }
 
         for bus in &model.buses {
@@ -2100,8 +2553,22 @@ impl JackEngine {
             else {
                 continue;
             };
-            restore_input(client, ret_l, "ret_l", &bus.name, &connections.ret_l, &mut missing);
-            restore_input(client, ret_r, "ret_r", &bus.name, &connections.ret_r, &mut missing);
+            restore_input(
+                client,
+                ret_l,
+                "ret_l",
+                &bus.name,
+                &connections.ret_l,
+                &mut missing,
+            );
+            restore_input(
+                client,
+                ret_r,
+                "ret_r",
+                &bus.name,
+                &connections.ret_r,
+                &mut missing,
+            );
         }
 
         if !missing.is_empty() {
@@ -2176,7 +2643,8 @@ impl JackEngine {
                         },
                     );
                 }
-                if let Some((ret_l, ret_r)) = self.bus_return_ports.get(index).and_then(Option::as_ref)
+                if let Some((ret_l, ret_r)) =
+                    self.bus_return_ports.get(index).and_then(Option::as_ref)
                 {
                     add(
                         ret_l,
@@ -2351,7 +2819,12 @@ impl JackEngine {
         while self.garbage_nested.pop().is_ok() {}
         while self.garbage_delays.pop().is_ok() {}
         while self.garbage_order.pop().is_ok() {}
+        while self.loop_garbage_rx.pop().is_ok() {}
     }
+}
+
+fn chain_latency(chain: &[SlotPlugin]) -> u32 {
+    chain.iter().map(|plugin| plugin.latency()).sum()
 }
 
 fn set_controls(
@@ -2367,12 +2840,7 @@ fn set_controls(
     }
 }
 
-fn set_bus_controls(
-    instance: &mut dyn PluginNode,
-    params: &SharedParams,
-    bus: usize,
-    slot: usize,
-) {
+fn set_bus_controls(instance: &mut dyn PluginNode, params: &SharedParams, bus: usize, slot: usize) {
     let controls = instance.control_count().min(MAX_PARAMS);
     for param in 0..controls {
         instance.set_control(param, params.bus_plugin_param(bus, slot, param));
@@ -2409,7 +2877,11 @@ fn feed_sidechain(
             return;
         }
         let tap = if delayed {
-            if pre { &pre_snapshot[source] } else { &post_snapshot[source] }
+            if pre {
+                &pre_snapshot[source]
+            } else {
+                &post_snapshot[source]
+            }
         } else if pre {
             &strip_pre[source]
         } else {
@@ -2737,10 +3209,7 @@ fn control_default_of(plugin: &SlotPlugin, param: usize) -> f32 {
     }
 }
 
-fn register_strip_ports(
-    client: &Client,
-    strip: usize,
-) -> Result<(Port<AudioIn>, Port<AudioIn>)> {
+fn register_strip_ports(client: &Client, strip: usize) -> Result<(Port<AudioIn>, Port<AudioIn>)> {
     let in_l = client.register_port(&format!("strip{strip}_in_l"), AudioIn::default())?;
     match client.register_port(&format!("strip{strip}_in_r"), AudioIn::default()) {
         Ok(in_r) => Ok((in_l, in_r)),
@@ -2796,11 +3265,7 @@ fn port_rename_fn() -> Option<PortRenameFn> {
     })
 }
 
-fn rename_port(
-    client: *mut jack::jack_sys::jack_client_t,
-    port: &mut Port<Unowned>,
-    name: &str,
-) {
+fn rename_port(client: *mut jack::jack_sys::jack_client_t, port: &mut Port<Unowned>, name: &str) {
     if let Some(rename) = port_rename_fn() {
         let Ok(cname) = std::ffi::CString::new(name) else {
             tracing::warn!(name, "port name contains a nul byte");
@@ -2947,14 +3412,10 @@ fn auto_connect_ports(client: &Client, client_name: &str, strip_count: usize, bu
     }
 
     if bus_count > 0 {
-        let _ = client.connect_ports_by_name(
-            &format!("{client_name}:bus0_out_l"),
-            "system:playback_1",
-        );
-        let _ = client.connect_ports_by_name(
-            &format!("{client_name}:bus0_out_r"),
-            "system:playback_2",
-        );
+        let _ =
+            client.connect_ports_by_name(&format!("{client_name}:bus0_out_l"), "system:playback_1");
+        let _ =
+            client.connect_ports_by_name(&format!("{client_name}:bus0_out_r"), "system:playback_2");
     }
 }
 
@@ -3047,9 +3508,18 @@ mod sidechain_feed_tests {
         params.set_sidechain_gain(0, 0, 0, 1, 0.25);
         params.set_sidechain_pre(0, 0, 0, 1, false);
 
-        let pre = vec![[vec![1.0f32; 4], vec![1.0; 4]], [vec![2.0; 4], vec![2.0; 4]]];
-        let post = vec![[vec![10.0f32; 4], vec![10.0; 4]], [vec![20.0; 4], vec![20.0; 4]]];
-        let zeros = vec![[vec![0.0f32; 4], vec![0.0; 4]], [vec![0.0; 4], vec![0.0; 4]]];
+        let pre = vec![
+            [vec![1.0f32; 4], vec![1.0; 4]],
+            [vec![2.0; 4], vec![2.0; 4]],
+        ];
+        let post = vec![
+            [vec![10.0f32; 4], vec![10.0; 4]],
+            [vec![20.0; 4], vec![20.0; 4]],
+        ];
+        let zeros = vec![
+            [vec![0.0f32; 4], vec![0.0; 4]],
+            [vec![0.0; 4], vec![0.0; 4]],
+        ];
         let silence = [vec![0.0f32; 4], vec![0.0; 4]];
         let mut mix = [vec![0.0f32; 4], vec![0.0; 4]];
 

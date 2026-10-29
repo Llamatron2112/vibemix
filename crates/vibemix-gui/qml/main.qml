@@ -67,6 +67,7 @@ ApplicationWindow {
     property var values: ({ strips: {}, buses: {}, params: {} })
     property var levels: ({ strips: {}, buses: {} })
     property var catalog: []
+    property var recorderRows: []
     property var meterSource: ({})
     property var busMeterSource: ({})
     property bool sliderHovered: false
@@ -665,6 +666,114 @@ ApplicationWindow {
         var index = Math.floor(((c.beats % total) + total) % total / total * len)
         return { count: len, index: index, bars: t.loop_bars }
     }
+    function recorderInfo() {
+        try { return JSON.parse(backend.recorder) } catch (e) { return ({ state: "idle", progress: 0 }) }
+    }
+    function loopList() {
+        try {
+            var value = JSON.parse(backend.loops)
+            return Array.isArray(value) ? value : []
+        } catch (e) { return [] }
+    }
+    function loopById(id) {
+        var loops = root.loopList()
+        for (var i = 0; i < loops.length; i++) if (loops[i].id === id) return loops[i]
+        return null
+    }
+    function recorderSettings() {
+        var r = mix.recorder || ({})
+        return {
+            sources: r.sources || [],
+            bit_depth: (r.bit_depth !== undefined) ? r.bit_depth : 24,
+            auto_latency: r.auto_latency !== false,
+            transient: r.transient !== false,
+            nudge_samples: r.nudge_samples || 0,
+            crossfade_ms: r.crossfade_ms || 0
+        }
+    }
+    function updateRecorderSetting(key, value) {
+        var settings = root.recorderSettings()
+        settings[key] = value
+        backend.setRecorderSettings(JSON.stringify(settings))
+    }
+    function sendRecorderAction(action) {
+        backend.recorderAction(JSON.stringify(action))
+    }
+    function openRecorder() {
+        var selected = root.recorderSettings().sources
+        var rows = []
+        function selectedTap(kind, id) {
+            for (var i = 0; i < selected.length; i++) {
+                if (selected[i].kind === kind && selected[i].id === id) return selected[i].tap
+            }
+            return null
+        }
+        var strips = mix.strips || []
+        for (var s = 0; s < strips.length; s++) {
+            var stripTap = selectedTap("strip", strips[s].id)
+            rows.push({
+                kind: "strip", id: strips[s].id, name: strips[s].name || ("strip " + strips[s].id),
+                checked: stripTap !== null, tap: stripTap || "post_fader",
+                taps: ["input", "pre_fader", "post_fader"]
+            })
+        }
+        var buses = mix.buses || []
+        for (var b = 0; b < buses.length; b++) {
+            if (buses[b].id === 0) continue
+            var busTap = selectedTap("bus", buses[b].id)
+            rows.push({
+                kind: "bus", id: buses[b].id, name: buses[b].name || ("bus " + buses[b].id),
+                checked: busTap !== null, tap: "output", taps: ["output"]
+            })
+        }
+        root.recorderRows = rows
+        recorderDialog.open()
+    }
+    function applyRecorderRows() {
+        var sources = []
+        for (var i = 0; i < root.recorderRows.length; i++) {
+            var row = root.recorderRows[i]
+            if (row.checked) sources.push({ kind: row.kind, id: row.id, tap: row.tap })
+        }
+        var settings = root.recorderSettings()
+        settings.sources = sources
+        backend.setRecorderSettings(JSON.stringify(settings))
+    }
+    function setRecorderRow(index, key, value) {
+        var rows = root.recorderRows.slice()
+        rows[index][key] = value
+        root.recorderRows = rows
+        root.applyRecorderRows()
+    }
+    function loopDescription(slot) {
+        var seconds = slot.sample_rate > 0 ? slot.frames / slot.sample_rate : 0
+        var length = slot.loop_beats > 0 ? (slot.loop_beats + " beats") : (seconds.toFixed(2) + " s")
+        return length + " · " + Math.round(slot.bpm || 0) + " BPM"
+    }
+    function loopNudgeText(slot) {
+        var ms = slot.sample_rate > 0 ? slot.nudge_samples * 1000 / slot.sample_rate : 0
+        return slot.nudge_samples + " smp (" + (ms >= 0 ? "+" : "") + ms.toFixed(2) + " ms)"
+    }
+    function nudgeLoop(delta) {
+        var slot = root.loopById(loopEditor.slotId)
+        if (!slot) return
+        root.sendRecorderAction({ action: "set_nudge", slot: slot.id, manual: slot.manual_nudge + delta })
+    }
+    function startLoop(slot, quantized) {
+        root.sendRecorderAction({ action: "loop_play", slot: slot.id, quantized: quantized })
+    }
+    function stopLoop(slot) {
+        root.sendRecorderAction({ action: "loop_stop", slot: slot.id })
+    }
+    function toggleLoopMute(slot) {
+        root.sendRecorderAction({ action: "set_loop_mute", slot: slot.id, mute: !slot.mute })
+    }
+    function saveLoop(slot, bitDepth) {
+        root.sendRecorderAction({ action: "loop_save", slot: slot.id, path: null, bit_depth: bitDepth })
+    }
+    function renameLoop(slot, name) {
+        root.sendRecorderAction({ action: "loop_rename", slot: slot.id, name: name })
+    }
     function midiKindName(kind) {
         switch (kind) {
         case 0: return "strip_gain"
@@ -1150,6 +1259,56 @@ ApplicationWindow {
                         font.pixelSize: 10
                     }
 
+                    Rectangle {
+                        id: recordDot
+                        Layout.alignment: Qt.AlignVCenter
+                        implicitWidth: 16
+                        implicitHeight: 16
+                        width: 16
+                        height: 16
+                        radius: 8
+                        border.color: root.borderColor
+                        border.width: 1
+                        color: {
+                            var r = root.recorderInfo()
+                            if (r.state === "recording") return "#e53935"
+                            if (r.state === "armed") return "#f9a825"
+                            return root.controlColor
+                        }
+
+                        HoverHandler { id: recordHover }
+                        ToolTip.visible: recordHover.hovered
+                        ToolTip.delay: 300
+                        ToolTip.text: {
+                            var r = root.recorderInfo()
+                            if (r.message) return r.message
+                            if (r.state === "recording") return "recording " + Math.round((r.progress || 0) * 100) + "%"
+                            if (r.state === "armed") return "armed: waiting for bar 1"
+                            return "record a loop"
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            onClicked: {
+                                var r = root.recorderInfo()
+                                root.sendRecorderAction({ action: r.state === "idle" ? "arm" : "cancel" })
+                            }
+                        }
+                    }
+
+                    Label {
+                        visible: root.recorderInfo().state !== "idle"
+                        text: {
+                            var r = root.recorderInfo()
+                            if (r.state === "recording") return "REC " + Math.round((r.progress || 0) * 100) + "%"
+                            if (r.state === "armed") return "ARM"
+                            return ""
+                        }
+                        color: root.recorderInfo().state === "recording" ? "#e53935" : "#f9a825"
+                        font.pixelSize: 10
+                        font.family: "monospace"
+                    }
+
                     Row {
                         id: loopIndicator
                         visible: root.transportUi().loop_indicator && backend.clock.length > 0
@@ -1233,6 +1392,14 @@ ApplicationWindow {
                     MenuItem {
                         text: "Loop settings…"
                         onTriggered: loopDialog.open()
+                    }
+                    MenuItem {
+                        text: "Recorder…"
+                        onTriggered: root.openRecorder()
+                    }
+                    MenuItem {
+                        text: "Loops…"
+                        onTriggered: loopsWindow.show()
                     }
                 }
             }
@@ -5141,6 +5308,560 @@ ApplicationWindow {
                     }
                         }
                     }
+                }
+            }
+        }
+    }
+
+    Dialog {
+        id: recorderDialog
+        title: "recorder"
+        modal: true
+        anchors.centerIn: parent
+        width: 480
+        padding: 10
+
+        contentItem: ColumnLayout {
+            width: recorderDialog.availableWidth
+            spacing: 8
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    text: "length"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: root.transportUi().loop_length
+                        + (root.transportUi().loop_bars ? " bars" : " beats")
+                    color: root.mutedText
+                    font.pixelSize: 11
+                }
+                FlatButton {
+                    text: "loop settings…"
+                    onClicked: {
+                        recorderDialog.close()
+                        loopDialog.open()
+                    }
+                }
+            }
+
+            Label {
+                text: "sources (summed)"
+                color: root.textColor
+                font.pixelSize: 11
+            }
+
+            Flickable {
+                Layout.fillWidth: true
+                Layout.preferredHeight: Math.min(220, recorderRowsColumn.implicitHeight)
+                clip: true
+                contentHeight: recorderRowsColumn.implicitHeight
+                ScrollBar.vertical: ScrollBar { }
+
+                ColumnLayout {
+                    id: recorderRowsColumn
+                    width: parent.width
+                    spacing: 1
+
+                    Repeater {
+                        model: root.recorderRows
+
+                        delegate: RowLayout {
+                            Layout.fillWidth: true
+                            spacing: 6
+                            property int rowIndex: index
+
+                            CheckBox {
+                                checked: modelData.checked
+                                onToggled: root.setRecorderRow(rowIndex, "checked", checked)
+                            }
+                            Label {
+                                Layout.fillWidth: true
+                                text: modelData.name
+                                color: root.textColor
+                                font.pixelSize: 11
+                                elide: Text.ElideRight
+                            }
+                            ComboBox {
+                                Layout.preferredWidth: 110
+                                font.pixelSize: 11
+                                model: modelData.taps
+                                currentIndex: Math.max(0, modelData.taps.indexOf(modelData.tap))
+                                enabled: modelData.checked
+                                onActivated: root.setRecorderRow(rowIndex, "tap", modelData.taps[index])
+                            }
+                        }
+                    }
+                }
+            }
+
+            RowLayout {
+                spacing: 12
+                CheckBox {
+                    text: "auto latency"
+                    checked: root.recorderSettings().auto_latency
+                    onToggled: root.updateRecorderSetting("auto_latency", checked)
+                }
+                CheckBox {
+                    text: "transient"
+                    checked: root.recorderSettings().transient
+                    onToggled: root.updateRecorderSetting("transient", checked)
+                }
+            }
+
+            RowLayout {
+                Label {
+                    text: "bit depth"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                ComboBox {
+                    Layout.preferredWidth: 130
+                    font.pixelSize: 11
+                    model: ["16-bit", "24-bit", "32-bit float"]
+                    currentIndex: {
+                        var depth = root.recorderSettings().bit_depth
+                        return depth === 16 ? 0 : (depth === 32 ? 2 : 1)
+                    }
+                    onActivated: {
+                        var depths = [16, 24, 32]
+                        root.updateRecorderSetting("bit_depth", depths[index])
+                    }
+                }
+                Item { Layout.fillWidth: true }
+                Label {
+                    text: root.recorderInfo().state + (root.recorderInfo().message ? " · " + root.recorderInfo().message : "")
+                    color: root.mutedText
+                    font.pixelSize: 10
+                    elide: Text.ElideRight
+                }
+            }
+
+            ProgressBar {
+                Layout.fillWidth: true
+                from: 0
+                to: 1
+                value: root.recorderInfo().progress || 0
+                visible: root.recorderInfo().state === "recording"
+            }
+
+            RowLayout {
+                FlatButton {
+                    text: root.recorderInfo().state === "idle" ? "arm" : "cancel"
+                    onClicked: {
+                        var state = root.recorderInfo().state
+                        root.sendRecorderAction({ action: state === "idle" ? "arm" : "cancel" })
+                    }
+                }
+                FlatButton {
+                    text: "loops…"
+                    onClicked: loopsWindow.show()
+                }
+                Item { Layout.fillWidth: true }
+                FlatButton {
+                    text: "close"
+                    onClicked: recorderDialog.close()
+                }
+            }
+        }
+    }
+
+    Window {
+        id: loopsWindow
+        modality: Qt.NonModal
+        flags: Qt.Window
+        transientParent: root
+        visible: false
+        width: 760
+        height: 430
+        minimumWidth: 420
+        minimumHeight: 260
+        title: "loops"
+        color: root.palette.window
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            RowLayout {
+                Label {
+                    Layout.fillWidth: true
+                    text: "loop launcher"
+                    color: root.textColor
+                    font.pixelSize: 12
+                    font.bold: true
+                }
+                FlatButton {
+                    text: "record…"
+                    onClicked: root.openRecorder()
+                }
+                FlatButton {
+                    text: "close"
+                    onClicked: loopsWindow.close()
+                }
+            }
+
+            GridView {
+                id: loopGrid
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                cellWidth: 156
+                cellHeight: 190
+                clip: true
+                model: root.loopList()
+
+                delegate: Rectangle {
+                    width: 146
+                    height: 180
+                    color: root.panelColor
+                    border.color: root.borderColor
+                    border.width: 1
+
+                    ColumnLayout {
+                        anchors.fill: parent
+                        anchors.margins: 6
+                        spacing: 4
+
+                        Label {
+                            Layout.fillWidth: true
+                            text: modelData.name
+                            color: root.textColor
+                            font.pixelSize: 11
+                            font.bold: true
+                            elide: Text.ElideRight
+                        }
+                        Label {
+                            Layout.fillWidth: true
+                            text: root.loopDescription(modelData)
+                            color: root.mutedText
+                            font.pixelSize: 10
+                            elide: Text.ElideRight
+                        }
+
+                        Canvas {
+                            Layout.fillWidth: true
+                            Layout.preferredHeight: 32
+                            property var peaks: modelData.peaks || []
+                            onPeaksChanged: requestPaint()
+                            onWidthChanged: requestPaint()
+                            onHeightChanged: requestPaint()
+                            onPaint: {
+                                var ctx = getContext("2d")
+                                ctx.clearRect(0, 0, width, height)
+                                if (!peaks || peaks.length === 0) return
+                                ctx.strokeStyle = root.mutedText
+                                ctx.beginPath()
+                                for (var i = 0; i < peaks.length; i++) {
+                                    var x = i / Math.max(1, peaks.length - 1) * width
+                                    var a = peaks[i] * height * 0.5
+                                    ctx.moveTo(x, height * 0.5 - a)
+                                    ctx.lineTo(x, height * 0.5 + a)
+                                }
+                                ctx.stroke()
+                            }
+                        }
+
+                        RowLayout {
+                            spacing: 3
+                            FlatButton {
+                                text: modelData.playing ? "stop" : "play"
+                                implicitWidth: 44
+                                onClicked: modelData.playing
+                                    ? root.stopLoop(modelData)
+                                    : root.startLoop(modelData, true)
+                            }
+                            FlatButton {
+                                text: modelData.mute ? "unmute" : "mute"
+                                implicitWidth: 50
+                                onClicked: root.toggleLoopMute(modelData)
+                            }
+                            FlatButton {
+                                text: "edit"
+                                implicitWidth: 40
+                                onClicked: loopEditor.openFor(modelData.id)
+                            }
+                        }
+
+                        Slider {
+                            Layout.fillWidth: true
+                            implicitHeight: 18
+                            from: 0
+                            to: 2
+                            value: modelData.gain
+                            onMoved: {
+                                if (!pressed) root.sendRecorderAction({
+                                    action: "set_loop_gain",
+                                    slot: modelData.id,
+                                    gain: value
+                                })
+                            }
+                            onPressedChanged: {
+                                if (!pressed) root.sendRecorderAction({
+                                    action: "set_loop_gain",
+                                    slot: modelData.id,
+                                    gain: value
+                                })
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    Window {
+        id: loopEditor
+        property int slotId: -1
+        function openFor(id) {
+            slotId = id
+            visible = true
+        }
+
+        modality: Qt.NonModal
+        flags: Qt.Window
+        transientParent: root
+        visible: false
+        width: 620
+        height: 430
+        minimumWidth: 460
+        minimumHeight: 320
+        title: "loop editor"
+        color: root.palette.window
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 8
+            spacing: 6
+
+            Label {
+                Layout.fillWidth: true
+                text: {
+                    var slot = root.loopById(loopEditor.slotId)
+                    return slot ? slot.name : ""
+                }
+                color: root.textColor
+                font.pixelSize: 12
+                font.bold: true
+                elide: Text.ElideRight
+            }
+
+            Canvas {
+                id: editorWave
+                Layout.fillWidth: true
+                Layout.preferredHeight: 120
+                property var slot: root.loopById(loopEditor.slotId)
+                property var peaks: slot ? (slot.peaks || []) : []
+                onSlotChanged: requestPaint()
+                onPeaksChanged: requestPaint()
+                onWidthChanged: requestPaint()
+                onHeightChanged: requestPaint()
+                onPaint: {
+                    var ctx = getContext("2d")
+                    ctx.clearRect(0, 0, width, height)
+                    if (!slot || !peaks || peaks.length === 0) return
+
+                    ctx.strokeStyle = root.borderColor
+                    ctx.beginPath()
+                    ctx.moveTo(0, height * 0.5)
+                    ctx.lineTo(width, height * 0.5)
+                    ctx.stroke()
+
+                    ctx.strokeStyle = root.mutedText
+                    ctx.beginPath()
+                    for (var i = 0; i < peaks.length; i++) {
+                        var x = i / Math.max(1, peaks.length - 1) * width
+                        var a = peaks[i] * height * 0.45
+                        ctx.moveTo(x, height * 0.5 - a)
+                        ctx.lineTo(x, height * 0.5 + a)
+                    }
+                    ctx.stroke()
+
+                    // Beat grid.
+                    var beats = Math.max(1, slot.loop_beats || 1)
+                    ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25)
+                    ctx.beginPath()
+                    for (var b = 0; b <= beats; b++) {
+                        var bx = b / beats * width
+                        ctx.moveTo(bx, 0)
+                        ctx.lineTo(bx, height)
+                    }
+                    ctx.stroke()
+
+                    // Seam: where the rotated loop starts.
+                    var frames = Math.max(1, slot.frames || 1)
+                    var phase = ((slot.nudge_samples || 0) % frames + frames) % frames / frames
+                    ctx.strokeStyle = root.accentColor
+                    ctx.lineWidth = 2
+                    ctx.beginPath()
+                    ctx.moveTo(phase * width, 0)
+                    ctx.lineTo(phase * width, height)
+                    ctx.stroke()
+                    ctx.lineWidth = 1
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                Label {
+                    text: "nudge"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                FlatButton { text: "-100"; implicitWidth: 40; onClicked: root.nudgeLoop(-100) }
+                FlatButton { text: "-10"; implicitWidth: 36; onClicked: root.nudgeLoop(-10) }
+                FlatButton { text: "-1"; implicitWidth: 30; onClicked: root.nudgeLoop(-1) }
+                Label {
+                    Layout.fillWidth: true
+                    text: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        return slot ? root.loopNudgeText(slot) : ""
+                    }
+                    color: root.textColor
+                    font.pixelSize: 11
+                    font.family: "monospace"
+                    horizontalAlignment: Text.AlignHCenter
+                }
+                FlatButton { text: "+1"; implicitWidth: 30; onClicked: root.nudgeLoop(1) }
+                FlatButton { text: "+10"; implicitWidth: 36; onClicked: root.nudgeLoop(10) }
+                FlatButton { text: "+100"; implicitWidth: 40; onClicked: root.nudgeLoop(100) }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: {
+                    var slot = root.loopById(loopEditor.slotId)
+                    if (!slot) return ""
+                    return "auto " + slot.base_nudge + " · transient " + slot.transient_nudge
+                        + " · manual " + slot.manual_nudge
+                }
+                color: root.mutedText
+                font.pixelSize: 10
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    text: "gain"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                Slider {
+                    Layout.fillWidth: true
+                    from: 0
+                    to: 2
+                    value: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        return slot ? slot.gain : 1
+                    }
+                    onMoved: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        if (slot && !pressed) root.sendRecorderAction({
+                            action: "set_loop_gain",
+                            slot: slot.id,
+                            gain: value
+                        })
+                    }
+                    onPressedChanged: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        if (slot && !pressed) root.sendRecorderAction({
+                            action: "set_loop_gain",
+                            slot: slot.id,
+                            gain: value
+                        })
+                    }
+                }
+                CheckBox {
+                    text: "mute"
+                    checked: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        return slot ? slot.mute : false
+                    }
+                    onToggled: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        if (slot) root.sendRecorderAction({ action: "set_loop_mute", slot: slot.id, mute: checked })
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    text: "name"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                TextField {
+                    Layout.fillWidth: true
+                    text: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        return slot ? slot.name : ""
+                    }
+                    onEditingFinished: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        if (slot) root.renameLoop(slot, text)
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    text: "bit depth"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                ComboBox {
+                    id: editorDepth
+                    Layout.preferredWidth: 120
+                    font.pixelSize: 11
+                    model: ["16-bit", "24-bit", "32-bit float"]
+                    currentIndex: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        var depth = slot ? (slot.bit_depth || root.recorderSettings().bit_depth) : 24
+                        return depth === 16 ? 0 : (depth === 32 ? 2 : 1)
+                    }
+                }
+                FlatButton {
+                    text: "save"
+                    onClicked: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        if (!slot) return
+                        var depths = [16, 24, 32]
+                        root.saveLoop(slot, depths[editorDepth.currentIndex])
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        if (!slot) return ""
+                        return slot.saved ? (slot.path || "saved") : "not saved"
+                    }
+                    color: root.mutedText
+                    font.pixelSize: 10
+                    elide: Text.ElideMiddle
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Item { Layout.fillWidth: true }
+                FlatButton {
+                    text: "delete"
+                    onClicked: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        if (slot) root.sendRecorderAction({ action: "loop_delete", slot: slot.id })
+                        loopEditor.close()
+                    }
+                }
+                FlatButton {
+                    text: "close"
+                    onClicked: loopEditor.close()
                 }
             }
         }

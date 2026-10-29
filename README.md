@@ -29,6 +29,9 @@ small OSC control protocol.
 - Sessions (TOML) with plugin state, patch info, and window geometry; File menu
   with Open/Save/Save As/Recent and an unsaved-changes prompt.
 - Metering with selectable taps (strip IN/GAIN/OUT; bus IN/SEND/RET/OUT).
+- **Loop recorder** with bar-aligned capture from the MIDI clock, multi-source
+  strip/bus taps, automatic latency and transient alignment, circular nudge,
+  a loop launcher, and 16/24-bit or 32-bit float WAV export.
 
 ## Using the UI
 
@@ -46,6 +49,13 @@ small OSC control protocol.
   strip/bus sidechain panel.
 - **Meters**: click a meter to cycle its tap (strip IN/GAIN/OUT; bus
   IN/SEND/RET/OUT).
+- **Loop recorder**: `Options → Recorder…` selects any strips/buses (and the
+  tap for each strip), arms the recorder, and starts on the next bar 1 from the
+  MIDI clock. The editor opens the take with auto-latency and transient
+  offsets, fine/coarse circular nudge, and a WAV save at 16/24-bit or 32-bit
+  float. `Options → Loops…` is the launcher: play/stop (quantized to the next
+  bar), gain, mute and edit. Loops are saved under `VIBEMIX_CONFIG_DIR/loops/`
+  unless a path is chosen. A MIDI clock is required to record.
 - **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
   matrix; pick the device on each axis. Tick a cell to connect. Only
   connections involving vibemix ports are editable.

@@ -226,6 +226,21 @@ pub enum ControlMessage {
     SetTransportUi {
         json: String,
     },
+    SetRecorderSources {
+        json: String,
+    },
+    SetRecorderSettings {
+        json: String,
+    },
+    RecorderAction {
+        json: String,
+    },
+    RecorderStatus {
+        json: String,
+    },
+    LoopList {
+        json: String,
+    },
     SetLayout {
         strips_per_row: u32,
         buses_per_row: u32,
@@ -653,12 +668,13 @@ impl ControlMessage {
             },
             PastePlugin { location, target } => OscMessage {
                 addr: addr::PLUGIN_PASTE.to_string(),
-                args: vec![
-                    OscType::Int(*location as i32),
-                    OscType::Int(*target as i32),
-                ],
+                args: vec![OscType::Int(*location as i32), OscType::Int(*target as i32)],
             },
-            Clipboard { has, location, name } => OscMessage {
+            Clipboard {
+                has,
+                location,
+                name,
+            } => OscMessage {
                 addr: addr::PLUGIN_CLIPBOARD.to_string(),
                 args: vec![
                     OscType::Int(*has as i32),
@@ -756,6 +772,26 @@ impl ControlMessage {
                 addr: addr::TRANSPORT_UI.to_string(),
                 args: vec![OscType::String(json.clone())],
             },
+            SetRecorderSources { json } => OscMessage {
+                addr: addr::RECORDER_SOURCES.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
+            SetRecorderSettings { json } => OscMessage {
+                addr: addr::RECORDER_SETTINGS.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
+            RecorderAction { json } => OscMessage {
+                addr: addr::RECORDER_ACTION.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
+            RecorderStatus { json } => OscMessage {
+                addr: addr::RECORDER_STATUS.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
+            LoopList { json } => OscMessage {
+                addr: addr::LOOP_LIST.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
             SetLayout {
                 strips_per_row,
                 buses_per_row,
@@ -800,10 +836,7 @@ impl ControlMessage {
             },
             SetStripMidiChannel { strip, channel } => OscMessage {
                 addr: addr::STRIP_MIDI_CHANNEL.to_string(),
-                args: vec![
-                    OscType::Int(*strip as i32),
-                    OscType::Int(*channel as i32),
-                ],
+                args: vec![OscType::Int(*strip as i32), OscType::Int(*channel as i32)],
             },
             SetBusMidiChannel { bus, channel } => OscMessage {
                 addr: addr::BUS_MIDI_CHANNEL.to_string(),
@@ -899,11 +932,17 @@ impl ControlMessage {
             },
             Connect { source, sink } => OscMessage {
                 addr: addr::CONNECT.to_string(),
-                args: vec![OscType::String(source.clone()), OscType::String(sink.clone())],
+                args: vec![
+                    OscType::String(source.clone()),
+                    OscType::String(sink.clone()),
+                ],
             },
             Disconnect { source, sink } => OscMessage {
                 addr: addr::DISCONNECT.to_string(),
-                args: vec![OscType::String(source.clone()), OscType::String(sink.clone())],
+                args: vec![
+                    OscType::String(source.clone()),
+                    OscType::String(sink.clone()),
+                ],
             },
             ConnectResult {
                 ok,
@@ -1198,6 +1237,21 @@ impl ControlMessage {
                 value: float(args, 0)?,
             }),
             addr::TRANSPORT_UI => Some(ControlMessage::SetTransportUi {
+                json: string(args, 0)?,
+            }),
+            addr::RECORDER_SOURCES => Some(ControlMessage::SetRecorderSources {
+                json: string(args, 0)?,
+            }),
+            addr::RECORDER_SETTINGS => Some(ControlMessage::SetRecorderSettings {
+                json: string(args, 0)?,
+            }),
+            addr::RECORDER_ACTION => Some(ControlMessage::RecorderAction {
+                json: string(args, 0)?,
+            }),
+            addr::RECORDER_STATUS => Some(ControlMessage::RecorderStatus {
+                json: string(args, 0)?,
+            }),
+            addr::LOOP_LIST => Some(ControlMessage::LoopList {
                 json: string(args, 0)?,
             }),
             addr::LAYOUT => Some(ControlMessage::SetLayout {
@@ -1600,20 +1654,14 @@ mod tests {
             strip: 2,
             pan: -0.25,
         });
-        roundtrip(ControlMessage::SetStripInputGain {
-            strip: 2,
-            db: 6.5,
-        });
+        roundtrip(ControlMessage::SetStripInputGain { strip: 2, db: 6.5 });
         roundtrip(ControlMessage::SetBusGain { bus: 0, gain: 1.5 });
         roundtrip(ControlMessage::SetBusMute { bus: 1, mute: true });
         roundtrip(ControlMessage::SetStripMidiChannel {
             strip: 4,
             channel: 2,
         });
-        roundtrip(ControlMessage::SetBusMidiChannel {
-            bus: 1,
-            channel: 9,
-        });
+        roundtrip(ControlMessage::SetBusMidiChannel { bus: 1, channel: 9 });
         roundtrip(ControlMessage::SetPluginMidiChannel {
             location: 0,
             target: 2,

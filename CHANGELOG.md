@@ -4,6 +4,18 @@ All notable changes to this project are documented here. The format is based on
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and this project
 adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [Unreleased]
+
+### Added
+
+- **Loop recorder** (`Options → Recorder…`): capture a bar-aligned loop from
+  the MIDI clock, summing any strips/buses at selectable taps. Takes get
+  automatic JACK/plugin latency compensation, optional transient alignment and
+  a circular manual nudge, and can be saved as 16-bit, 24-bit or 32-bit float
+  WAV. `Options → Loops…` is a separate launcher window with quantized
+  play/stop, gain, mute and an editor. Loops are stored in the session and
+  under `VIBEMIX_CONFIG_DIR/loops/`.
+
 ## [1.0.2] - 2026-10-22
 
 ### Added

@@ -274,6 +274,12 @@ pub struct MixerModel {
     /// to plugins.
     #[serde(default = "default_true")]
     pub midi_sync: bool,
+    /// Loop recorder sources and save settings.
+    #[serde(default)]
+    pub recorder: crate::recorder::RecorderSettings,
+    /// Loop slots (metadata; the audio lives in the WAV files).
+    #[serde(default)]
+    pub loops: Vec<crate::recorder::LoopSlot>,
     /// External JACK ports feeding the engine's MIDI input. `None` means no
     /// patch information was saved (connections are left alone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -403,6 +409,8 @@ impl MixerModel {
             transport_ui: TransportUi::default(),
             layout: LayoutSettings::default(),
             midi_sync: true,
+            recorder: crate::recorder::RecorderSettings::default(),
+            loops: Vec::new(),
             midi_connections: None,
         }
     }

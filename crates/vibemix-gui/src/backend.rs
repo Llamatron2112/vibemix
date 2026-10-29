@@ -1,12 +1,12 @@
 #![allow(clippy::too_many_arguments)]
 
+use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
-use std::fs;
 
 use cxx_qt_lib::QString;
 use vibemix_proto::{message::ChunkAssembler, ControlMessage};
@@ -47,6 +47,12 @@ static LAST_METERS_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 static PORTS_REV: AtomicU64 = AtomicU64::new(0);
 static LAST_PORTS_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 static PORTS: Mutex<String> = Mutex::new(String::new());
+static RECORDER: Mutex<String> = Mutex::new(String::new());
+static LOOPS: Mutex<String> = Mutex::new(String::new());
+static RECORDER_REV: AtomicU64 = AtomicU64::new(0);
+static LOOPS_REV: AtomicU64 = AtomicU64::new(0);
+static LAST_RECORDER_REV: AtomicU64 = AtomicU64::new(0);
+static LAST_LOOPS_REV: AtomicU64 = AtomicU64::new(0);
 static PENDING_CONNECTION_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static LAST_CLOCK: Mutex<Option<ClockState>> = Mutex::new(None);
 static LAST_SESSION_PATH: Mutex<String> = Mutex::new(String::new());
@@ -83,7 +89,9 @@ struct View {
 /// data, so a panic while it was locked leaves it usable; refusing to lock
 /// again (the default `expect` behaviour) would wedge the whole GUI.
 fn view_lock() -> std::sync::MutexGuard<'static, View> {
-    view().lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    view()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn view() -> &'static Mutex<View> {
@@ -298,7 +306,11 @@ fn receive_loop(socket: UdpSocket) {
                         *guard = Some(json);
                     }
                 }
-                Some(ControlMessage::Clipboard { has, location, name }) => {
+                Some(ControlMessage::Clipboard {
+                    has,
+                    location,
+                    name,
+                }) => {
                     if let Ok(mut guard) = CLIPBOARD.lock() {
                         *guard = (has, location, name);
                     }
@@ -361,6 +373,18 @@ fn receive_loop(socket: UdpSocket) {
                         *guard = json;
                     }
                     PORTS_REV.fetch_add(1, Ordering::Release);
+                }
+                Some(ControlMessage::RecorderStatus { json }) => {
+                    if let Ok(mut guard) = RECORDER.lock() {
+                        *guard = json;
+                    }
+                    RECORDER_REV.fetch_add(1, Ordering::Release);
+                }
+                Some(ControlMessage::LoopList { json }) => {
+                    if let Ok(mut guard) = LOOPS.lock() {
+                        *guard = json;
+                    }
+                    LOOPS_REV.fetch_add(1, Ordering::Release);
                 }
                 Some(ControlMessage::ConnectResult { ok, error, .. }) => {
                     if let Ok(mut guard) = PENDING_CONNECTION_ERROR.lock() {
@@ -512,7 +536,10 @@ fn build_plugins(
         let mut controls_structure = Vec::new();
         let mut controls_values = Vec::new();
         let mut sidechain = serde_json::Map::new();
-        if let Some(sources) = plugin.get("sidechain").and_then(serde_json::Value::as_array) {
+        if let Some(sources) = plugin
+            .get("sidechain")
+            .and_then(serde_json::Value::as_array)
+        {
             for source in sources {
                 if let Some(strip) = source.get("strip").and_then(serde_json::Value::as_u64) {
                     sidechain.insert(
@@ -539,8 +566,12 @@ fn build_plugins(
                     "integer": control.get("integer").cloned().unwrap_or(serde_json::json!(false)),
                     "scale_points": control.get("scale_points").cloned().unwrap_or(serde_json::json!([])),
                 }));
-                controls_values
-                    .push(control.get("value").cloned().unwrap_or(serde_json::json!(0.0)));
+                controls_values.push(
+                    control
+                        .get("value")
+                        .cloned()
+                        .unwrap_or(serde_json::json!(0.0)),
+                );
             }
         }
 
@@ -583,7 +614,9 @@ fn split_state(value: &serde_json::Value) -> (String, String) {
                 &mut sidechain_values,
             );
             let plugins_post_structure = build_plugins(
-                strip.get("plugins_post").and_then(serde_json::Value::as_array),
+                strip
+                    .get("plugins_post")
+                    .and_then(serde_json::Value::as_array),
                 1,
                 id,
                 &mut params_values,
@@ -684,6 +717,7 @@ fn split_state(value: &serde_json::Value) -> (String, String) {
         "beats_per_bar": value.get("beats_per_bar").cloned().unwrap_or(serde_json::json!(4.0)),
         "midi_bindings": value.get("midi_bindings").cloned().unwrap_or(serde_json::json!([])),
         "transport_ui": value.get("transport_ui").cloned().unwrap_or(serde_json::json!({})),
+        "recorder": value.get("recorder").cloned().unwrap_or(serde_json::json!({})),
         "layout": value
             .get("layout")
             .cloned()
@@ -736,6 +770,8 @@ pub mod qobject {
         #[qproperty(QString, undo_label)]
         #[qproperty(QString, redo_label)]
         #[qproperty(QString, clock)]
+        #[qproperty(QString, recorder)]
+        #[qproperty(QString, loops)]
         #[qproperty(bool, catalog_ready)]
         #[qproperty(bool, scan_running)]
         #[qproperty(i32, scan_done)]
@@ -877,7 +913,14 @@ pub mod qobject {
 
         #[qinvokable]
         #[cxx_name = "setPluginParam"]
-        fn update_plugin_param(&self, location: i32, target: i32, slot: i32, param: i32, value: f32);
+        fn update_plugin_param(
+            &self,
+            location: i32,
+            target: i32,
+            slot: i32,
+            param: i32,
+            value: f32,
+        );
 
         #[qinvokable]
         #[cxx_name = "setPluginBypass"]
@@ -885,15 +928,35 @@ pub mod qobject {
 
         #[qinvokable]
         #[cxx_name = "setPluginSidechainEnabled"]
-        fn update_plugin_sidechain_enabled(&self, location: i32, target: i32, slot: i32, enabled: bool);
+        fn update_plugin_sidechain_enabled(
+            &self,
+            location: i32,
+            target: i32,
+            slot: i32,
+            enabled: bool,
+        );
 
         #[qinvokable]
         #[cxx_name = "setSidechainSend"]
-        fn update_plugin_sidechain(&self, location: i32, target: i32, slot: i32, strip: i32, gain: f32);
+        fn update_plugin_sidechain(
+            &self,
+            location: i32,
+            target: i32,
+            slot: i32,
+            strip: i32,
+            gain: f32,
+        );
 
         #[qinvokable]
         #[cxx_name = "setSidechainPreFader"]
-        fn update_plugin_sidechain_pre(&self, location: i32, target: i32, slot: i32, strip: i32, pre: bool);
+        fn update_plugin_sidechain_pre(
+            &self,
+            location: i32,
+            target: i32,
+            slot: i32,
+            strip: i32,
+            pre: bool,
+        );
 
         #[qinvokable]
         #[cxx_name = "openPluginUi"]
@@ -923,33 +986,54 @@ pub mod qobject {
         #[cxx_name = "duplicateBus"]
         fn duplicate_bus(&self, bus: i32);
 
-    #[qinvokable]
-    #[cxx_name = "undo"]
-    fn undo(&self);
+        #[qinvokable]
+        #[cxx_name = "undo"]
+        fn undo(&self);
 
-    #[qinvokable]
-    #[cxx_name = "redo"]
-    fn redo(&self);
+        #[qinvokable]
+        #[cxx_name = "redo"]
+        fn redo(&self);
 
-    #[qinvokable]
-    #[cxx_name = "setTransportUi"]
-    fn set_transport_ui(&self, json: &QString);
+        #[qinvokable]
+        #[cxx_name = "setTransportUi"]
+        fn set_transport_ui(&self, json: &QString);
 
-    #[qinvokable]
-    #[cxx_name = "setLayout"]
-    fn set_layout(&self, strips_per_row: i32, buses_per_row: i32);
+        #[qinvokable]
+        #[cxx_name = "setRecorderSources"]
+        fn set_recorder_sources(&self, json: &QString);
 
-    #[qinvokable]
-    #[cxx_name = "setBeatsPerBar"]
-    fn set_beats_per_bar(&self, value: f32);
+        #[qinvokable]
+        #[cxx_name = "setRecorderSettings"]
+        fn set_recorder_settings(&self, json: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "recorderAction"]
+        fn recorder_action(&self, json: &QString);
+
+        #[qinvokable]
+        #[cxx_name = "setLayout"]
+        fn set_layout(&self, strips_per_row: i32, buses_per_row: i32);
+
+        #[qinvokable]
+        #[cxx_name = "setBeatsPerBar"]
+        fn set_beats_per_bar(&self, value: f32);
 
         #[qinvokable]
         #[cxx_name = "midiLearn"]
-        fn midi_learn(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32, min: f32, max: f32);
+        fn midi_learn(
+            &self,
+            kind: i32,
+            location: i32,
+            target: i32,
+            slot: i32,
+            param: i32,
+            min: f32,
+            max: f32,
+        );
 
-    #[qinvokable]
-    #[cxx_name = "midiLearnCancel"]
-    fn midi_learn_cancel(&self);
+        #[qinvokable]
+        #[cxx_name = "midiLearnCancel"]
+        fn midi_learn_cancel(&self);
 
         #[qinvokable]
         #[cxx_name = "midiBindingsClear"]
@@ -973,7 +1057,18 @@ pub mod qobject {
 
         #[qinvokable]
         #[cxx_name = "midiBind"]
-        fn midi_bind(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32, min: f32, max: f32, channel: i32, cc: i32);
+        fn midi_bind(
+            &self,
+            kind: i32,
+            location: i32,
+            target: i32,
+            slot: i32,
+            param: i32,
+            min: f32,
+            max: f32,
+            channel: i32,
+            cc: i32,
+        );
 
         #[qinvokable]
         #[cxx_name = "midiUnbind"]
@@ -981,7 +1076,15 @@ pub mod qobject {
 
         #[qinvokable]
         #[cxx_name = "keyBind"]
-        fn key_bind(&self, kind: i32, location: i32, target: i32, slot: i32, param: i32, key: &QString);
+        fn key_bind(
+            &self,
+            kind: i32,
+            location: i32,
+            target: i32,
+            slot: i32,
+            param: i32,
+            key: &QString,
+        );
 
         #[qinvokable]
         #[cxx_name = "keyTrigger"]
@@ -1027,6 +1130,8 @@ pub struct BackendRust {
     undo_label: QString,
     redo_label: QString,
     clock: QString,
+    recorder: QString,
+    loops: QString,
     catalog_ready: bool,
     scan_running: bool,
     scan_done: i32,
@@ -1066,6 +1171,8 @@ impl Default for BackendRust {
             undo_label: QString::from(""),
             redo_label: QString::from(""),
             clock: QString::from("{\"locked\":false,\"playing\":false,\"bpm\":120,\"beats\":0,\"seconds\":0,\"beats_per_bar\":4,\"jitter_bpm\":0,\"glitches\":0}"),
+            recorder: QString::from("{\"state\":\"idle\",\"progress\":0,\"frames\":0,\"peak\":0,\"loop_beats\":0,\"message\":\"\"}"),
+            loops: QString::from("[]"),
             catalog_ready: false,
             scan_running: false,
             scan_done: 0,
@@ -1107,11 +1214,25 @@ impl qobject::Backend {
         let ports_rev = PORTS_REV.load(Ordering::Acquire);
         if ports_rev != LAST_PORTS_REV.load(Ordering::Relaxed) {
             LAST_PORTS_REV.store(ports_rev, Ordering::Relaxed);
-            let ports = PORTS
+            let ports = PORTS.lock().map(|guard| guard.clone()).unwrap_or_default();
+            self.as_mut().set_ports(QString::from(ports.as_str()));
+        }
+
+        let recorder_rev = RECORDER_REV.load(Ordering::Acquire);
+        if recorder_rev != LAST_RECORDER_REV.load(Ordering::Relaxed) {
+            LAST_RECORDER_REV.store(recorder_rev, Ordering::Relaxed);
+            let json = RECORDER
                 .lock()
                 .map(|guard| guard.clone())
                 .unwrap_or_default();
-            self.as_mut().set_ports(QString::from(ports.as_str()));
+            self.as_mut().set_recorder(QString::from(json.as_str()));
+        }
+
+        let loops_rev = LOOPS_REV.load(Ordering::Acquire);
+        if loops_rev != LAST_LOOPS_REV.load(Ordering::Relaxed) {
+            LAST_LOOPS_REV.store(loops_rev, Ordering::Relaxed);
+            let json = LOOPS.lock().map(|guard| guard.clone()).unwrap_or_default();
+            self.as_mut().set_loops(QString::from(json.as_str()));
         }
         if let Some(error) = PENDING_CONNECTION_ERROR
             .lock()
@@ -1123,9 +1244,12 @@ impl qobject::Backend {
         }
         self.as_mut().set_connected(is_connected());
 
-        if let Some(report) = PENDING_REPORT.lock().ok().and_then(|mut guard| guard.take()) {
-            self.as_mut()
-                .set_report(QString::from(report.as_str()));
+        if let Some(report) = PENDING_REPORT
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
+        {
+            self.as_mut().set_report(QString::from(report.as_str()));
         }
 
         self.as_mut().set_dirty(DIRTY.load(Ordering::SeqCst));
@@ -1152,8 +1276,10 @@ impl qobject::Backend {
                 }
             }
         }
-        if let Some((ok, path, error)) =
-            PENDING_SESSION.lock().ok().and_then(|mut guard| guard.take())
+        if let Some((ok, path, error)) = PENDING_SESSION
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
         {
             let nonce = SESSION_NONCE.fetch_add(1, Ordering::SeqCst) + 1;
             let json = serde_json::json!({
@@ -1167,8 +1293,10 @@ impl qobject::Backend {
                 .set_session_result(QString::from(json.as_str()));
         }
 
-        if let Some((width, height, maximized)) =
-            PENDING_WINDOW.lock().ok().and_then(|mut guard| guard.take())
+        if let Some((width, height, maximized)) = PENDING_WINDOW
+            .lock()
+            .ok()
+            .and_then(|mut guard| guard.take())
         {
             let nonce = WINDOW_NONCE.fetch_add(1, Ordering::SeqCst) + 1;
             let json = serde_json::json!({
@@ -1184,8 +1312,7 @@ impl qobject::Backend {
 
         self.as_mut()
             .set_sample_rate(SAMPLE_RATE.load(Ordering::SeqCst) as i32);
-        self.as_mut()
-            .set_xruns(XRUNS.load(Ordering::SeqCst) as i32);
+        self.as_mut().set_xruns(XRUNS.load(Ordering::SeqCst) as i32);
 
         if let Ok(clipboard) = CLIPBOARD.lock() {
             self.as_mut().set_has_clipboard(clipboard.0);
@@ -1469,7 +1596,14 @@ impl qobject::Backend {
         });
     }
 
-    pub fn update_plugin_param(&self, location: i32, target: i32, slot: i32, param: i32, value: f32) {
+    pub fn update_plugin_param(
+        &self,
+        location: i32,
+        target: i32,
+        slot: i32,
+        param: i32,
+        value: f32,
+    ) {
         note_action("plugin param");
         send(ControlMessage::SetPluginParam {
             location: location as u32,
@@ -1611,6 +1745,27 @@ impl qobject::Backend {
     pub fn set_transport_ui(&self, json: &QString) {
         note_action("transport ui");
         send(ControlMessage::SetTransportUi {
+            json: json.to_string(),
+        });
+    }
+
+    pub fn set_recorder_sources(&self, json: &QString) {
+        note_action("recorder sources");
+        send(ControlMessage::SetRecorderSources {
+            json: json.to_string(),
+        });
+    }
+
+    pub fn set_recorder_settings(&self, json: &QString) {
+        note_action("recorder settings");
+        send(ControlMessage::SetRecorderSettings {
+            json: json.to_string(),
+        });
+    }
+
+    pub fn recorder_action(&self, json: &QString) {
+        note_action("recorder action");
+        send(ControlMessage::RecorderAction {
             json: json.to_string(),
         });
     }
@@ -1799,7 +1954,8 @@ mod tests {
 
     #[test]
     fn extracts_ids_from_snapshot() {
-        let json = r#"{"strips":[{"id":0,"name":"ch 1","plugins":[]},{"id":2}],"buses":[{"id":0}]}"#;
+        let json =
+            r#"{"strips":[{"id":0,"name":"ch 1","plugins":[]},{"id":2}],"buses":[{"id":0}]}"#;
         let value: serde_json::Value = serde_json::from_str(json).expect("parse");
         let (strips, buses) = extract_ids(&value);
         assert_eq!(strips, vec![0, 2]);

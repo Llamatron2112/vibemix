@@ -1,20 +1,27 @@
+#![allow(clippy::items_after_test_module)]
+
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::net::{SocketAddr, UdpSocket};
 use std::os::unix::process::ExitStatusExt;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
+use crate::midi_map::target_from_code;
 use vibemix_core::config::config_dir;
 use vibemix_core::ids::{BusId, StripId};
+use vibemix_core::model::PluginFormat;
 use vibemix_core::model::{
     Bus, MidiBinding, MidiTarget, MixerModel, PluginSlot, Send, SidechainSource, Strip,
     WindowGeometry, MAX_SEND_DELAY_MS,
 };
-use crate::midi_map::target_from_code;
-use vibemix_core::model::PluginFormat;
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
+use vibemix_core::recorder::{
+    detect_transient, peaks, rotate_interleaved, LoopSlot, RecorderAction, RecorderSettings,
+    RecorderSource, RecorderStatus,
+};
 use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 
 use crate::ui_service::UiService;
@@ -27,6 +34,7 @@ use crate::health::{HealthStore, Scan, ScanEvent, Status, VerdictMeta};
 use crate::params::{
     MeterLevels, SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
 };
+use crate::recorder::MAX_LOOPS;
 
 const PLUGIN_LOC_STRIP_PRE: u32 = 0;
 const PLUGIN_LOC_STRIP_POST: u32 = 1;
@@ -56,6 +64,15 @@ struct PluginClipboard {
     slot: PluginSlot,
     location: u32,
 }
+
+/// A loop slot loaded in memory. `raw` is the unrotated capture (or the saved
+/// file when loaded from disk); the engine holds the rotated playback copy.
+struct LoopRuntime {
+    slot: LoopSlot,
+    raw: Vec<f32>,
+}
+
+const LOOP_PEAK_BUCKETS: usize = 512;
 
 /// A full mixer-model snapshot for undo/redo.
 struct UndoEntry {
@@ -140,16 +157,17 @@ pub struct Controller {
     /// Reused meter snapshot and OSC packet buffers (no per-frame allocation).
     meter_levels: MeterLevels,
     meter_bytes: Vec<u8>,
+    loops: Vec<Option<LoopRuntime>>,
+    recorder_status: RecorderStatus,
+    recorder_dirty: bool,
+    loops_dirty: bool,
 }
 
 /// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
 /// UI host) or a VST3 `IPlugView`.
 enum OpenUi {
     /// LV2 editor hosted in the out-of-process UI host, keyed by host id.
-    Lv2Remote {
-        id: u32,
-        context: Box<UiWriteCtx>,
-    },
+    Lv2Remote { id: u32, context: Box<UiWriteCtx> },
     /// LV2 editor hosted in-process (instance-access UIs, or `VIBEMIX_UI_LOCAL`).
     Lv2Local {
         window: UiWindow,
@@ -175,8 +193,6 @@ struct OutputEvent {
     type_uri: Option<String>,
     bytes: Vec<u8>,
 }
-
-
 
 struct UiWriteCtx {
     location: u32,
@@ -236,7 +252,8 @@ impl UiWriteCtx {
         }
         // Per the atom extension, sequence events transfer individually to the
         // UI with `format = atom:eventTransfer`.
-        let event_transfer = vibemix_lv2::urid::UridMap::shared().map(vibemix_lv2::EVENT_TRANSFER_URI);
+        let event_transfer =
+            vibemix_lv2::urid::UridMap::shared().map(vibemix_lv2::EVENT_TRANSFER_URI);
         for index in 0..atoms {
             let seq = outputs.atom_seq(index);
             if seq == 0 || self.last_atom_seq[index] == seq {
@@ -275,11 +292,7 @@ extern "C" fn ui_port_write(
             return;
         }
         let value = unsafe { *(buffer as *const f32) };
-        if let Some((_, param)) = context
-            .ports
-            .iter()
-            .find(|(port, _)| *port == port_index)
-        {
+        if let Some((_, param)) = context.ports.iter().find(|(port, _)| *port == port_index) {
             if let Some(chain) = strip_chain(context.location) {
                 context
                     .params
@@ -372,8 +385,17 @@ impl Controller {
             last_routing_signature: 0,
             meter_levels: MeterLevels::default(),
             meter_bytes: Vec::new(),
+            loops: (0..MAX_LOOPS).map(|_| None).collect(),
+            recorder_status: RecorderStatus::default(),
+            recorder_dirty: false,
+            loops_dirty: true,
         };
         controller.ensure_model_plugin_controls();
+        controller
+            .engine
+            .recorder()
+            .set_sources(&controller.model.recorder.sources);
+        controller.load_loops_from_model();
         save_catalog(&controller.plugins);
         controller.rebuild_shared_bindings();
         controller.start_health_scan();
@@ -439,6 +461,7 @@ impl Controller {
             }
 
             self.engine.drain_garbage();
+            self.poll_recorder();
             self.pump_uis();
             let vst3_edits = self.drain_vst3_param_edits();
             let clap_edits = self.drain_clap_param_edits();
@@ -450,8 +473,7 @@ impl Controller {
             let signature = sidechain_signature(&self.model);
             if signature != self.last_routing_signature {
                 self.last_routing_signature = signature;
-                let (order, delayed) =
-                    compute_strip_order(&self.model, self.params.strip_count());
+                let (order, delayed) = compute_strip_order(&self.model, self.params.strip_count());
                 if let Err(error) = self.engine.set_strip_order(order, delayed) {
                     tracing::warn!(%error, "failed to install strip order");
                 }
@@ -524,8 +546,22 @@ impl Controller {
             if actions.catalog {
                 self.send_catalog(address);
             }
-            if actions.snapshot || param_edits {
+            if actions.snapshot {
                 self.send_state(address);
+                self.send_recorder(address);
+                self.send_loops(address);
+                self.recorder_dirty = false;
+                self.loops_dirty = false;
+            } else if param_edits {
+                self.send_state(address);
+            }
+            if self.recorder_dirty {
+                self.send_recorder(address);
+                self.recorder_dirty = false;
+            }
+            if self.loops_dirty {
+                self.send_loops(address);
+                self.loops_dirty = false;
             }
             if self.clipboard_dirty {
                 self.clipboard_dirty = false;
@@ -602,10 +638,14 @@ impl Controller {
         }
         self.sample_rate = rate;
 
-        if let Err(error) =
-            self.engine
-                .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut self.model, &self.params, rate as f64)
-        {
+        if let Err(error) = self.engine.rebuild_plugins(
+            &self.host,
+            &self.vst3,
+            &self.clap,
+            &mut self.model,
+            &self.params,
+            rate as f64,
+        ) {
             tracing::warn!(%error, "failed to rebuild plugins after sample-rate change");
         }
         self.close_all_uis();
@@ -808,8 +848,7 @@ impl Controller {
             }
             ControlMessage::SetSendDelay { strip, bus, ms } => {
                 let ms = ms.clamp(0.0, vibemix_core::model::MAX_SEND_DELAY_MS);
-                self.params
-                    .set_send_delay(strip as usize, bus as usize, ms);
+                self.params.set_send_delay(strip as usize, bus as usize, ms);
                 if let Some(target) = self.model.strip_mut(StripId(strip)) {
                     if let Some(send) = target.sends.iter_mut().find(|send| send.bus.0 == bus) {
                         send.delay_ms = ms;
@@ -1012,13 +1051,9 @@ impl Controller {
                 enabled,
             } => {
                 if let Some(chain) = strip_chain(location) {
-                    if let Some(plugin) = self
-                        .model
-                        .strip_mut(StripId(target))
-                        .and_then(|strip| {
-                            strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
-                        })
-                    {
+                    if let Some(plugin) = self.model.strip_mut(StripId(target)).and_then(|strip| {
+                        strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
+                    }) {
                         plugin.sidechain_enabled = enabled;
                     }
                 } else if let Some(plugin) = self
@@ -1046,10 +1081,8 @@ impl Controller {
                     if source < self.model.strips.len() {
                         let strip_id = StripId(source as u32);
                         if let Some(chain) = strip_chain(location) {
-                            if let Some(plugin) = self
-                                .model
-                                .strip_mut(StripId(target))
-                                .and_then(|strip| {
+                            if let Some(plugin) =
+                                self.model.strip_mut(StripId(target)).and_then(|strip| {
                                     strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
                                 })
                             {
@@ -1081,10 +1114,8 @@ impl Controller {
                 if source < self.model.strips.len() {
                     let strip_id = StripId(strip);
                     if let Some(chain) = strip_chain(location) {
-                        if let Some(plugin) = self
-                            .model
-                            .strip_mut(StripId(target))
-                            .and_then(|strip| {
+                        if let Some(plugin) =
+                            self.model.strip_mut(StripId(target)).and_then(|strip| {
                                 strip_plugin_list_mut(strip, chain).get_mut(slot as usize)
                             })
                         {
@@ -1117,7 +1148,8 @@ impl Controller {
                 target,
                 slot,
             } => {
-                if let Some(OpenUi::Lv2Remote { id, .. }) = self.uis.remove(&(location, target, slot))
+                if let Some(OpenUi::Lv2Remote { id, .. }) =
+                    self.uis.remove(&(location, target, slot))
                 {
                     self.ui_service.close(id);
                 }
@@ -1175,10 +1207,14 @@ impl Controller {
                 // (which holds the old instance handle) must be closed first or
                 // it would touch freed memory once the old graph is retired.
                 self.close_all_uis();
-                if let Err(error) =
-                    self.engine
-                        .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut self.model, &self.params, sample_rate)
-                {
+                if let Err(error) = self.engine.rebuild_plugins(
+                    &self.host,
+                    &self.vst3,
+                    &self.clap,
+                    &mut self.model,
+                    &self.params,
+                    sample_rate,
+                ) {
                     tracing::warn!(%error, "failed to rebuild plugins after rescan");
                 }
                 tracing::info!(count = self.plugins.len(), "plugins rescanned");
@@ -1237,6 +1273,7 @@ impl Controller {
                 });
                 self.capture_plugin_states();
                 self.engine.capture_connections(&mut self.model);
+                self.rebuild_model_loops();
                 self.pending_session = Some(match save_session(&self.model, &path) {
                     Ok(()) => (true, path.clone(), String::new()),
                     Err(error) => (false, path.clone(), error),
@@ -1245,7 +1282,11 @@ impl Controller {
             }
             ControlMessage::NewSession => {
                 let mut model = MixerModel::default_minimal();
-                clamp_to_capacity(&mut model, self.params.strip_count(), self.params.bus_count());
+                clamp_to_capacity(
+                    &mut model,
+                    self.params.strip_count(),
+                    self.params.bus_count(),
+                );
                 apply_model(&self.params, &model);
                 if let Err(error) = self.engine.sync_strip_ports(&self.params) {
                     tracing::warn!(%error, "failed to sync strip ports for new session");
@@ -1257,14 +1298,22 @@ impl Controller {
                     tracing::warn!(%error, "failed to sync bus return ports for new session");
                 }
                 let sample_rate = self.engine.sample_rate() as f64;
-                match self
-                    .engine
-                    .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut model, &self.params, sample_rate)
-                {
+                match self.engine.rebuild_plugins(
+                    &self.host,
+                    &self.vst3,
+                    &self.clap,
+                    &mut model,
+                    &self.params,
+                    sample_rate,
+                ) {
                     Ok(()) => {
                         self.close_all_uis();
                         self.model = model;
                         self.engine.sync_port_names(&self.model);
+                        self.engine
+                            .recorder()
+                            .set_sources(&self.model.recorder.sources);
+                        self.clear_loops();
                         self.rebuild_shared_bindings();
                         self.clear_history();
                         self.pending_session = Some((true, String::new(), String::new()));
@@ -1282,7 +1331,11 @@ impl Controller {
             }
             ControlMessage::LoadSession { path } => match load_session(&path) {
                 Ok(mut loaded) => {
-                    clamp_to_capacity(&mut loaded, self.params.strip_count(), self.params.bus_count());
+                    clamp_to_capacity(
+                        &mut loaded,
+                        self.params.strip_count(),
+                        self.params.bus_count(),
+                    );
                     apply_model(&self.params, &loaded);
                     if let Err(error) = self.engine.sync_strip_ports(&self.params) {
                         tracing::warn!(%error, "failed to sync strip ports for session");
@@ -1294,20 +1347,27 @@ impl Controller {
                         tracing::warn!(%error, "failed to sync bus return ports for session");
                     }
                     let sample_rate = self.engine.sample_rate() as f64;
-                    match self
-                        .engine
-                        .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut loaded, &self.params, sample_rate)
-                    {
+                    match self.engine.rebuild_plugins(
+                        &self.host,
+                        &self.vst3,
+                        &self.clap,
+                        &mut loaded,
+                        &self.params,
+                        sample_rate,
+                    ) {
                         Ok(()) => {
                             self.close_all_uis();
                             self.model = loaded;
                             self.ensure_model_plugin_controls();
                             save_catalog(&self.plugins);
                             self.engine.sync_port_names(&self.model);
+                            self.engine
+                                .recorder()
+                                .set_sources(&self.model.recorder.sources);
+                            self.load_loops_from_model();
                             self.rebuild_shared_bindings();
-                            self.missing_report = missing_report_json(
-                                &self.engine.restore_connections(&self.model),
-                            );
+                            self.missing_report =
+                                missing_report_json(&self.engine.restore_connections(&self.model));
                             self.clear_history();
                             self.pending_session = Some((true, path.clone(), String::new()));
                             Actions {
@@ -1317,8 +1377,7 @@ impl Controller {
                         }
                         Err(error) => {
                             tracing::warn!(%error, "failed to rebuild plugins for session");
-                            self.pending_session =
-                                Some((false, path.clone(), error.to_string()));
+                            self.pending_session = Some((false, path.clone(), error.to_string()));
                             Actions::default()
                         }
                     }
@@ -1345,6 +1404,37 @@ impl Controller {
                     snapshot: true,
                     catalog: false,
                 }
+            }
+            ControlMessage::SetRecorderSources { json } => {
+                if let Ok(sources) = serde_json::from_str::<Vec<RecorderSource>>(&json) {
+                    self.model.recorder.sources = sources;
+                    self.engine
+                        .recorder()
+                        .set_sources(&self.model.recorder.sources);
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetRecorderSettings { json } => {
+                if let Ok(settings) = serde_json::from_str::<RecorderSettings>(&json) {
+                    self.engine.recorder().set_sources(&settings.sources);
+                    self.model.recorder = settings;
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::RecorderAction { json } => {
+                if let Ok(action) = serde_json::from_str::<RecorderAction>(&json) {
+                    self.handle_recorder_action(action);
+                }
+                Actions::default()
+            }
+            ControlMessage::RecorderStatus { .. } | ControlMessage::LoopList { .. } => {
+                Actions::default()
             }
             ControlMessage::SetLayout {
                 strips_per_row,
@@ -1935,7 +2025,8 @@ impl Controller {
                 return;
             }
             let state = if let Some(chain) = strip_chain(location) {
-                self.engine.state_proxy(target as usize, chain, slot as usize)
+                self.engine
+                    .state_proxy(target as usize, chain, slot as usize)
             } else {
                 self.engine.bus_state_proxy(target as usize, slot as usize)
             };
@@ -1961,7 +2052,8 @@ impl Controller {
                 return;
             }
             let state = if let Some(chain) = strip_chain(location) {
-                self.engine.state_proxy(target as usize, chain, slot as usize)
+                self.engine
+                    .state_proxy(target as usize, chain, slot as usize)
             } else {
                 self.engine.bus_state_proxy(target as usize, slot as usize)
             };
@@ -1979,9 +2071,11 @@ impl Controller {
         }
 
         let handle = if let Some(chain) = strip_chain(location) {
-            self.engine.plugin_handle(target as usize, chain, slot as usize)
+            self.engine
+                .plugin_handle(target as usize, chain, slot as usize)
         } else {
-            self.engine.bus_plugin_handle(target as usize, slot as usize)
+            self.engine
+                .bus_plugin_handle(target as usize, slot as usize)
         };
 
         let candidate = self
@@ -2008,14 +2102,18 @@ impl Controller {
             .unwrap_or_default();
 
         let outputs = if let Some(chain) = strip_chain(location) {
-            self.engine.plugin_outputs(target as usize, chain, slot as usize)
+            self.engine
+                .plugin_outputs(target as usize, chain, slot as usize)
         } else {
-            self.engine.bus_plugin_outputs(target as usize, slot as usize)
+            self.engine
+                .bus_plugin_outputs(target as usize, slot as usize)
         };
         let ui_inputs = if let Some(chain) = strip_chain(location) {
-            self.engine.plugin_ui_inputs(target as usize, chain, slot as usize)
+            self.engine
+                .plugin_ui_inputs(target as usize, chain, slot as usize)
         } else {
-            self.engine.bus_plugin_ui_inputs(target as usize, slot as usize)
+            self.engine
+                .bus_plugin_ui_inputs(target as usize, slot as usize)
         };
 
         let mut context = Box::new(UiWriteCtx {
@@ -2088,7 +2186,14 @@ impl Controller {
     /// calls `IEditController::setParamNormalized`, which the spec sanctions
     /// from the UI thread (the processor is driven separately by the parameter
     /// queue in `set_controls`); plugins are required to make that reentrant.
-    fn reflect_param_to_ui(&mut self, location: u32, target: u32, slot: u32, param: u32, value: f32) {
+    fn reflect_param_to_ui(
+        &mut self,
+        location: u32,
+        target: u32,
+        slot: u32,
+        param: u32,
+        value: f32,
+    ) {
         let mut remote = None;
         let mut local = None;
         if let Some(ui) = self.uis.get(&(location, target, slot)) {
@@ -2124,7 +2229,12 @@ impl Controller {
             self.ui_service
                 .send_port_event(id, port, 0, None, value.to_ne_bytes().to_vec());
         } else if let Some((port, window)) = local {
-            window.port_event(port, std::mem::size_of::<f32>() as u32, 0, &value.to_ne_bytes());
+            window.port_event(
+                port,
+                std::mem::size_of::<f32>() as u32,
+                0,
+                &value.to_ne_bytes(),
+            );
         }
     }
 
@@ -2171,21 +2281,37 @@ impl Controller {
         };
 
         if let Some(chain) = strip_chain(location) {
-            self.params.clear_sidechain(target as usize, chain, slot as usize);
+            self.params
+                .clear_sidechain(target as usize, chain, slot as usize);
             if enabled {
                 for (source, gain, pre) in entries {
-                    self.params
-                        .set_sidechain_gain(target as usize, chain, slot as usize, source, gain);
-                    self.params
-                        .set_sidechain_pre(target as usize, chain, slot as usize, source, pre);
+                    self.params.set_sidechain_gain(
+                        target as usize,
+                        chain,
+                        slot as usize,
+                        source,
+                        gain,
+                    );
+                    self.params.set_sidechain_pre(
+                        target as usize,
+                        chain,
+                        slot as usize,
+                        source,
+                        pre,
+                    );
                 }
             }
         } else {
-            self.params.clear_bus_sidechain(target as usize, slot as usize);
+            self.params
+                .clear_bus_sidechain(target as usize, slot as usize);
             if enabled {
                 for (source, gain, pre) in entries {
-                    self.params
-                        .set_bus_sidechain_gain(target as usize, slot as usize, source, gain);
+                    self.params.set_bus_sidechain_gain(
+                        target as usize,
+                        slot as usize,
+                        source,
+                        gain,
+                    );
                     self.params
                         .set_bus_sidechain_pre(target as usize, slot as usize, source, pre);
                 }
@@ -2228,7 +2354,14 @@ impl Controller {
             }
             if flags & (VST3_RESTART_LATENCY | VST3_RESTART_IO | VST3_RESTART_RELOAD) != 0 {
                 let latency = handle.latency();
-                tracing::info!(flags, latency, location, target, slot, "VST3 plugin requested restart");
+                tracing::info!(
+                    flags,
+                    latency,
+                    location,
+                    target,
+                    slot,
+                    "VST3 plugin requested restart"
+                );
             }
         }
         changed
@@ -2256,7 +2389,9 @@ impl Controller {
 
         let mut closed = Vec::new();
         {
-            let Controller { uis, ui_service, .. } = self;
+            let Controller {
+                uis, ui_service, ..
+            } = self;
             for (key, ui) in uis.iter_mut() {
                 match ui {
                     OpenUi::Lv2Remote { id, context } => {
@@ -2341,7 +2476,9 @@ impl Controller {
                         self.uis.remove(&key);
                     }
                 }
-                UiMessage::Title { .. } | UiMessage::Opened { .. } | UiMessage::OpenFailed { .. } => {}
+                UiMessage::Title { .. }
+                | UiMessage::Opened { .. }
+                | UiMessage::OpenFailed { .. } => {}
                 UiMessage::Open { .. }
                 | UiMessage::PortEvent { .. }
                 | UiMessage::Close { .. }
@@ -2675,9 +2812,14 @@ impl Controller {
 
         let sample_rate = self.engine.sample_rate() as f64;
         let buffer_size = self.engine.buffer_size() as usize;
-        let Some((slot_plugin, proxy, handle)) =
-            instantiate_slot(&self.host, &self.vst3, &self.clap, &plugin, sample_rate, buffer_size)
-        else {
+        let Some((slot_plugin, proxy, handle)) = instantiate_slot(
+            &self.host,
+            &self.vst3,
+            &self.clap,
+            &plugin,
+            sample_rate,
+            buffer_size,
+        ) else {
             tracing::warn!(uri = %plugin.uri, "plugin instantiate failed");
             return false;
         };
@@ -2761,12 +2903,16 @@ impl Controller {
         if let Some(chain) = strip_chain(location) {
             for param in 0..controls {
                 plugin.params[param] =
-                    self.params.plugin_param(target as usize, chain, slot as usize, param);
+                    self.params
+                        .plugin_param(target as usize, chain, slot as usize, param);
             }
             plugin.bypassed = self
                 .params
                 .plugin_bypass(target as usize, chain, slot as usize);
-            if let Some(state) = self.engine.state_proxy(target as usize, chain, slot as usize) {
+            if let Some(state) = self
+                .engine
+                .state_proxy(target as usize, chain, slot as usize)
+            {
                 if let Some(encoded) = state.encode(&self.host) {
                     plugin.state = encoded;
                 }
@@ -2774,9 +2920,12 @@ impl Controller {
         } else {
             for param in 0..controls {
                 plugin.params[param] =
-                    self.params.bus_plugin_param(target as usize, slot as usize, param);
+                    self.params
+                        .bus_plugin_param(target as usize, slot as usize, param);
             }
-            plugin.bypassed = self.params.bus_plugin_bypass(target as usize, slot as usize);
+            plugin.bypassed = self
+                .params
+                .bus_plugin_bypass(target as usize, slot as usize);
             if let Some(state) = self.engine.bus_state_proxy(target as usize, slot as usize) {
                 if let Some(encoded) = state.encode(&self.host) {
                     plugin.state = encoded;
@@ -2876,7 +3025,8 @@ impl Controller {
         self.params.set_strip_active(slot, true);
         self.params.set_strip_gain(slot, source.gain.0);
         self.params.set_strip_pan(slot, source.pan.0);
-        self.params.set_strip_input_gain_db(slot, source.input_gain_db);
+        self.params
+            .set_strip_input_gain_db(slot, source.input_gain_db);
         self.params.set_strip_mute(slot, source.mute);
         self.params.set_strip_solo(slot, source.solo);
         for bus in 0..self.params.bus_count() {
@@ -3034,12 +3184,7 @@ impl Controller {
     /// Records the outcome of a patchbay connect/disconnect, keeps the model's
     /// saved connections current (so a session save captures the live patch),
     /// and queues a result for the GUI.
-    fn record_connection(
-        &mut self,
-        outcome: anyhow::Result<()>,
-        source: String,
-        sink: String,
-    ) {
+    fn record_connection(&mut self, outcome: anyhow::Result<()>, source: String, sink: String) {
         let (ok, error) = match outcome {
             Ok(()) => {
                 self.engine.capture_connections(&mut self.model);
@@ -3080,10 +3225,14 @@ impl Controller {
             }
             self.close_all_uis();
             let sample_rate = self.engine.sample_rate() as f64;
-            if let Err(error) =
-                self.engine
-                    .rebuild_plugins(&self.host, &self.vst3, &self.clap, &mut self.model, &self.params, sample_rate)
-            {
+            if let Err(error) = self.engine.rebuild_plugins(
+                &self.host,
+                &self.vst3,
+                &self.clap,
+                &mut self.model,
+                &self.params,
+                sample_rate,
+            ) {
                 tracing::warn!(%error, "failed to rebuild plugins on undo");
             }
             self.missing_report =
@@ -3113,10 +3262,10 @@ impl Controller {
             let index = bus.id.0 as usize;
             for (slot, plugin) in bus.plugins.iter().enumerate() {
                 for (param, value) in plugin.params.iter().enumerate().take(MAX_PARAMS) {
-                    self.params
-                        .set_bus_plugin_param(index, slot, param, *value);
+                    self.params.set_bus_plugin_param(index, slot, param, *value);
                 }
-                self.params.set_bus_plugin_bypass(index, slot, plugin.bypassed);
+                self.params
+                    .set_bus_plugin_bypass(index, slot, plugin.bypassed);
             }
         }
     }
@@ -3149,9 +3298,10 @@ impl Controller {
                 .model
                 .strip(StripId(target_id))
                 .and_then(|strip| strip.midi_channel),
-            MidiTarget::BusGain | MidiTarget::BusMute => {
-                self.model.bus(BusId(target_id)).and_then(|bus| bus.midi_channel)
-            }
+            MidiTarget::BusGain | MidiTarget::BusMute => self
+                .model
+                .bus(BusId(target_id))
+                .and_then(|bus| bus.midi_channel),
             MidiTarget::PluginParam | MidiTarget::PluginBypass => {
                 if location <= 1 {
                     let strip = self.model.strip(StripId(target_id))?;
@@ -3159,7 +3309,11 @@ impl Controller {
                         .get(slot as usize)?
                         .midi_channel
                 } else {
-                    self.model.bus(BusId(target_id))?.plugins.get(slot as usize)?.midi_channel
+                    self.model
+                        .bus(BusId(target_id))?
+                        .plugins
+                        .get(slot as usize)?
+                        .midi_channel
                 }
             }
         }
@@ -3288,7 +3442,10 @@ impl Controller {
             };
 
             self.pause_rt();
-            if let Err(error) = self.engine.remove_bus_plugin(target as usize, slot as usize) {
+            if let Err(error) = self
+                .engine
+                .remove_bus_plugin(target as usize, slot as usize)
+            {
                 self.resume_rt();
                 tracing::warn!(%error, "failed to remove bus plugin");
                 return false;
@@ -3335,9 +3492,9 @@ impl Controller {
             }
 
             self.pause_rt();
-            if let Err(error) = self
-                .engine
-                .move_plugin(target as usize, chain, from as usize, to as usize)
+            if let Err(error) =
+                self.engine
+                    .move_plugin(target as usize, chain, from as usize, to as usize)
             {
                 self.resume_rt();
                 tracing::warn!(%error, "failed to move plugin");
@@ -3362,9 +3519,9 @@ impl Controller {
             }
 
             self.pause_rt();
-            if let Err(error) = self
-                .engine
-                .move_bus_plugin(target as usize, from as usize, to as usize)
+            if let Err(error) =
+                self.engine
+                    .move_bus_plugin(target as usize, from as usize, to as usize)
             {
                 self.resume_rt();
                 tracing::warn!(%error, "failed to move bus plugin");
@@ -3439,6 +3596,369 @@ impl Controller {
             ),
         };
         self.send_message(&message, address);
+    }
+
+    fn send_recorder(&self, address: SocketAddr) {
+        if let Ok(json) = serde_json::to_string(&self.recorder_status) {
+            self.send_message(&ControlMessage::RecorderStatus { json }, address);
+        }
+    }
+
+    fn send_loops(&self, address: SocketAddr) {
+        if let Ok(json) = serde_json::to_string(&self.model.loops) {
+            self.send_message(&ControlMessage::LoopList { json }, address);
+        }
+    }
+
+    /// Poll the audio thread for a finished take and refresh the status.
+    fn poll_recorder(&mut self) {
+        while let Some(take) = self.engine.take_recording() {
+            self.finish_take(take);
+        }
+
+        let snapshot = self.engine.recorder().snapshot();
+        let total = snapshot.total;
+        let clock = self
+            .engine
+            .clock()
+            .snapshot(self.engine.sample_rate() as f32);
+        let message = if snapshot.state == crate::params::RecorderState::Armed && !clock.playing {
+            "waiting for MIDI clock".to_string()
+        } else {
+            String::new()
+        };
+        let status = RecorderStatus {
+            state: snapshot.state.as_str().to_string(),
+            progress: if total > 0 {
+                (snapshot.frames as f32 / total as f32).clamp(0.0, 1.0)
+            } else {
+                0.0
+            },
+            frames: snapshot.frames,
+            peak: snapshot.peak,
+            loop_beats: snapshot.loop_beats,
+            message,
+        };
+        if status != self.recorder_status {
+            self.recorder_status = status;
+            self.recorder_dirty = true;
+        }
+    }
+
+    /// Trim a captured take, apply the automatic/transient/manual offsets, and
+    /// install it in the next free launcher slot.
+    fn finish_take(&mut self, take: crate::recorder::RecordedTake) {
+        let frames = take.frames;
+        if frames == 0 {
+            return;
+        }
+        let raw = take.buffer[..frames * 2].to_vec();
+        let sample_rate = take.sample_rate;
+        let base = if self.model.recorder.auto_latency {
+            take.latency_frames as i64
+        } else {
+            0
+        };
+        let transient = if self.model.recorder.transient {
+            detect_transient(&raw, frames, sample_rate, base, 100.0)
+                .map(|onset| onset - base)
+                .unwrap_or(0)
+        } else {
+            0
+        };
+        let manual = self.model.recorder.nudge_samples;
+        let total = base + transient + manual;
+        let rotated = rotate_interleaved(&raw, frames, total);
+        let loop_peaks = peaks(&raw, frames, LOOP_PEAK_BUCKETS);
+
+        let Some(slot_index) = self.loops.iter().position(Option::is_none) else {
+            self.recorder_status.message = "loop slots are full".to_string();
+            self.recorder_dirty = true;
+            return;
+        };
+        let bpm = self
+            .engine
+            .clock()
+            .snapshot(self.engine.sample_rate() as f32)
+            .bpm;
+        let slot = LoopSlot {
+            id: slot_index as u32,
+            name: format!("loop {}", slot_index + 1),
+            path: None,
+            frames: frames as u64,
+            sample_rate,
+            loop_beats: take.loop_beats,
+            bpm,
+            nudge_samples: total,
+            base_nudge: base,
+            transient_nudge: transient,
+            manual_nudge: manual,
+            peaks: loop_peaks,
+            gain: 1.0,
+            mute: false,
+            playing: false,
+            saved: false,
+        };
+        if let Err(error) = self
+            .engine
+            .set_loop(slot_index, rotated.into_boxed_slice(), frames)
+        {
+            tracing::warn!(%error, "failed to install recorded loop");
+            self.recorder_status.message = error.to_string();
+            self.recorder_dirty = true;
+            return;
+        }
+        self.loops[slot_index] = Some(LoopRuntime { slot, raw });
+        self.rebuild_model_loops();
+        self.loops_dirty = true;
+        self.recorder_status = RecorderStatus::default();
+        self.recorder_dirty = true;
+    }
+
+    fn arm_recorder(&mut self) {
+        let sources = self.model.recorder.sources.clone();
+        if sources.is_empty() {
+            self.recorder_status.message = "select at least one source".to_string();
+            self.recorder_dirty = true;
+            return;
+        }
+        self.engine.recorder().set_sources(&sources);
+
+        let length = self.model.transport_ui.loop_length.max(1) as f32;
+        let loop_beats = if self.model.transport_ui.loop_bars {
+            length * self.model.beats_per_bar
+        } else {
+            length
+        };
+        let clock = self
+            .engine
+            .clock()
+            .snapshot(self.engine.sample_rate() as f32);
+        let bpm = if clock.bpm > 1.0 { clock.bpm } else { 120.0 };
+        let sample_rate = self.engine.sample_rate() as usize;
+        let expected =
+            ((loop_beats as f64 * 60.0 / bpm as f64) * sample_rate as f64).ceil() as usize;
+        // Allocate for a slow (30 BPM) take so a tempo lower than the current
+        // estimate cannot overflow the buffer; the audio thread discards the
+        // take if it still runs out.
+        let capacity_frames =
+            ((loop_beats as f64 * 60.0 / 30.0) * sample_rate as f64).ceil() as usize;
+        let cap = sample_rate * 300;
+        if expected == 0 {
+            self.recorder_status.message = "loop length is zero".to_string();
+            self.recorder_dirty = true;
+            return;
+        }
+        if capacity_frames > cap {
+            self.recorder_status.message = "loop is longer than five minutes".to_string();
+            self.recorder_dirty = true;
+            return;
+        }
+        let capacity = (capacity_frames + sample_rate).min(cap);
+        let buffer = vec![0.0f32; capacity * 2].into_boxed_slice();
+        let loop_pulses = (loop_beats * 24.0).round().max(1.0) as u32;
+
+        match self
+            .engine
+            .arm_recorder(buffer, capacity, expected, loop_pulses, loop_beats)
+        {
+            Ok(()) => {
+                self.recorder_status = RecorderStatus {
+                    state: "armed".to_string(),
+                    message: if clock.playing {
+                        String::new()
+                    } else {
+                        "waiting for MIDI clock".to_string()
+                    },
+                    ..RecorderStatus::default()
+                };
+                self.recorder_dirty = true;
+            }
+            Err(error) => {
+                self.recorder_status.message = error.to_string();
+                self.recorder_dirty = true;
+            }
+        }
+    }
+
+    fn handle_recorder_action(&mut self, action: RecorderAction) {
+        match action {
+            RecorderAction::Arm => self.arm_recorder(),
+            RecorderAction::Cancel | RecorderAction::Stop => {
+                let _ = self.engine.cancel_recorder();
+                self.recorder_status = RecorderStatus::default();
+                self.recorder_dirty = true;
+            }
+            RecorderAction::SetNudge { slot, manual } => self.set_loop_nudge(slot, manual),
+            RecorderAction::SetLoopGain { slot, gain } => {
+                let gain = gain.clamp(0.0, 4.0);
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.gain = gain;
+                    let _ = self.engine.loop_gain(slot as usize, gain);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::SetLoopMute { slot, mute } => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.mute = mute;
+                    let _ = self.engine.loop_mute(slot as usize, mute);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::LoopPlay { slot, quantized } => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.playing = true;
+                    let _ = self.engine.loop_play(slot as usize, quantized);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::LoopStop { slot } => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.playing = false;
+                    let _ = self.engine.loop_stop(slot as usize);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::LoopDelete { slot } => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::take) {
+                    let _ = runtime;
+                    let _ = self.engine.clear_loop(slot as usize);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::LoopRename { slot, name } => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.name = name;
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::LoopSave {
+                slot,
+                path,
+                bit_depth,
+            } => self.save_loop(slot, path, bit_depth),
+        }
+    }
+
+    fn set_loop_nudge(&mut self, slot: u32, manual: i64) {
+        let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        runtime.slot.manual_nudge = manual;
+        runtime.slot.nudge_samples =
+            runtime.slot.base_nudge + runtime.slot.transient_nudge + manual;
+        runtime.slot.saved = false;
+        let frames = runtime.slot.frames as usize;
+        let rotated = rotate_interleaved(&runtime.raw, frames, runtime.slot.nudge_samples);
+        let _ = self
+            .engine
+            .set_loop(slot as usize, rotated.into_boxed_slice(), frames);
+        self.rebuild_model_loops();
+        self.loops_dirty = true;
+    }
+
+    fn save_loop(&mut self, slot: u32, path: Option<String>, bit_depth: u8) {
+        let Some(runtime) = self.loops.get(slot as usize).and_then(Option::as_ref) else {
+            return;
+        };
+        let frames = runtime.slot.frames as usize;
+        let sample_rate = runtime.slot.sample_rate;
+        let name = sanitize_file_name(&runtime.slot.name);
+        let path = path
+            .filter(|path| !path.trim().is_empty())
+            .map(PathBuf::from)
+            .unwrap_or_else(|| loops_dir().join(format!("{name}.wav")));
+        match write_loop_wav(
+            &path,
+            &runtime.raw,
+            frames,
+            sample_rate,
+            bit_depth,
+            runtime.slot.nudge_samples,
+        ) {
+            Ok(()) => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.path = Some(path.to_string_lossy().into_owned());
+                    runtime.slot.saved = true;
+                }
+                self.model.recorder.bit_depth = bit_depth;
+                self.rebuild_model_loops();
+                self.loops_dirty = true;
+                self.recorder_status.message = format!("saved {}", path.display());
+                self.recorder_dirty = true;
+            }
+            Err(error) => {
+                tracing::warn!(%error, path = %path.display(), "failed to save loop");
+                self.recorder_status.message = error.to_string();
+                self.recorder_dirty = true;
+            }
+        }
+    }
+
+    fn rebuild_model_loops(&mut self) {
+        self.model.loops = self
+            .loops
+            .iter()
+            .flatten()
+            .map(|runtime| runtime.slot.clone())
+            .collect();
+    }
+
+    fn clear_loops(&mut self) {
+        for index in 0..MAX_LOOPS {
+            let _ = self.engine.clear_loop(index);
+            self.loops[index] = None;
+        }
+        self.model.loops.clear();
+        self.loops_dirty = true;
+    }
+
+    fn load_loops_from_model(&mut self) {
+        let saved = std::mem::take(&mut self.model.loops);
+        for index in 0..MAX_LOOPS {
+            let _ = self.engine.clear_loop(index);
+            self.loops[index] = None;
+        }
+        let sample_rate = self.engine.sample_rate();
+        for mut slot in saved {
+            let Some(path) = slot.path.clone() else {
+                continue;
+            };
+            match read_loop_wav(Path::new(&path), sample_rate) {
+                Ok((raw, frames)) => {
+                    let Some(index) = self.loops.iter().position(Option::is_none) else {
+                        break;
+                    };
+                    slot.id = index as u32;
+                    slot.frames = frames as u64;
+                    slot.sample_rate = sample_rate;
+                    slot.nudge_samples = 0;
+                    slot.base_nudge = 0;
+                    slot.transient_nudge = 0;
+                    slot.manual_nudge = 0;
+                    slot.playing = false;
+                    slot.peaks = peaks(&raw, frames, LOOP_PEAK_BUCKETS);
+                    if self
+                        .engine
+                        .set_loop(index, raw.clone().into_boxed_slice(), frames)
+                        .is_ok()
+                    {
+                        self.loops[index] = Some(LoopRuntime { slot, raw });
+                    }
+                }
+                Err(error) => {
+                    tracing::warn!(%error, path, "failed to load loop");
+                }
+            }
+        }
+        self.rebuild_model_loops();
+        self.loops_dirty = true;
     }
 
     fn send_missing(&self, address: SocketAddr, json: &str) {
@@ -3635,7 +4155,11 @@ fn plugin_lists_eq(a: &[PluginSlot], b: &[PluginSlot]) -> bool {
 }
 
 fn sidechain_strips(plugin: &PluginSlot) -> Vec<u32> {
-    let mut strips: Vec<u32> = plugin.sidechain.iter().map(|source| source.strip.0).collect();
+    let mut strips: Vec<u32> = plugin
+        .sidechain
+        .iter()
+        .map(|source| source.strip.0)
+        .collect();
     strips.sort_unstable();
     strips
 }
@@ -4232,6 +4756,7 @@ fn build_state_json(
         "transport_ui": model.transport_ui,
         "layout": model.layout,
         "midi_sync": model.midi_sync,
+        "recorder": model.recorder,
         "strip_capacity": params.strip_count(),
         "bus_capacity": params.bus_count(),
     })
@@ -4267,7 +4792,10 @@ fn sidechain_signature(model: &MixerModel) -> u64 {
 /// strips whose plugins consume them, so the source tap is complete in the
 /// same block (`strip_count` is the mixing capacity). Consumers left in a
 /// dependency cycle are flagged to read the previous block's tap.
-fn compute_strip_order(model: &MixerModel, strip_count: usize) -> (Vec<usize>, Vec<Vec<Vec<bool>>>) {
+fn compute_strip_order(
+    model: &MixerModel,
+    strip_count: usize,
+) -> (Vec<usize>, Vec<Vec<Vec<bool>>>) {
     let mut delayed = vec![vec![vec![false; MAX_PLUGINS]; PLUGIN_CHAINS]; strip_count];
     // Consumers: (consumer strip, chain, slot, source strips).
     let mut consumers: Vec<(usize, usize, usize, Vec<usize>)> = Vec::new();
@@ -4341,7 +4869,10 @@ fn compute_strip_order(model: &MixerModel, strip_count: usize) -> (Vec<usize>, V
         }
     }
     for (sid, chain, slot, sources) in &consumers {
-        if sources.iter().any(|&source| position[source] >= position[*sid]) {
+        if sources
+            .iter()
+            .any(|&source| position[source] >= position[*sid])
+        {
             delayed[*sid][*chain][*slot] = true;
         }
     }
@@ -4403,7 +4934,10 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
             params.set_send_pre_fader(index, send.bus.0 as usize, send.pre_fader);
         }
 
-        for (chain, plugins) in [&strip.plugins, &strip.plugins_post].into_iter().enumerate() {
+        for (chain, plugins) in [&strip.plugins, &strip.plugins_post]
+            .into_iter()
+            .enumerate()
+        {
             for (slot, plugin) in plugins.iter().enumerate() {
                 params.clear_sidechain(index, chain, slot);
                 if plugin.sidechain_enabled {
@@ -4448,14 +4982,22 @@ pub fn clamp_to_capacity(model: &mut MixerModel, strips: usize, buses: usize) {
         strip.sends.retain(|send| (send.bus.0 as usize) < buses);
         strip.plugins.truncate(MAX_PLUGINS);
         strip.plugins_post.truncate(MAX_PLUGINS);
-        for plugin in strip.plugins.iter_mut().chain(strip.plugins_post.iter_mut()) {
-            plugin.sidechain.retain(|source| (source.strip.0 as usize) < strips);
+        for plugin in strip
+            .plugins
+            .iter_mut()
+            .chain(strip.plugins_post.iter_mut())
+        {
+            plugin
+                .sidechain
+                .retain(|source| (source.strip.0 as usize) < strips);
         }
     }
     for bus in &mut model.buses {
         bus.plugins.truncate(MAX_PLUGINS);
         for plugin in bus.plugins.iter_mut() {
-            plugin.sidechain.retain(|source| (source.strip.0 as usize) < strips);
+            plugin
+                .sidechain
+                .retain(|source| (source.strip.0 as usize) < strips);
         }
         if bus.id.0 == 0 {
             bus.return_inputs = false;
@@ -4511,9 +5053,11 @@ mod sidechain_order_tests {
 
         // Strip 0's plugin takes its sidechain from strip 1.
         let mut plugin = PluginSlot::new(PluginId(0), "x");
-        plugin
-            .sidechain
-            .push(SidechainSource::new(if self_cycle { StripId(0) } else { StripId(1) }));
+        plugin.sidechain.push(SidechainSource::new(if self_cycle {
+            StripId(0)
+        } else {
+            StripId(1)
+        }));
         model.strips[0].plugins.push(plugin);
         model
     }
@@ -4522,8 +5066,14 @@ mod sidechain_order_tests {
     fn contributors_run_before_consumers() {
         let model = model_with_sidechain(false);
         let (order, delayed) = compute_strip_order(&model, 2);
-        assert_eq!(order, vec![1, 0], "source strip 1 must precede consumer strip 0");
-        assert!(delayed.iter().all(|c| c.iter().all(|s| s.iter().all(|d| !d))));
+        assert_eq!(
+            order,
+            vec![1, 0],
+            "source strip 1 must precede consumer strip 0"
+        );
+        assert!(delayed
+            .iter()
+            .all(|c| c.iter().all(|s| s.iter().all(|d| !d))));
     }
 
     #[test]
@@ -4540,5 +5090,137 @@ mod sidechain_order_tests {
         let list = plugin_list_json(&[plugin], &[], |_, _| 0.0);
         assert_eq!(list.len(), 1);
         assert_eq!(list[0]["missing"], serde_json::json!(true));
+    }
+}
+
+fn loops_dir() -> PathBuf {
+    config_dir().join("loops")
+}
+
+fn sanitize_file_name(name: &str) -> String {
+    let mut out = String::new();
+    for ch in name.chars() {
+        if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+            out.push(ch);
+        } else if ch.is_whitespace() {
+            out.push('-');
+        }
+    }
+    if out.is_empty() {
+        "loop".to_string()
+    } else {
+        out
+    }
+}
+
+/// Write an interleaved stereo loop, applying the circular nudge first.
+fn write_loop_wav(
+    path: &Path,
+    raw: &[f32],
+    frames: usize,
+    sample_rate: u32,
+    bit_depth: u8,
+    nudge: i64,
+) -> anyhow::Result<()> {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let depth = match bit_depth {
+        16 | 24 | 32 => bit_depth,
+        _ => 24,
+    };
+    let spec = hound::WavSpec {
+        channels: 2,
+        sample_rate,
+        bits_per_sample: depth as u16,
+        sample_format: if depth == 32 {
+            hound::SampleFormat::Float
+        } else {
+            hound::SampleFormat::Int
+        },
+    };
+    let mut writer = hound::WavWriter::create(path, spec)?;
+    let rotated = rotate_interleaved(raw, frames, nudge);
+    for sample in rotated {
+        match depth {
+            16 => writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)?,
+            24 => writer.write_sample((sample.clamp(-1.0, 1.0) * 8_388_607.0).round() as i32)?,
+            _ => writer.write_sample(sample)?,
+        }
+    }
+    writer.finalize()?;
+    Ok(())
+}
+
+/// Read a stereo WAV as interleaved f32. Keeps the engine sample rate fixed.
+fn read_loop_wav(path: &Path, expected_rate: u32) -> anyhow::Result<(Vec<f32>, usize)> {
+    let mut reader = hound::WavReader::open(path)?;
+    let spec = reader.spec();
+    if spec.channels != 2 {
+        anyhow::bail!("expected a stereo WAV, found {} channels", spec.channels);
+    }
+    if spec.sample_rate != expected_rate {
+        anyhow::bail!(
+            "loop is {} Hz but the engine runs at {} Hz",
+            spec.sample_rate,
+            expected_rate
+        );
+    }
+
+    let mut out = Vec::new();
+    match (spec.sample_format, spec.bits_per_sample) {
+        (hound::SampleFormat::Float, 32) => {
+            for sample in reader.samples::<f32>() {
+                out.push(sample?);
+            }
+        }
+        (hound::SampleFormat::Int, 16) => {
+            for sample in reader.samples::<i16>() {
+                out.push(sample? as f32 / 32_768.0);
+            }
+        }
+        (hound::SampleFormat::Int, 24) => {
+            for sample in reader.samples::<i32>() {
+                out.push(sample? as f32 / 8_388_608.0);
+            }
+        }
+        (hound::SampleFormat::Int, 32) => {
+            for sample in reader.samples::<i32>() {
+                out.push(sample? as f32 / 2_147_483_648.0);
+            }
+        }
+        (format, bits) => anyhow::bail!("unsupported WAV format: {format:?}, {bits} bits"),
+    }
+    if out.len() % 2 != 0 {
+        anyhow::bail!("WAV has an odd number of samples");
+    }
+    let frames = out.len() / 2;
+    if frames == 0 {
+        anyhow::bail!("WAV is empty");
+    }
+    Ok((out, frames))
+}
+
+#[cfg(test)]
+mod wav_tests {
+    use super::*;
+
+    #[test]
+    fn wav_roundtrip_for_each_depth() {
+        let dir = std::env::temp_dir().join(format!("vibemix-wav-test-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let raw = vec![0.0, 0.5, -0.25, 0.125, 0.75, -0.75, 0.0, 0.0];
+        for depth in [16u8, 24, 32] {
+            let path = dir.join(format!("loop-{depth}.wav"));
+            write_loop_wav(&path, &raw, 4, 48_000, depth, 0).unwrap();
+            let (read, frames) = read_loop_wav(&path, 48_000).unwrap();
+            assert_eq!(frames, 4);
+            assert_eq!(read.len(), raw.len());
+            let tolerance = if depth == 16 { 1.0e-3 } else { 1.0e-4 };
+            for (a, b) in read.iter().zip(raw.iter()) {
+                assert!((a - b).abs() <= tolerance, "{depth}: {a} vs {b}");
+            }
+        }
+        fs::remove_dir_all(&dir).unwrap();
     }
 }

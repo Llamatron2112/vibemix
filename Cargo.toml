@@ -37,6 +37,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 rosc = "0.10"
 rtrb = "0.3"
 jack = "0.13"
+hound = "3"
 
 [profile.release]
 lto = true

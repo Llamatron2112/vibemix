@@ -7,6 +7,7 @@ mod midi;
 mod midi_map;
 mod params;
 mod plugin;
+mod recorder;
 mod rt_guard;
 mod smoke;
 mod ui_service;

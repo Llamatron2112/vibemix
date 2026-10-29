@@ -84,11 +84,7 @@ impl SharedParams {
             plugin_params: (0..strip_count)
                 .map(|_| {
                     (0..PLUGIN_CHAINS)
-                        .map(|_| {
-                            (0..MAX_PLUGINS)
-                                .map(|_| zero_vec(MAX_PARAMS))
-                                .collect()
-                        })
+                        .map(|_| (0..MAX_PLUGINS).map(|_| zero_vec(MAX_PARAMS)).collect())
                         .collect()
                 })
                 .collect(),
@@ -187,7 +183,11 @@ impl SharedParams {
 
     /// Sets the input trim from a decibel value, clamped to the supported range.
     pub fn set_strip_input_gain_db(&self, strip: usize, db: f32) {
-        set_gain(&self.strip_input_gain, strip, db_to_linear(clamp_trim_db(db)));
+        set_gain(
+            &self.strip_input_gain,
+            strip,
+            db_to_linear(clamp_trim_db(db)),
+        );
     }
 
     pub fn strip_mute(&self, strip: usize) -> bool {
@@ -287,7 +287,9 @@ impl SharedParams {
     pub fn set_send_delay(&self, strip: usize, bus: usize, value: f32) {
         if let Some(slot) = self.send_delay.get(strip).and_then(|sends| sends.get(bus)) {
             slot.store(
-                value.clamp(0.0, vibemix_core::model::MAX_SEND_DELAY_MS).to_bits(),
+                value
+                    .clamp(0.0, vibemix_core::model::MAX_SEND_DELAY_MS)
+                    .to_bits(),
                 Ordering::Relaxed,
             );
         }
@@ -398,12 +400,7 @@ impl SharedParams {
         }
     }
 
-    pub fn for_each_bus_sidechain(
-        &self,
-        bus: usize,
-        slot: usize,
-        f: impl FnMut(usize, f32, bool),
-    ) {
+    pub fn for_each_bus_sidechain(&self, bus: usize, slot: usize, f: impl FnMut(usize, f32, bool)) {
         for_each_active(self.bus_sidechain_slots(bus, slot), f);
     }
 
@@ -781,11 +778,21 @@ fn for_each_active(
         if gain <= 1.0e-6 {
             continue;
         }
-        f((source - 1) as usize, gain, entry.pre.load(Ordering::Relaxed));
+        f(
+            (source - 1) as usize,
+            gain,
+            entry.pre.load(Ordering::Relaxed),
+        );
     }
 }
 
-fn store_pair(left_slots: &[AtomicU32], right_slots: &[AtomicU32], index: usize, left: f32, right: f32) {
+fn store_pair(
+    left_slots: &[AtomicU32],
+    right_slots: &[AtomicU32],
+    index: usize,
+    left: f32,
+    right: f32,
+) {
     if let Some(slot) = left_slots.get(index) {
         slot.store(left.to_bits(), Ordering::Relaxed);
     }
@@ -795,11 +802,15 @@ fn store_pair(left_slots: &[AtomicU32], right_slots: &[AtomicU32], index: usize,
 }
 
 fn gain_vec(count: usize) -> Vec<AtomicU32> {
-    (0..count).map(|_| AtomicU32::new(1.0f32.to_bits())).collect()
+    (0..count)
+        .map(|_| AtomicU32::new(1.0f32.to_bits()))
+        .collect()
 }
 
 fn zero_vec(count: usize) -> Vec<AtomicU32> {
-    (0..count).map(|_| AtomicU32::new(0.0f32.to_bits())).collect()
+    (0..count)
+        .map(|_| AtomicU32::new(0.0f32.to_bits()))
+        .collect()
 }
 
 fn bool_vec(count: usize) -> Vec<AtomicBool> {
@@ -972,8 +983,10 @@ impl SharedClock {
         self.playing.store(clock.playing, Ordering::Relaxed);
         self.bpm.store(clock.bpm.to_bits(), Ordering::Relaxed);
         self.beats.store(clock.beats.to_bits(), Ordering::Relaxed);
-        self.frames.store(clock.frames_since_start, Ordering::Relaxed);
-        self.jitter_bpm.store(clock.jitter_bpm.to_bits(), Ordering::Relaxed);
+        self.frames
+            .store(clock.frames_since_start, Ordering::Relaxed);
+        self.jitter_bpm
+            .store(clock.jitter_bpm.to_bits(), Ordering::Relaxed);
         self.glitches.store(clock.glitches, Ordering::Relaxed);
     }
 
@@ -996,6 +1009,168 @@ impl SharedClock {
 }
 
 impl Default for SharedClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+/// Maximum number of sources a single loop take can sum.
+pub const MAX_RECORD_SOURCES: usize = 16;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Default)]
+pub enum RecorderState {
+    #[default]
+    Idle,
+    Armed,
+    Recording,
+    Finalizing,
+}
+
+impl RecorderState {
+    fn to_u32(self) -> u32 {
+        match self {
+            Self::Idle => 0,
+            Self::Armed => 1,
+            Self::Recording => 2,
+            Self::Finalizing => 3,
+        }
+    }
+
+    fn from_u32(value: u32) -> Self {
+        match value {
+            1 => Self::Armed,
+            2 => Self::Recording,
+            3 => Self::Finalizing,
+            _ => Self::Idle,
+        }
+    }
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Armed => "armed",
+            Self::Recording => "recording",
+            Self::Finalizing => "finalizing",
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct RecorderSnapshot {
+    pub state: RecorderState,
+    pub frames: u64,
+    pub total: u64,
+    pub peak: f32,
+    pub loop_beats: f32,
+}
+
+/// Recorder state shared between the audio thread and the control thread.
+pub struct SharedRecorder {
+    state: AtomicU32,
+    frames: AtomicU64,
+    total: AtomicU64,
+    peak: AtomicU32,
+    loop_beats: AtomicU32,
+    source_count: AtomicU32,
+    sources: [AtomicU32; MAX_RECORD_SOURCES],
+}
+
+impl SharedRecorder {
+    pub fn new() -> Self {
+        Self {
+            state: AtomicU32::new(0),
+            frames: AtomicU64::new(0),
+            total: AtomicU64::new(0),
+            peak: AtomicU32::new(0.0f32.to_bits()),
+            loop_beats: AtomicU32::new(4.0f32.to_bits()),
+            source_count: AtomicU32::new(0),
+            sources: std::array::from_fn(|_| AtomicU32::new(0)),
+        }
+    }
+
+    pub fn set_state(&self, state: RecorderState) {
+        self.state.store(state.to_u32(), Ordering::Release);
+    }
+
+    pub fn state(&self) -> RecorderState {
+        RecorderState::from_u32(self.state.load(Ordering::Acquire))
+    }
+
+    pub fn set_status(&self, frames: u64, total: u64, peak: f32) {
+        self.frames.store(frames, Ordering::Relaxed);
+        self.total.store(total, Ordering::Relaxed);
+        self.peak.store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn set_loop_beats(&self, beats: f32) {
+        self.loop_beats.store(beats.to_bits(), Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> RecorderSnapshot {
+        RecorderSnapshot {
+            state: self.state(),
+            frames: self.frames.load(Ordering::Relaxed),
+            total: self.total.load(Ordering::Relaxed),
+            peak: f32::from_bits(self.peak.load(Ordering::Relaxed)),
+            loop_beats: f32::from_bits(self.loop_beats.load(Ordering::Relaxed)),
+        }
+    }
+
+    /// Replace the source list. The count is written last so the audio thread
+    /// never observes a partially written list.
+    pub fn set_sources(&self, sources: &[vibemix_core::recorder::RecorderSource]) {
+        let count = sources.len().min(MAX_RECORD_SOURCES);
+        self.source_count.store(0, Ordering::Release);
+        for (i, source) in sources.iter().take(count).enumerate() {
+            let kind = match source.kind {
+                vibemix_core::recorder::RecorderSourceKind::Strip => 0u32,
+                vibemix_core::recorder::RecorderSourceKind::Bus => 1u32,
+            };
+            let tap = match source.tap {
+                vibemix_core::recorder::RecorderTap::Input => 0u32,
+                vibemix_core::recorder::RecorderTap::PreFader => 1u32,
+                vibemix_core::recorder::RecorderTap::PostFader => 2u32,
+                vibemix_core::recorder::RecorderTap::Output => 3u32,
+            };
+            let packed = (source.id & 0xffff) | (kind << 16) | (tap << 18);
+            self.sources[i].store(packed, Ordering::Relaxed);
+        }
+        self.source_count.store(count as u32, Ordering::Release);
+    }
+
+    pub fn source(
+        &self,
+        index: usize,
+    ) -> Option<(
+        vibemix_core::recorder::RecorderSourceKind,
+        vibemix_core::recorder::RecorderTap,
+        u32,
+    )> {
+        if index >= self.source_count.load(Ordering::Acquire) as usize {
+            return None;
+        }
+        let packed = self.sources.get(index)?.load(Ordering::Relaxed);
+        let id = packed & 0xffff;
+        let kind = if (packed >> 16) & 0x1 == 0 {
+            vibemix_core::recorder::RecorderSourceKind::Strip
+        } else {
+            vibemix_core::recorder::RecorderSourceKind::Bus
+        };
+        let tap = match (packed >> 18) & 0x3 {
+            0 => vibemix_core::recorder::RecorderTap::Input,
+            1 => vibemix_core::recorder::RecorderTap::PreFader,
+            2 => vibemix_core::recorder::RecorderTap::PostFader,
+            _ => vibemix_core::recorder::RecorderTap::Output,
+        };
+        Some((kind, tap, id))
+    }
+
+    pub fn source_count(&self) -> usize {
+        self.source_count.load(Ordering::Acquire) as usize
+    }
+}
+
+impl Default for SharedRecorder {
     fn default() -> Self {
         Self::new()
     }
