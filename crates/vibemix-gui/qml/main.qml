@@ -768,7 +768,11 @@ ApplicationWindow {
     function nudgeLoop(delta) {
         var slot = root.loopById(loopEditor.slotId)
         if (!slot) return
-        root.sendRecorderAction({ action: "set_nudge", slot: slot.id, manual: slot.manual_nudge + delta })
+        var manual = slot.manual_nudge + delta
+        loopEditor.previewManual = manual
+        loopEditor.previewing = true
+        root.sendRecorderAction({ action: "set_nudge", slot: slot.id, manual: manual })
+        editorWave.requestPaint()
     }
     function startLoop(slot, quantized) {
         root.sendRecorderAction({ action: "loop_play", slot: slot.id, quantized: quantized })
@@ -5665,12 +5669,84 @@ ApplicationWindow {
         id: loopEditor
         property int slotId: -1
         property var editorPeaks: []
+        property var previewPeaks: []
+        property real waveStart: 0
+        property real waveEnd: 0
         property string zoomMode: "all"
+        property int zoomFactor: 32
+        property int previewManual: 0
+        property bool dragging: false
+        property bool previewing: false
+
+        function currentSlot() { return root.loopById(slotId) }
+        function currentManual() {
+            var slot = currentSlot()
+            return slot ? slot.manual_nudge : 0
+        }
+        function displayManual() { return previewing ? previewManual : currentManual() }
+        function requestWaveform() {
+            var slot = currentSlot()
+            if (!slot || !slot.frames) return
+            var frames = slot.frames
+            var start = 0
+            var end = frames
+            if (zoomMode !== "all") {
+                var span = Math.max(1, Math.floor(frames / zoomFactor))
+                if (zoomMode === "start") {
+                    start = 0
+                    end = span
+                } else {
+                    start = frames - span
+                    end = frames
+                }
+            }
+            waveStart = start
+            waveEnd = end
+            editorPeaks = []
+            root.sendRecorderAction({
+                action: "waveform",
+                slot: slot.id,
+                start: start,
+                end: end,
+                preview: false
+            })
+            editorWave.requestPaint()
+        }
+        function requestPreview() {
+            var slot = currentSlot()
+            if (!slot || !slot.frames) return
+            root.sendRecorderAction({
+                action: "waveform",
+                slot: slot.id,
+                start: 0,
+                end: slot.frames,
+                preview: true
+            })
+        }
+        function setZoom(mode) {
+            zoomMode = mode
+            requestWaveform()
+        }
+        function nudgeText() {
+            var slot = currentSlot()
+            if (!slot) return ""
+            var total = slot.base_nudge + slot.transient_nudge + displayManual()
+            var ms = slot.sample_rate > 0 ? total * 1000 / slot.sample_rate : 0
+            return total + " smp (" + (ms >= 0 ? "+" : "") + ms.toFixed(2) + " ms)"
+        }
         function openFor(id) {
             slotId = id
             editorPeaks = []
+            previewPeaks = []
+            waveStart = 0
+            waveEnd = 0
             zoomMode = "all"
-            root.sendRecorderAction({ action: "waveform", slot: id })
+            zoomFactor = 32
+            previewManual = 0
+            dragging = false
+            previewing = false
+            requestPreview()
+            requestWaveform()
             visible = true
         }
 
@@ -5679,11 +5755,20 @@ ApplicationWindow {
             function onWaveformChanged() {
                 try {
                     var wave = JSON.parse(backend.waveform)
-                    if (wave.slot === loopEditor.slotId) {
+                    if (wave.slot !== loopEditor.slotId) return
+                    if (wave.preview) {
+                        loopEditor.previewPeaks = wave.peaks || []
+                    } else {
                         loopEditor.editorPeaks = wave.peaks || []
-                        editorWave.requestPaint()
+                        loopEditor.waveStart = wave.start
+                        loopEditor.waveEnd = wave.end
+                        loopEditor.previewing = false
                     }
+                    editorWave.requestPaint()
                 } catch (e) {}
+            }
+            function onLoopsChanged() {
+                if (loopEditor.visible && !loopEditor.dragging) loopEditor.requestWaveform()
             }
         }
 
@@ -5692,9 +5777,9 @@ ApplicationWindow {
         transientParent: root
         visible: false
         width: 620
-        height: 430
+        height: 620
         minimumWidth: 460
-        minimumHeight: 320
+        minimumHeight: 520
         title: "loop editor"
         color: root.palette.window
 
@@ -5715,61 +5800,138 @@ ApplicationWindow {
                 elide: Text.ElideRight
             }
 
-            Canvas {
-                id: editorWave
+            Item {
                 Layout.fillWidth: true
-                Layout.preferredHeight: 120
-                property var slot: root.loopById(loopEditor.slotId)
-                property var peaks: loopEditor.editorPeaks.length > 0
-                    ? loopEditor.editorPeaks
-                    : (slot ? (slot.peaks || []) : [])
-                onSlotChanged: requestPaint()
-                onPeaksChanged: requestPaint()
-                onWidthChanged: requestPaint()
-                onHeightChanged: requestPaint()
-                onPaint: {
-                    var ctx = getContext("2d")
-                    ctx.clearRect(0, 0, width, height)
-                    if (!slot || !peaks || peaks.length === 0 || width <= 0) return
+                Layout.preferredHeight: 220
 
-                    ctx.strokeStyle = root.borderColor
-                    ctx.beginPath()
-                    ctx.moveTo(0, height * 0.5)
-                    ctx.lineTo(width, height * 0.5)
-                    ctx.stroke()
+                Canvas {
+                    id: editorWave
+                    anchors.fill: parent
+                    property var slot: root.loopById(loopEditor.slotId)
+                    onSlotChanged: requestPaint()
+                    onWidthChanged: requestPaint()
+                    onHeightChanged: requestPaint()
+                    onPaint: {
+                        var ctx = getContext("2d")
+                        ctx.clearRect(0, 0, width, height)
+                        if (!slot || width <= 0) return
 
-                    var frames = Math.max(1, slot.frames || 1)
-                    var nudge = slot.nudge_samples || 0
-                    var phase = ((nudge % frames) + frames) % frames / frames
-                    var offset = Math.floor(phase * peaks.length)
-                    var zoom = loopEditor.zoomMode
-                    var viewStart = zoom === "end" ? 1 - 1 / 32 : 0
-                    var viewEnd = zoom === "start" ? 1 / 32 : 1
-                    var span = Math.max(1.0e-9, viewEnd - viewStart)
+                        var frames = Math.max(1, slot.frames || 1)
+                        var viewStart = loopEditor.waveStart
+                        var viewEnd = loopEditor.waveEnd
+                        if (!(viewEnd > viewStart)) {
+                            viewStart = 0
+                            viewEnd = frames
+                        }
+                        var span = Math.max(1, viewEnd - viewStart)
+                        var usePreview = loopEditor.previewing || loopEditor.editorPeaks.length === 0
+                        var peaks = usePreview
+                            ? (loopEditor.previewPeaks.length > 0
+                                ? loopEditor.previewPeaks
+                                : (slot.peaks || []))
+                            : loopEditor.editorPeaks
+                        if (!peaks || peaks.length === 0) return
 
-                    ctx.strokeStyle = root.mutedText
-                    ctx.beginPath()
-                    for (var x = 0; x < width; x++) {
-                        var frac = viewStart + (x / Math.max(1, width - 1)) * span
-                        var index = Math.floor((offset + frac * peaks.length) % peaks.length)
-                        var a = peaks[index] * height * 0.45
-                        ctx.moveTo(x, height * 0.5 - a)
-                        ctx.lineTo(x, height * 0.5 + a)
+                        ctx.strokeStyle = root.borderColor
+                        ctx.beginPath()
+                        ctx.moveTo(0, height * 0.5)
+                        ctx.lineTo(width, height * 0.5)
+                        ctx.stroke()
+
+                        var total = slot.base_nudge + slot.transient_nudge + loopEditor.displayManual()
+                        var phase = ((total % frames) + frames) % frames / frames
+
+                        ctx.strokeStyle = root.mutedText
+                        ctx.beginPath()
+                        for (var x = 0; x < width; x++) {
+                            var frame = viewStart + (x / Math.max(1, width - 1)) * span
+                            var index
+                            if (usePreview) {
+                                var frac = frame / frames
+                                index = Math.floor(((phase + frac) % 1) * peaks.length) % peaks.length
+                            } else {
+                                index = Math.floor((x / Math.max(1, width - 1)) * (peaks.length - 1))
+                            }
+                            var a = peaks[index] * height * 0.45
+                            ctx.moveTo(x, height * 0.5 - a)
+                            ctx.lineTo(x, height * 0.5 + a)
+                        }
+                        ctx.stroke()
+
+                        // Beat grid, clipped to the visible window.
+                        var beats = Math.max(1, slot.loop_beats || 1)
+                        ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25)
+                        ctx.beginPath()
+                        for (var b = 0; b <= beats; b++) {
+                            var beatFrame = b / beats * frames
+                            if (beatFrame < viewStart - 1.0e-6 || beatFrame > viewEnd + 1.0e-6) continue
+                            var bx = (beatFrame - viewStart) / span * width
+                            ctx.moveTo(bx, 0)
+                            ctx.lineTo(bx, height)
+                        }
+                        ctx.stroke()
                     }
-                    ctx.stroke()
+                }
 
-                    // Beat grid, clipped to the visible window.
-                    var beats = Math.max(1, slot.loop_beats || 1)
-                    ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25)
-                    ctx.beginPath()
-                    for (var b = 0; b <= beats; b++) {
-                        var beat = b / beats
-                        if (beat < viewStart - 1.0e-9 || beat > viewEnd + 1.0e-9) continue
-                        var bx = (beat - viewStart) / span * width
-                        ctx.moveTo(bx, 0)
-                        ctx.lineTo(bx, height)
+                MouseArea {
+                    id: waveDrag
+                    anchors.fill: parent
+                    hoverEnabled: true
+                    cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+                    property real pressX: 0
+                    property int pressManual: 0
+
+                    ToolTip.visible: containsMouse && !pressed
+                    ToolTip.delay: 500
+                    ToolTip.text: "drag to nudge · Shift = 1 sample/px"
+
+                    onPressed: {
+                        var slot = loopEditor.currentSlot()
+                        if (!slot) return
+                        pressX = mouse.x
+                        pressManual = slot.manual_nudge
+                        loopEditor.previewManual = pressManual
+                        loopEditor.dragging = true
+                        loopEditor.previewing = true
+                        if (loopEditor.previewPeaks.length === 0) loopEditor.requestPreview()
+                        editorWave.requestPaint()
                     }
-                    ctx.stroke()
+                    onPositionChanged: {
+                        if (!pressed) return
+                        var slot = loopEditor.currentSlot()
+                        if (!slot) return
+                        var span = Math.max(1, loopEditor.waveEnd - loopEditor.waveStart)
+                        var dx = mouse.x - pressX
+                        var delta = (mouse.modifiers & Qt.ShiftModifier)
+                            ? -Math.round(dx)
+                            : -Math.round(dx * span / Math.max(1, width))
+                        loopEditor.previewManual = pressManual + delta
+                        editorWave.requestPaint()
+                    }
+                    onReleased: {
+                        var slot = loopEditor.currentSlot()
+                        loopEditor.dragging = false
+                        if (!slot) {
+                            loopEditor.previewing = false
+                            return
+                        }
+                        if (loopEditor.previewManual !== slot.manual_nudge) {
+                            loopEditor.previewing = true
+                            root.sendRecorderAction({
+                                action: "set_nudge",
+                                slot: slot.id,
+                                manual: loopEditor.previewManual
+                            })
+                        } else {
+                            loopEditor.previewing = false
+                        }
+                        editorWave.requestPaint()
+                    }
+                    onCanceled: {
+                        loopEditor.dragging = false
+                        loopEditor.previewing = false
+                        editorWave.requestPaint()
+                    }
                 }
             }
 
@@ -5784,32 +5946,44 @@ ApplicationWindow {
                 FlatButton {
                     text: "all"
                     implicitWidth: 34
-                    onClicked: {
-                        loopEditor.zoomMode = "all"
-                        editorWave.requestPaint()
-                    }
+                    onClicked: loopEditor.setZoom("all")
                 }
                 FlatButton {
                     text: "start"
                     implicitWidth: 42
-                    onClicked: {
-                        loopEditor.zoomMode = "start"
-                        editorWave.requestPaint()
-                    }
+                    onClicked: loopEditor.setZoom("start")
                 }
                 FlatButton {
                     text: "end"
                     implicitWidth: 36
-                    onClicked: {
-                        loopEditor.zoomMode = "end"
-                        editorWave.requestPaint()
+                    onClicked: loopEditor.setZoom("end")
+                }
+                ComboBox {
+                    Layout.preferredWidth: 76
+                    font.pixelSize: 11
+                    model: ["8×", "32×", "128×", "512×"]
+                    currentIndex: {
+                        var factors = [8, 32, 128, 512]
+                        return Math.max(0, factors.indexOf(loopEditor.zoomFactor))
+                    }
+                    onActivated: {
+                        var factors = [8, 32, 128, 512]
+                        loopEditor.zoomFactor = factors[index]
+                        loopEditor.requestWaveform()
                     }
                 }
                 Label {
                     Layout.fillWidth: true
-                    text: loopEditor.zoomMode === "all" ? "whole loop" : ("32× " + loopEditor.zoomMode)
+                    text: {
+                        var slot = loopEditor.currentSlot()
+                        if (!slot) return ""
+                        var span = Math.max(1, loopEditor.waveEnd - loopEditor.waveStart)
+                        var ms = slot.sample_rate > 0 ? span * 1000 / slot.sample_rate : 0
+                        return ms.toFixed(2) + " ms · " + Math.round(span) + " smp"
+                    }
                     color: root.mutedText
                     font.pixelSize: 10
+                    elide: Text.ElideRight
                 }
             }
 
@@ -5826,10 +6000,7 @@ ApplicationWindow {
                 FlatButton { text: "-1"; implicitWidth: 30; onClicked: root.nudgeLoop(-1) }
                 Label {
                     Layout.fillWidth: true
-                    text: {
-                        var slot = root.loopById(loopEditor.slotId)
-                        return slot ? root.loopNudgeText(slot) : ""
-                    }
+                    text: loopEditor.nudgeText()
                     color: root.textColor
                     font.pixelSize: 11
                     font.family: "monospace"
@@ -5840,13 +6011,46 @@ ApplicationWindow {
                 FlatButton { text: "+100"; implicitWidth: 40; onClicked: root.nudgeLoop(100) }
             }
 
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                Label {
+                    text: "manual"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                SpinBox {
+                    from: -10000000
+                    to: 10000000
+                    editable: true
+                    value: loopEditor.displayManual()
+                    onValueModified: {
+                        loopEditor.previewing = true
+                        loopEditor.previewManual = value
+                        var slot = loopEditor.currentSlot()
+                        if (slot) root.sendRecorderAction({
+                            action: "set_nudge",
+                            slot: slot.id,
+                            manual: value
+                        })
+                        editorWave.requestPaint()
+                    }
+                }
+                Item { Layout.fillWidth: true }
+                Label {
+                    text: "samples"
+                    color: root.mutedText
+                    font.pixelSize: 10
+                }
+            }
+
             Label {
                 Layout.fillWidth: true
                 text: {
                     var slot = root.loopById(loopEditor.slotId)
                     if (!slot) return ""
                     return "auto " + slot.base_nudge + " · transient " + slot.transient_nudge
-                        + " · manual " + slot.manual_nudge
+                        + " · manual " + loopEditor.displayManual()
                 }
                 color: root.mutedText
                 font.pixelSize: 10

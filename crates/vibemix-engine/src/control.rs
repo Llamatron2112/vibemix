@@ -72,8 +72,16 @@ struct LoopRuntime {
     raw: Vec<f32>,
 }
 
+struct PendingWaveform {
+    slot: u32,
+    start: u64,
+    end: u64,
+    preview: bool,
+}
+
 const LOOP_PEAK_BUCKETS: usize = 512;
-const LOOP_WAVEFORM_BUCKETS: usize = 8192;
+const LOOP_WAVEFORM_BUCKETS: usize = 4096;
+const LOOP_PREVIEW_BUCKETS: usize = 8192;
 
 /// A full mixer-model snapshot for undo/redo.
 struct UndoEntry {
@@ -162,7 +170,7 @@ pub struct Controller {
     recorder_status: RecorderStatus,
     recorder_dirty: bool,
     loops_dirty: bool,
-    pending_waveform: Option<u32>,
+    pending_waveform: Option<PendingWaveform>,
 }
 
 /// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
@@ -3620,17 +3628,54 @@ impl Controller {
 
     /// Send a high-resolution envelope for the editor. Kept out of the 30 Hz
     /// loop list so gain/play updates stay small.
-    fn send_loop_waveform(&self, address: SocketAddr, slot: u32) {
-        let Some(runtime) = self.loops.get(slot as usize).and_then(Option::as_ref) else {
+    fn send_loop_waveform(&self, address: SocketAddr, request: PendingWaveform) {
+        let Some(runtime) = self.loops.get(request.slot as usize).and_then(Option::as_ref) else {
             return;
         };
         let frames = runtime.slot.frames as usize;
         if frames == 0 || runtime.raw.len() < frames * 2 {
             return;
         }
+        let (start, end) = if request.preview {
+            (0usize, frames)
+        } else {
+            let start = (request.start as usize).min(frames - 1);
+            let end = (request.end as usize).min(frames);
+            if end <= start {
+                (0, frames)
+            } else {
+                (start, end)
+            }
+        };
+        let buckets = if request.preview {
+            LOOP_PREVIEW_BUCKETS
+        } else {
+            LOOP_WAVEFORM_BUCKETS
+        };
+        let nudge = if request.preview {
+            0
+        } else {
+            runtime.slot.nudge_samples.rem_euclid(frames as i64) as usize
+        };
+        let span = end - start;
+        let mut peaks = vec![0.0f32; buckets];
+        for (bucket, peak) in peaks.iter_mut().enumerate() {
+            let from = start + span * bucket / buckets;
+            let to = (start + span * (bucket + 1) / buckets).max(from + 1).min(end);
+            for frame in from..to {
+                let raw = (nudge + frame) % frames;
+                let index = raw * 2;
+                *peak = peak
+                    .max(runtime.raw[index].abs())
+                    .max(runtime.raw[index + 1].abs());
+            }
+        }
         let json = LoopWaveform {
-            slot,
-            peaks: peaks(&runtime.raw, frames, LOOP_WAVEFORM_BUCKETS),
+            slot: request.slot,
+            start: start as u64,
+            end: end as u64,
+            preview: request.preview,
+            peaks,
         };
         if let Ok(json) = serde_json::to_string(&json) {
             self.send_message(&ControlMessage::LoopWaveform { json }, address);
@@ -3866,8 +3911,18 @@ impl Controller {
                     self.loops_dirty = true;
                 }
             }
-            RecorderAction::Waveform { slot } => {
-                self.pending_waveform = Some(slot);
+            RecorderAction::Waveform {
+                slot,
+                start,
+                end,
+                preview,
+            } => {
+                self.pending_waveform = Some(PendingWaveform {
+                    slot,
+                    start,
+                    end,
+                    preview,
+                });
             }
             RecorderAction::LoopSave {
                 slot,

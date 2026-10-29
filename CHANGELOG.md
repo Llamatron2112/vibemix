@@ -15,8 +15,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   WAV. `Options → Loops…` is a separate launcher window with quantized
   play/stop, gain, mute and an editor. The save folder is chosen in the GUI and
   remembered; filenames include a timestamp. The editor requests a
-  high-resolution waveform and can zoom to the loop start or end. Loops are
-  stored in the session and under `VIBEMIX_CONFIG_DIR/loops/` by default.
+  high-resolution window for the visible range and can zoom to the loop start
+  or end at 8×–512×. Drag the waveform to nudge (Shift = one sample per pixel),
+  or type an exact value. Loops are stored in the session and under
+  `VIBEMIX_CONFIG_DIR/loops/` by default.
 
 ## [1.0.2] - 2026-10-22
 

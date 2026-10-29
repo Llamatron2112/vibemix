@@ -209,14 +209,32 @@ pub enum RecorderAction {
         slot: u32,
         name: String,
     },
-    /// Ask the engine for a high-resolution waveform of a slot.
-    Waveform { slot: u32 },
+    /// Ask the engine for a waveform of a slot.
+    ///
+    /// `start`/`end` are frames in loop coordinates (after the current nudge).
+    /// `preview` requests the whole-loop envelope used while dragging; otherwise
+    /// the engine returns a high-resolution window for the editor.
+    Waveform {
+        slot: u32,
+        #[serde(default)]
+        start: u64,
+        #[serde(default)]
+        end: u64,
+        #[serde(default)]
+        preview: bool,
+    },
 }
 
-/// High-resolution peak envelope for the loop editor.
+/// Peak envelope for the loop editor.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct LoopWaveform {
     pub slot: u32,
+    #[serde(default)]
+    pub start: u64,
+    #[serde(default)]
+    pub end: u64,
+    #[serde(default)]
+    pub preview: bool,
     #[serde(default)]
     pub peaks: Vec<f32>,
 }

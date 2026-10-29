@@ -32,8 +32,9 @@ small OSC control protocol.
 - **Loop recorder** with bar-aligned capture from the MIDI clock, multi-source
   strip/bus taps, automatic latency and transient alignment, circular nudge,
   a loop launcher, a chosen save folder with timestamped WAV names, and
-  16/24-bit or 32-bit float export. The editor has a high-resolution waveform
-  with all/start/end zoom.
+  16/24-bit or 32-bit float export. The editor has a high-resolution,
+  windowed waveform with all/start/end zoom and drag-to-nudge (Shift for
+  sample-level drag).
 
 ## Using the UI
 
@@ -59,7 +60,9 @@ small OSC control protocol.
   bar), gain, mute and edit. Loops are saved to the folder chosen in the
   recorder/editor (default `VIBEMIX_CONFIG_DIR/loops/`) with a timestamped
   filename. The editor's waveform zooms to the whole loop, its start, or its
-  end. A MIDI clock is required to record.
+  end with a selectable 8×–512× factor; drag horizontally on it to nudge, hold
+  Shift for one sample per pixel, or type an exact manual value. A MIDI clock
+  is required to record.
 - **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
   matrix; pick the device on each axis. Tick a cell to connect. Only
   connections involving vibemix ports are editable.
