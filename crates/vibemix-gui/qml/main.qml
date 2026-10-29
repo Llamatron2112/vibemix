@@ -5760,6 +5760,34 @@ ApplicationWindow {
             viewEnd = slot.frames
             requestWaveform(null, true)
         }
+        function setSpan(span, anchorFrame) {
+            var slot = currentSlot()
+            if (!slot) return
+            var frames = Math.max(1, slot.frames)
+            var minSpan = Math.min(frames, 16)
+            var next = Math.max(minSpan, Math.min(frames, span))
+            var anchor = Math.max(0, Math.min(frames, anchorFrame))
+            var start = Math.max(0, Math.min(frames - next, anchor - next * 0.5))
+            viewStart = start
+            viewEnd = start + next
+            requestWaveform(null, true)
+            ruler.requestPaint()
+        }
+        function zoomBy(factor, anchorFrac) {
+            var slot = currentSlot()
+            if (!slot) return
+            var frames = Math.max(1, slot.frames)
+            var span = Math.max(1, viewEnd - viewStart)
+            var anchor = viewStart + anchorFrac * span
+            var next = span * factor
+            setSpan(next, anchor)
+        }
+        function zoomToSamples() {
+            var slot = currentSlot()
+            if (!slot) return
+            var center = cursorFrame >= 0 ? cursorFrame : (viewStart + viewEnd) * 0.5
+            setSpan(Math.min(slot.frames, 2048), center)
+        }
         function nudgeText() {
             var slot = currentSlot()
             if (!slot) return ""
@@ -6180,7 +6208,8 @@ ApplicationWindow {
                                 var span0 = Math.max(1, pressViewEnd - pressViewStart)
                                 var minSpan = Math.min(frames, 16)
                                 var pan = -dx * span0 / Math.max(1, width)
-                                var zoom = Math.exp(-dy * 0.01)
+                                // Drag up to zoom in; down to zoom out.
+                                var zoom = Math.exp(dy * 0.03)
                                 var newSpan = Math.max(minSpan, Math.min(frames, span0 * zoom))
                                 var frac = mouse.x / Math.max(1, width)
                                 var anchor = pressViewStart + frac * span0 + pan
@@ -6250,6 +6279,13 @@ ApplicationWindow {
                         loopEditor.cursorFrame = -1
                         editorWave.requestPaint()
                     }
+                    onWheel: function(wheel) {
+                        var delta = wheel.angleDelta.y
+                        if (delta === 0) return
+                        var factor = Math.pow(1.25, -delta / 120)
+                        loopEditor.zoomBy(factor, mouse.x / Math.max(1, width))
+                        wheel.accepted = true
+                    }
                 }
             }
 
@@ -6260,6 +6296,21 @@ ApplicationWindow {
                     text: "view"
                     color: root.textColor
                     font.pixelSize: 11
+                }
+                FlatButton {
+                    text: "−"
+                    implicitWidth: 26
+                    onClicked: loopEditor.zoomBy(2.0, 0.5)
+                }
+                FlatButton {
+                    text: "+"
+                    implicitWidth: 26
+                    onClicked: loopEditor.zoomBy(0.5, 0.5)
+                }
+                FlatButton {
+                    text: "samples"
+                    implicitWidth: 58
+                    onClicked: loopEditor.zoomToSamples()
                 }
                 FlatButton {
                     text: "fit"
@@ -6273,8 +6324,9 @@ ApplicationWindow {
                         if (!slot) return ""
                         var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                         var ms = slot.sample_rate > 0 ? span * 1000 / slot.sample_rate : 0
+                        var mode = loopEditor.waveSamples.length > 0 ? "raw" : "envelope"
                         var cursor = loopEditor.cursorText()
-                        return ms.toFixed(2) + " ms · " + Math.round(span) + " smp"
+                        return mode + " · " + ms.toFixed(2) + " ms · " + Math.round(span) + " smp"
                             + (cursor.length > 0 ? " · " + cursor : "")
                     }
                     color: root.mutedText

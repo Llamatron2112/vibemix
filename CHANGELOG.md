@@ -20,7 +20,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   one sample per pixel), or type an exact value. Multiple transient markers are
   shown; Ctrl+click one to make it the loop start, or use "snap first"/"zero
   seam". Onsets now come from spectral flux (FFT) rather than amplitude, with a
-  high-frequency energy strip and raw-sample drawing at close zoom. The visible
+  high-frequency energy strip and raw-sample drawing at close zoom. Wheel
+  zoom, ± buttons, and a "samples" button make the raw view easy to reach. The visible
   window is re-requested at the preview nudge while dragging, so it stays
   sharp. Loops are stored in the session and
   under `VIBEMIX_CONFIG_DIR/loops/` by default.

@@ -3659,7 +3659,7 @@ impl Controller {
                 .rem_euclid(frames as i64) as usize
         };
         let span = end - start;
-        const RAW_SAMPLE_LIMIT: usize = 16_384;
+        const RAW_SAMPLE_LIMIT: usize = 32_768;
         let samples = if !request.base && span <= RAW_SAMPLE_LIMIT {
             (start..end)
                 .map(|frame| {
