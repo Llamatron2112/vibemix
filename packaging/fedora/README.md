@@ -1,5 +1,8 @@
 # Fedora package (COPR)
 
+COPR is the Fedora release channel. GitHub releases carry the Debian packages
+and the two source archives, not Fedora RPMs.
+
 `vibemix.spec` builds from the GitHub release assets:
 
 - `vibemix-<version>.tar.gz`: source tree with the VST3 SDK and CLAP

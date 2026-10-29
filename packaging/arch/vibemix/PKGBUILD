@@ -77,9 +77,12 @@ build() {
   # Qt's Cargo link step fails with the default ld.bfd; use lld.
   # Remap the build dir so no $srcdir paths end up embedded in the binaries.
   export RUSTFLAGS="-C link-arg=-fuse-ld=lld \
---remap-path-prefix=$srcdir=/usr/src/$pkgname ${RUSTFLAGS:-}"
+--remap-path-prefix=$srcdir/$pkgname-$pkgver=/usr/src/$pkgname \
+--remap-path-prefix=$srcdir=/usr/src ${RUSTFLAGS:-}"
+  export CXXFLAGS="-ffile-prefix-map=$srcdir/$pkgname-$pkgver=/usr/src/$pkgname \
+-ffile-prefix-map=$srcdir=/usr/src ${CXXFLAGS:-}"
 
-  cargo build --release --locked --workspace
+  cargo build --release --locked --offline --workspace
 }
 
 package() {

@@ -76,23 +76,29 @@ prepare() {
   # needs the vendored VST3 SDK, which is a submodule with nested submodules
   # (base, pluginterfaces, public.sdk, ...); fetch them all.
   git submodule update --init --recursive
+
+  # Fetch the locked crates here so build() can stay offline.
+  cargo fetch --locked
 }
 
 build() {
   cd "$pkgname"
 
   # cxx-qt-build locates Qt through qmake; Arch ships it as qmake6.
-  # (The repo's checked-out .cargo/config.toml points at a Fedora path and is
-  # untracked, so it is not present in the cloned source.)
+  # (The repo's .cargo/config.toml is host-specific and untracked, so it is
+  # not present in the cloned source.)
   export QMAKE=/usr/bin/qmake6
   export QT_VERSION_MAJOR=6
 
   # Qt's Cargo link step fails with the default ld.bfd; use lld.
   # Remap the build dir so no $srcdir paths end up embedded in the binaries.
   export RUSTFLAGS="-C link-arg=-fuse-ld=lld \
---remap-path-prefix=$srcdir=/usr/src/$pkgname ${RUSTFLAGS:-}"
+--remap-path-prefix=$srcdir/$pkgname=/usr/src/$pkgname \
+--remap-path-prefix=$srcdir=/usr/src ${RUSTFLAGS:-}"
+  export CXXFLAGS="-ffile-prefix-map=$srcdir/$pkgname=/usr/src/$pkgname \
+-ffile-prefix-map=$srcdir=/usr/src ${CXXFLAGS:-}"
 
-  cargo build --release --locked --workspace
+  cargo build --release --locked --offline --workspace
 }
 
 package() {

@@ -7,9 +7,12 @@
 .qmlls.ini
 
 # makepkg build artifacts (the PKGBUILD and .SRCINFO are tracked)
-packaging/arch/pkg/
-packaging/arch/src/
-packaging/arch/*.pkg.tar.*
+packaging/arch/**/pkg/
+packaging/arch/**/src/
+packaging/arch/**/*.pkg.tar.*
+
+# Release checksum scratch file (generated for uploads)
+/sha256sums.txt
 
 # Editor / OS
 .idea/

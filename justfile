@@ -53,6 +53,15 @@ release:
 
 # Install binaries, launcher, desktop entry and icon.
 # Depends on `release` so `target/release/*` is always fresh.
+# Build and install a pacman package from the working tree. It provides and
+# conflicts with vibemix/vibemix-git, so it replaces either package and keeps a
+# single install under /usr (no ~/.local copy).
+dev-package:
+    cd packaging/arch/vibemix-dev && makepkg -sf
+
+dev-install:
+    cd packaging/arch/vibemix-dev && makepkg -sfi
+
 install: release
     install -Dm755 target/release/vibemix-engine {{PREFIX}}/bin/vibemix-engine
     install -Dm755 target/release/vibemix-gui {{PREFIX}}/bin/vibemix-gui

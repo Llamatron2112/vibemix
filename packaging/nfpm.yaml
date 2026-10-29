@@ -1,13 +1,13 @@
-# nfpm packaging for the release workflow (https://nfpm.goreleaser.com).
+# nfpm packaging for the Debian release workflow (https://nfpm.goreleaser.com).
 #
-# The release workflow runs this once per distro release, in that distro's
-# container and against that distro's Qt:
+# The release workflow runs this once per Debian release, in that release's
+# container and against that release's Qt:
 #   cargo build --release --locked --workspace
 #   nfpm package -f packaging/nfpm.yaml -p deb -t dist/
 #
 # nfpm expands ${VAR} from the environment:
 #   VIBEMIX_VERSION  the version (from the git tag)
-#   PKG_RELEASE      the package release, distro-tagged (e.g. 1~deb12, 1.fc43)
+#   PKG_RELEASE      the package release, distro-tagged (e.g. 1~deb12)
 #   QT_MIN, QT_MAX   the Qt series to require, derived from the build container
 #   QT_CORE/QT_GUI/QT_QML/QT_QUICK  the distro's Qt6 library package names
 #                    (Debian 12: libqt6core6; Debian 13: libqt6core6t64)
@@ -76,18 +76,3 @@ overrides:
       - qml6-module-qtquick-window
     recommends:
       - libgtk-3-0
-  rpm:
-    depends:
-      - glibc
-      - libstdc++
-      - libX11
-      - libglvnd-glx
-      - lilv
-      - suil
-      - pipewire-jack-audio-connection-kit
-      - qt6-qtbase >= ${QT_MIN}
-      - qt6-qtbase < ${QT_MAX}
-      - qt6-qtdeclarative >= ${QT_MIN}
-      - qt6-qtdeclarative < ${QT_MAX}
-    recommends:
-      - gtk3

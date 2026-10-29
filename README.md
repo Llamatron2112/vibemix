@@ -47,8 +47,7 @@ small OSC control protocol.
 - **Meters**: click a meter to cycle its tap (strip IN/GAIN/OUT; bus
   IN/SEND/RET/OUT).
 - **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
-  matrix; pick the device on each axis. Tick a cell to connect. **Link L/R**
-  pairs the channels and **Mono → L+R** feeds one source to both; only
+  matrix; pick the device on each axis. Tick a cell to connect. Only
   connections involving vibemix ports are editable.
 - **MIDI input**: `Options → MIDI input…` chooses which MIDI outputs feed
   vibemix.
@@ -58,8 +57,8 @@ small OSC control protocol.
 ## Build
 
 Prerequisites are listed in [docs/prerequisites.md](docs/prerequisites.md)
-(Arch packages, Fedora mapping, Qt/cxx-qt and JACK/PipeWire notes). The VST3 SDK
-and CLAP headers are vendored submodules:
+(Arch packages, Qt/cxx-qt and JACK/PipeWire notes, plus the Fedora/COPR
+mapping). The VST3 SDK and CLAP headers are vendored submodules:
 
 ```bash
 git submodule update --init --recursive
@@ -121,11 +120,11 @@ engine for the session, then the GUI), a `.desktop` entry and an icon.
    git push origin vX.Y.Z
    ```
 
-7. The `Release` workflow gates on tests, then builds and verifies one package
-   per distro release — `.deb` for Debian 12/13 and `.rpm` for Fedora 43/44 —
-   each against that release's Qt, and publishes them with SHA-256 checksums.
-   It also attaches the source tarball and the cargo vendor archive that the
-   COPR and OBS specs build from.
+7. The `Release` workflow gates on tests, then builds and verifies the Debian
+   packages (`.deb` for Debian 12/13), each against that release's Qt, and
+   publishes them with SHA-256 checksums. It also attaches the source tarball
+   and the cargo vendor archive that the COPR and OBS specs build from. Fedora
+   ships through COPR and openSUSE through OBS.
 
 ## License
 

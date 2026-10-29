@@ -81,10 +81,21 @@ just release               # optimized (lto)
 just run-engine            # run the engine from source
 just run-gui               # run the GUI from source
 
-just install               # install to /usr/local
+just dev-install           # pacman package from the working tree (recommended)
+just dev-package           # build that package without installing it
+
+just install               # prefix install to /usr/local
 just PREFIX=~/.local install   # or a custom prefix
 just PREFIX=~/.local uninstall
 ```
+
+`just dev-install` builds `packaging/arch/vibemix-dev` from the working tree and
+installs it with pacman. It provides and conflicts with `vibemix` and
+`vibemix-git`, so it replaces either package, and installing a release package
+replaces it again. Everything lands in `/usr`, so there is no `~/.local` copy to
+shadow it. If you previously used `just PREFIX=~/.local install`, remove it first
+with `just PREFIX=~/.local uninstall` (`/usr/local/bin` usually comes before
+`/usr/bin` in `PATH`).
 
 `just install` installs `vibemix-engine`, `vibemix-gui`, a `vibemix` launcher
 (starts the engine for the session, then opens the GUI), a `.desktop` entry and
@@ -194,7 +205,6 @@ change the audio callback's scheduling — it is PipeWire's data thread.
 | `ninja` | `ninja-build` |
 | `qt6-base` | `qt6-qtbase-devel` |
 | `qt6-declarative` | `qt6-qtdeclarative-devel` |
-| `qt6-declarative` (ships Quick Controls 2) | `qt6-qtquickcontrols2-devel` |
 | `lv2` | `lv2-devel` |
 | `lilv` | `lilv-devel` |
 | `serd` | `serd-devel` |
@@ -210,6 +220,9 @@ Arch's `pipewire-jack` ships JACK headers, `libjack.so` and `jack.pc` in one
 package. Do not also install `jack2`. Fedora's
 `pipewire-jack-audio-connection-kit-devel` plays the same role; do not install
 `jack-audio-connection-kit`.
+
+Current Fedora ships Qt Quick Controls 2 and Quick Dialogs inside
+`qt6-qtdeclarative`; there is no separate `qt6-qtquickcontrols2-devel`.
 
 ## Submodules
 

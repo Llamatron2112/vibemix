@@ -1,0 +1,129 @@
+# Maintainer: vibemix maintainers
+#
+# Development package: builds the current working tree, including uncommitted
+# changes and the third_party/ submodules, and installs it with pacman. It
+# replaces vibemix/vibemix-git, so there is no separate ~/.local install.
+#
+# Build:  makepkg -sf        Install: makepkg -sfi
+# Or:     just dev-package / just dev-install
+#
+# This package is local-only; it is not published.
+
+pkgname=vibemix-dev
+pkgver=1.0.2.r126.g7f01027
+pkgrel=1
+pkgdesc="Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire (development build)"
+arch=('x86_64')
+url="https://github.com/Llamatron2112/vibemix"
+license=('MIT' 'Apache')
+depends=(
+  'glibc'
+  'gcc-libs'
+  'libx11'
+  'libglvnd'
+  'lilv'
+  'suil'
+  'jack'
+  'qt6-base'
+  'qt6-declarative'
+)
+optdepends=(
+  'gtk3: host GTK3 plugin UIs'
+  'gtk2: host GTK2 plugin UIs'
+)
+makedepends=(
+  'rust'
+  'cmake'
+  'ninja'
+  'pkgconf'
+  'gcc'
+  'lld'
+  'libglvnd'
+  'libx11'
+  'lv2'
+  'lilv'
+  'serd'
+  'sord'
+  'sratom'
+  'suil'
+  'jack'
+  'qt6-base'
+  'qt6-declarative'
+)
+provides=(
+  'vibemix'
+  'vst3-host'
+  'clap-host'
+  'lv2-host'
+)
+conflicts=('vibemix' 'vibemix-git')
+# No sources: prepare() copies the working tree. pkgver comes from Cargo.toml.
+source=()
+sha256sums=()
+
+pkgver() {
+  cd "$srcdir/$pkgname"
+  local ver
+  ver="$(grep -m1 '^version = ' Cargo.toml | sed 's/.*"\(.*\)".*/\1/')"
+  if git -C "$startdir/../../.." rev-parse --short HEAD >/dev/null 2>&1; then
+    printf '%s.r%s.g%s\n' "$ver" \
+      "$(git -C "$startdir/../../.." rev-list --count HEAD)" \
+      "$(git -C "$startdir/../../.." rev-parse --short HEAD)"
+  else
+    printf '%s\n' "$ver"
+  fi
+}
+
+prepare() {
+  local repo
+  repo="$(realpath "$startdir/../../..")"
+
+  mkdir -p "$srcdir/$pkgname"
+  tar -C "$repo" \
+      --exclude-vcs \
+      --exclude=.cargo \
+      --exclude=target \
+      --exclude=dist \
+      --exclude='packaging/arch/*/src' \
+      --exclude='packaging/arch/*/pkg' \
+      --exclude='*.pkg.tar.*' \
+      -cf - . | tar -C "$srcdir/$pkgname" -xf -
+  find "$srcdir/$pkgname" -name .git -prune -exec rm -rf {} +
+
+  cd "$srcdir/$pkgname"
+  cargo fetch --locked
+}
+
+build() {
+  cd "$srcdir/$pkgname"
+
+  # cxx-qt-build locates Qt through qmake; Arch ships it as qmake6.
+  export QMAKE=/usr/bin/qmake6
+  export QT_VERSION_MAJOR=6
+
+  # Qt's Cargo link step fails with the default ld.bfd; use lld.
+  # Remap the build dir so no $srcdir paths end up embedded in the binaries.
+  export RUSTFLAGS="-C link-arg=-fuse-ld=lld \
+--remap-path-prefix=$srcdir/$pkgname=/usr/src/$pkgname \
+--remap-path-prefix=$srcdir=/usr/src ${RUSTFLAGS:-}"
+  export CXXFLAGS="-ffile-prefix-map=$srcdir/$pkgname=/usr/src/$pkgname \
+-ffile-prefix-map=$srcdir=/usr/src ${CXXFLAGS:-}"
+
+  cargo build --release --locked --offline --workspace
+}
+
+package() {
+  cd "$srcdir/$pkgname"
+
+  install -Dm755 target/release/vibemix-engine "$pkgdir/usr/bin/vibemix-engine"
+  install -Dm755 target/release/vibemix-gui "$pkgdir/usr/bin/vibemix-gui"
+  install -Dm755 packaging/vibemix "$pkgdir/usr/bin/vibemix"
+
+  install -Dm644 packaging/vibemix.desktop \
+    "$pkgdir/usr/share/applications/vibemix.desktop"
+  install -Dm644 packaging/vibemix.svg \
+    "$pkgdir/usr/share/icons/hicolor/scalable/apps/vibemix.svg"
+
+  install -Dm644 LICENSE-MIT "$pkgdir/usr/share/licenses/$pkgname/LICENSE-MIT"
+  install -Dm644 LICENSE-APACHE "$pkgdir/usr/share/licenses/$pkgname/LICENSE-APACHE"
+}
