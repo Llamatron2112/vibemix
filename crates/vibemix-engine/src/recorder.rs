@@ -85,6 +85,7 @@ pub struct Recorder {
     latency_frames: u32,
     loop_beats: f32,
     peak: f32,
+    since_pulse: usize,
 }
 
 impl Recorder {
@@ -100,6 +101,7 @@ impl Recorder {
             latency_frames: 0,
             loop_beats: 4.0,
             peak: 0.0,
+            since_pulse: 0,
         }
     }
 
@@ -124,6 +126,7 @@ impl Recorder {
         self.latency_frames = latency_frames;
         self.loop_beats = loop_beats;
         self.peak = 0.0;
+        self.since_pulse = 0;
         shared.set_loop_beats(loop_beats);
         shared.set_status(0, 0, 0.0);
         shared.set_state(RecorderState::Armed);
@@ -137,6 +140,7 @@ impl Recorder {
         }
         self.state = State::Idle;
         self.write = 0;
+        self.since_pulse = 0;
         shared.set_state(RecorderState::Idle);
         shared.set_status(0, 0, 0.0);
     }
@@ -150,7 +154,6 @@ impl Recorder {
         events: &[MidiEvent],
         beats_before: f64,
         beats_per_bar: f32,
-        playing: bool,
         left: &[f32],
         right: &[f32],
         sample_rate: u32,
@@ -162,10 +165,20 @@ impl Recorder {
             return;
         }
 
-        if self.state == State::Recording && !playing {
-            // The transport stopped mid-take; discard it.
-            self.cancel(garbage, shared);
-            return;
+        // Some clock sources send 24 PPQN without a START. Treat clock pulses
+        // as the transport reference; only an explicit STOP aborts a take.
+        let saw_clock = events.iter().any(|event| status(event) == CLOCK);
+        if self.state == State::Recording {
+            if saw_clock {
+                self.since_pulse = 0;
+            } else {
+                self.since_pulse += frames;
+                if self.since_pulse > sample_rate as usize {
+                    tracing::warn!("recorder lost the MIDI clock; take discarded");
+                    self.cancel(garbage, shared);
+                    return;
+                }
+            }
         }
 
         let bpb = (beats_per_bar as f64).max(1.0);
@@ -214,10 +227,6 @@ impl Recorder {
                     break;
                 }
                 RESET => {
-                    if started {
-                        aborted = true;
-                        break;
-                    }
                     beats = 0.0;
                 }
                 _ => {}
@@ -377,6 +386,49 @@ mod tests {
     }
 
     #[test]
+    fn captures_from_clock_without_start() {
+        let shared = SharedRecorder::new();
+        let (mut take_tx, mut take_rx) = rtrb::RingBuffer::<RecordedTake>::new(2);
+        let (mut garbage_tx, _garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(2);
+        let mut recorder = Recorder::new();
+        recorder.arm(
+            vec![0.0; 8 * 2].into_boxed_slice(),
+            8,
+            4,
+            2,
+            0,
+            1.0,
+            &shared,
+        );
+
+        let left = [0.1, 0.2, 0.3, 0.4];
+        let right = [1.0, 2.0, 3.0, 4.0];
+        // 95 pulses = 3.9583 beats; the first CLOCK lands on the 4/4 bar.
+        let events = [
+            MidiEvent::new(0, &[CLOCK]),
+            MidiEvent::new(1, &[CLOCK]),
+            MidiEvent::new(2, &[CLOCK]),
+        ];
+        recorder.process(
+            4,
+            &events,
+            95.0 / 24.0,
+            4.0,
+            &left,
+            &right,
+            48_000,
+            &shared,
+            &mut take_tx,
+            &mut garbage_tx,
+        );
+
+        let take = take_rx.pop().expect("clock-only take");
+        assert_eq!(take.frames, 2);
+        assert!((take.buffer[0] - 0.1).abs() < 1e-6);
+        assert_eq!(shared.state(), RecorderState::Idle);
+    }
+
+    #[test]
     fn captures_from_start_to_loop_boundary() {
         let shared = SharedRecorder::new();
         let (mut take_tx, mut take_rx) = rtrb::RingBuffer::<RecordedTake>::new(2);
@@ -404,7 +456,6 @@ mod tests {
             &events,
             0.0,
             4.0,
-            true,
             &left,
             &right,
             48_000,

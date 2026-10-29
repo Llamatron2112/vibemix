@@ -1368,7 +1368,6 @@ impl ProcessHandler for MixerGraph {
             self.transport_midi.as_slice(),
             beats_before,
             beats_per_bar,
-            playing,
             &self.record_mix[0],
             &self.record_mix[1],
             self.sample_rate as u32,

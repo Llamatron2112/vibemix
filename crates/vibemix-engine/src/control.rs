@@ -3688,7 +3688,7 @@ impl Controller {
             .engine
             .clock()
             .snapshot(self.engine.sample_rate() as f32);
-        let message = if snapshot.state == crate::params::RecorderState::Armed && !clock.playing {
+        let message = if snapshot.state == crate::params::RecorderState::Armed && !clock.locked {
             "waiting for MIDI clock".to_string()
         } else {
             String::new()
@@ -3832,7 +3832,7 @@ impl Controller {
             Ok(()) => {
                 self.recorder_status = RecorderStatus {
                     state: "armed".to_string(),
-                    message: if clock.playing {
+                    message: if clock.locked {
                         String::new()
                     } else {
                         "waiting for MIDI clock".to_string()
