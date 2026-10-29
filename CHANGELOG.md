@@ -13,8 +13,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   automatic JACK/plugin latency compensation, optional transient alignment and
   a circular manual nudge, and can be saved as 16-bit, 24-bit or 32-bit float
   WAV. `Options → Loops…` is a separate launcher window with quantized
-  play/stop, gain, mute and an editor. Loops are stored in the session and
-  under `VIBEMIX_CONFIG_DIR/loops/`.
+  play/stop, gain, mute and an editor. The save folder is chosen in the GUI and
+  remembered; filenames include a timestamp. The editor requests a
+  high-resolution waveform and can zoom to the loop start or end. Loops are
+  stored in the session and under `VIBEMIX_CONFIG_DIR/loops/` by default.
 
 ## [1.0.2] - 2026-10-22
 

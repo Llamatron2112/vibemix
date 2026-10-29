@@ -19,8 +19,8 @@ use vibemix_core::model::{
 };
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_core::recorder::{
-    detect_transient, peaks, rotate_interleaved, LoopSlot, RecorderAction, RecorderSettings,
-    RecorderSource, RecorderStatus,
+    detect_transient, peaks, rotate_interleaved, LoopSlot, LoopWaveform, RecorderAction,
+    RecorderSettings, RecorderSource, RecorderStatus,
 };
 use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 
@@ -73,6 +73,7 @@ struct LoopRuntime {
 }
 
 const LOOP_PEAK_BUCKETS: usize = 512;
+const LOOP_WAVEFORM_BUCKETS: usize = 8192;
 
 /// A full mixer-model snapshot for undo/redo.
 struct UndoEntry {
@@ -161,6 +162,7 @@ pub struct Controller {
     recorder_status: RecorderStatus,
     recorder_dirty: bool,
     loops_dirty: bool,
+    pending_waveform: Option<u32>,
 }
 
 /// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
@@ -389,6 +391,7 @@ impl Controller {
             recorder_status: RecorderStatus::default(),
             recorder_dirty: false,
             loops_dirty: true,
+            pending_waveform: None,
         };
         controller.ensure_model_plugin_controls();
         controller
@@ -542,6 +545,9 @@ impl Controller {
             }
             if let Some(message) = self.pending_connect_result.take() {
                 self.send_message(&message, address);
+            }
+            if let Some(slot) = self.pending_waveform.take() {
+                self.send_loop_waveform(address, slot);
             }
             if actions.catalog {
                 self.send_catalog(address);
@@ -1433,7 +1439,9 @@ impl Controller {
                 }
                 Actions::default()
             }
-            ControlMessage::RecorderStatus { .. } | ControlMessage::LoopList { .. } => {
+            ControlMessage::RecorderStatus { .. }
+            | ControlMessage::LoopList { .. }
+            | ControlMessage::LoopWaveform { .. } => {
                 Actions::default()
             }
             ControlMessage::SetLayout {
@@ -3610,6 +3618,25 @@ impl Controller {
         }
     }
 
+    /// Send a high-resolution envelope for the editor. Kept out of the 30 Hz
+    /// loop list so gain/play updates stay small.
+    fn send_loop_waveform(&self, address: SocketAddr, slot: u32) {
+        let Some(runtime) = self.loops.get(slot as usize).and_then(Option::as_ref) else {
+            return;
+        };
+        let frames = runtime.slot.frames as usize;
+        if frames == 0 || runtime.raw.len() < frames * 2 {
+            return;
+        }
+        let json = LoopWaveform {
+            slot,
+            peaks: peaks(&runtime.raw, frames, LOOP_WAVEFORM_BUCKETS),
+        };
+        if let Ok(json) = serde_json::to_string(&json) {
+            self.send_message(&ControlMessage::LoopWaveform { json }, address);
+        }
+    }
+
     /// Poll the audio thread for a finished take and refresh the status.
     fn poll_recorder(&mut self) {
         while let Some(take) = self.engine.take_recording() {
@@ -3637,6 +3664,7 @@ impl Controller {
             frames: snapshot.frames,
             peak: snapshot.peak,
             loop_beats: snapshot.loop_beats,
+            loops_dir: loops_dir().to_string_lossy().into_owned(),
             message,
         };
         if status != self.recorder_status {
@@ -3838,6 +3866,9 @@ impl Controller {
                     self.loops_dirty = true;
                 }
             }
+            RecorderAction::Waveform { slot } => {
+                self.pending_waveform = Some(slot);
+            }
             RecorderAction::LoopSave {
                 slot,
                 path,
@@ -3864,6 +3895,7 @@ impl Controller {
     }
 
     fn save_loop(&mut self, slot: u32, path: Option<String>, bit_depth: u8) {
+        let save_dir = self.model.recorder.save_dir.clone();
         let Some(runtime) = self.loops.get(slot as usize).and_then(Option::as_ref) else {
             return;
         };
@@ -3873,7 +3905,21 @@ impl Controller {
         let path = path
             .filter(|path| !path.trim().is_empty())
             .map(PathBuf::from)
-            .unwrap_or_else(|| loops_dir().join(format!("{name}.wav")));
+            .unwrap_or_else(|| {
+                let dir = if save_dir.trim().is_empty() {
+                    loops_dir()
+                } else {
+                    PathBuf::from(&save_dir)
+                };
+                let stamp = timestamp_slug();
+                let mut candidate = dir.join(format!("{name}-{stamp}.wav"));
+                let mut suffix = 2;
+                while candidate.exists() {
+                    candidate = dir.join(format!("{name}-{stamp}-{suffix}.wav"));
+                    suffix += 1;
+                }
+                candidate
+            });
         match write_loop_wav(
             &path,
             &runtime.raw,
@@ -5095,6 +5141,26 @@ mod sidechain_order_tests {
 
 fn loops_dir() -> PathBuf {
     config_dir().join("loops")
+}
+
+fn timestamp_slug() -> String {
+    let now = unsafe { libc::time(std::ptr::null_mut()) };
+    if now == -1 {
+        return "0".to_string();
+    }
+    let mut tm: libc::tm = unsafe { std::mem::zeroed() };
+    if unsafe { libc::localtime_r(&now, &mut tm) }.is_null() {
+        return now.to_string();
+    }
+    format!(
+        "{:04}{:02}{:02}-{:02}{:02}{:02}",
+        tm.tm_year + 1900,
+        tm.tm_mon + 1,
+        tm.tm_mday,
+        tm.tm_hour,
+        tm.tm_min,
+        tm.tm_sec
+    )
 }
 
 fn sanitize_file_name(name: &str) -> String {

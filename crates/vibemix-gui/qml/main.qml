@@ -595,6 +595,7 @@ ApplicationWindow {
     function localPath(url) {
         var text = String(url)
         if (text.indexOf("file://") === 0) text = text.slice(7)
+        try { text = decodeURIComponent(text) } catch (e) {}
         return text
     }
 
@@ -685,6 +686,7 @@ ApplicationWindow {
         return {
             sources: r.sources || [],
             bit_depth: (r.bit_depth !== undefined) ? r.bit_depth : 24,
+            save_dir: r.save_dir || "",
             auto_latency: r.auto_latency !== false,
             transient: r.transient !== false,
             nudge_samples: r.nudge_samples || 0,
@@ -698,6 +700,15 @@ ApplicationWindow {
     }
     function sendRecorderAction(action) {
         backend.recorderAction(JSON.stringify(action))
+    }
+    function loopFolder() {
+        var folder = root.recorderSettings().save_dir
+        if (folder && folder.length > 0) return folder
+        return root.recorderInfo().loops_dir || ""
+    }
+    function loopFolderUrl() {
+        var folder = root.loopFolder()
+        return folder.length > 0 ? "file://" + folder : "file:///"
     }
     function openRecorder() {
         var selected = root.recorderSettings().sources
@@ -1458,6 +1469,13 @@ ApplicationWindow {
             root.saveSessionTo(root.localPath(selectedFile))
             root.runPending()
         }
+    }
+
+    FolderDialog {
+        id: loopFolderDialog
+        title: "Loop folder"
+        currentFolder: root.loopFolderUrl()
+        onAccepted: root.updateRecorderSetting("save_dir", root.localPath(selectedFolder))
     }
 
     Dialog {
@@ -5451,6 +5469,25 @@ ApplicationWindow {
                 }
             }
 
+            RowLayout {
+                Label {
+                    text: "folder"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: root.loopFolder().length > 0 ? root.loopFolder() : "default"
+                    color: root.mutedText
+                    font.pixelSize: 10
+                    elide: Text.ElideMiddle
+                }
+                FlatButton {
+                    text: "browse…"
+                    onClicked: loopFolderDialog.open()
+                }
+            }
+
             ProgressBar {
                 Layout.fillWidth: true
                 from: 0
@@ -5627,9 +5664,27 @@ ApplicationWindow {
     Window {
         id: loopEditor
         property int slotId: -1
+        property var editorPeaks: []
+        property string zoomMode: "all"
         function openFor(id) {
             slotId = id
+            editorPeaks = []
+            zoomMode = "all"
+            root.sendRecorderAction({ action: "waveform", slot: id })
             visible = true
+        }
+
+        Connections {
+            target: backend
+            function onWaveformChanged() {
+                try {
+                    var wave = JSON.parse(backend.waveform)
+                    if (wave.slot === loopEditor.slotId) {
+                        loopEditor.editorPeaks = wave.peaks || []
+                        editorWave.requestPaint()
+                    }
+                } catch (e) {}
+            }
         }
 
         modality: Qt.NonModal
@@ -5665,7 +5720,9 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 Layout.preferredHeight: 120
                 property var slot: root.loopById(loopEditor.slotId)
-                property var peaks: slot ? (slot.peaks || []) : []
+                property var peaks: loopEditor.editorPeaks.length > 0
+                    ? loopEditor.editorPeaks
+                    : (slot ? (slot.peaks || []) : [])
                 onSlotChanged: requestPaint()
                 onPeaksChanged: requestPaint()
                 onWidthChanged: requestPaint()
@@ -5673,7 +5730,7 @@ ApplicationWindow {
                 onPaint: {
                     var ctx = getContext("2d")
                     ctx.clearRect(0, 0, width, height)
-                    if (!slot || !peaks || peaks.length === 0) return
+                    if (!slot || !peaks || peaks.length === 0 || width <= 0) return
 
                     ctx.strokeStyle = root.borderColor
                     ctx.beginPath()
@@ -5681,37 +5738,78 @@ ApplicationWindow {
                     ctx.lineTo(width, height * 0.5)
                     ctx.stroke()
 
+                    var frames = Math.max(1, slot.frames || 1)
+                    var nudge = slot.nudge_samples || 0
+                    var phase = ((nudge % frames) + frames) % frames / frames
+                    var offset = Math.floor(phase * peaks.length)
+                    var zoom = loopEditor.zoomMode
+                    var viewStart = zoom === "end" ? 1 - 1 / 32 : 0
+                    var viewEnd = zoom === "start" ? 1 / 32 : 1
+                    var span = Math.max(1.0e-9, viewEnd - viewStart)
+
                     ctx.strokeStyle = root.mutedText
                     ctx.beginPath()
-                    for (var i = 0; i < peaks.length; i++) {
-                        var x = i / Math.max(1, peaks.length - 1) * width
-                        var a = peaks[i] * height * 0.45
+                    for (var x = 0; x < width; x++) {
+                        var frac = viewStart + (x / Math.max(1, width - 1)) * span
+                        var index = Math.floor((offset + frac * peaks.length) % peaks.length)
+                        var a = peaks[index] * height * 0.45
                         ctx.moveTo(x, height * 0.5 - a)
                         ctx.lineTo(x, height * 0.5 + a)
                     }
                     ctx.stroke()
 
-                    // Beat grid.
+                    // Beat grid, clipped to the visible window.
                     var beats = Math.max(1, slot.loop_beats || 1)
                     ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25)
                     ctx.beginPath()
                     for (var b = 0; b <= beats; b++) {
-                        var bx = b / beats * width
+                        var beat = b / beats
+                        if (beat < viewStart - 1.0e-9 || beat > viewEnd + 1.0e-9) continue
+                        var bx = (beat - viewStart) / span * width
                         ctx.moveTo(bx, 0)
                         ctx.lineTo(bx, height)
                     }
                     ctx.stroke()
+                }
+            }
 
-                    // Seam: where the rotated loop starts.
-                    var frames = Math.max(1, slot.frames || 1)
-                    var phase = ((slot.nudge_samples || 0) % frames + frames) % frames / frames
-                    ctx.strokeStyle = root.accentColor
-                    ctx.lineWidth = 2
-                    ctx.beginPath()
-                    ctx.moveTo(phase * width, 0)
-                    ctx.lineTo(phase * width, height)
-                    ctx.stroke()
-                    ctx.lineWidth = 1
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                Label {
+                    text: "zoom"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                FlatButton {
+                    text: "all"
+                    implicitWidth: 34
+                    onClicked: {
+                        loopEditor.zoomMode = "all"
+                        editorWave.requestPaint()
+                    }
+                }
+                FlatButton {
+                    text: "start"
+                    implicitWidth: 42
+                    onClicked: {
+                        loopEditor.zoomMode = "start"
+                        editorWave.requestPaint()
+                    }
+                }
+                FlatButton {
+                    text: "end"
+                    implicitWidth: 36
+                    onClicked: {
+                        loopEditor.zoomMode = "end"
+                        editorWave.requestPaint()
+                    }
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: loopEditor.zoomMode === "all" ? "whole loop" : ("32× " + loopEditor.zoomMode)
+                    color: root.mutedText
+                    font.pixelSize: 10
                 }
             }
 
@@ -5816,6 +5914,26 @@ ApplicationWindow {
                         var slot = root.loopById(loopEditor.slotId)
                         if (slot) root.renameLoop(slot, text)
                     }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                Label {
+                    text: "folder"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: root.loopFolder().length > 0 ? root.loopFolder() : "default"
+                    color: root.mutedText
+                    font.pixelSize: 10
+                    elide: Text.ElideMiddle
+                }
+                FlatButton {
+                    text: "browse…"
+                    onClicked: loopFolderDialog.open()
                 }
             }
 

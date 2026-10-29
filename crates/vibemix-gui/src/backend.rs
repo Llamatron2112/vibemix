@@ -49,10 +49,13 @@ static LAST_PORTS_REV: AtomicU64 = AtomicU64::new(u64::MAX);
 static PORTS: Mutex<String> = Mutex::new(String::new());
 static RECORDER: Mutex<String> = Mutex::new(String::new());
 static LOOPS: Mutex<String> = Mutex::new(String::new());
+static WAVEFORM: Mutex<String> = Mutex::new(String::new());
 static RECORDER_REV: AtomicU64 = AtomicU64::new(0);
 static LOOPS_REV: AtomicU64 = AtomicU64::new(0);
+static WAVEFORM_REV: AtomicU64 = AtomicU64::new(0);
 static LAST_RECORDER_REV: AtomicU64 = AtomicU64::new(0);
 static LAST_LOOPS_REV: AtomicU64 = AtomicU64::new(0);
+static LAST_WAVEFORM_REV: AtomicU64 = AtomicU64::new(0);
 static PENDING_CONNECTION_ERROR: Mutex<Option<String>> = Mutex::new(None);
 static LAST_CLOCK: Mutex<Option<ClockState>> = Mutex::new(None);
 static LAST_SESSION_PATH: Mutex<String> = Mutex::new(String::new());
@@ -385,6 +388,12 @@ fn receive_loop(socket: UdpSocket) {
                         *guard = json;
                     }
                     LOOPS_REV.fetch_add(1, Ordering::Release);
+                }
+                Some(ControlMessage::LoopWaveform { json }) => {
+                    if let Ok(mut guard) = WAVEFORM.lock() {
+                        *guard = json;
+                    }
+                    WAVEFORM_REV.fetch_add(1, Ordering::Release);
                 }
                 Some(ControlMessage::ConnectResult { ok, error, .. }) => {
                     if let Ok(mut guard) = PENDING_CONNECTION_ERROR.lock() {
@@ -772,6 +781,7 @@ pub mod qobject {
         #[qproperty(QString, clock)]
         #[qproperty(QString, recorder)]
         #[qproperty(QString, loops)]
+        #[qproperty(QString, waveform)]
         #[qproperty(bool, catalog_ready)]
         #[qproperty(bool, scan_running)]
         #[qproperty(i32, scan_done)]
@@ -1132,6 +1142,7 @@ pub struct BackendRust {
     clock: QString,
     recorder: QString,
     loops: QString,
+    waveform: QString,
     catalog_ready: bool,
     scan_running: bool,
     scan_done: i32,
@@ -1171,8 +1182,9 @@ impl Default for BackendRust {
             undo_label: QString::from(""),
             redo_label: QString::from(""),
             clock: QString::from("{\"locked\":false,\"playing\":false,\"bpm\":120,\"beats\":0,\"seconds\":0,\"beats_per_bar\":4,\"jitter_bpm\":0,\"glitches\":0}"),
-            recorder: QString::from("{\"state\":\"idle\",\"progress\":0,\"frames\":0,\"peak\":0,\"loop_beats\":0,\"message\":\"\"}"),
+            recorder: QString::from("{\"state\":\"idle\",\"progress\":0,\"frames\":0,\"peak\":0,\"loop_beats\":0,\"loops_dir\":\"\",\"message\":\"\"}"),
             loops: QString::from("[]"),
+            waveform: QString::from("{\"slot\":-1,\"peaks\":[]}"),
             catalog_ready: false,
             scan_running: false,
             scan_done: 0,
@@ -1233,6 +1245,13 @@ impl qobject::Backend {
             LAST_LOOPS_REV.store(loops_rev, Ordering::Relaxed);
             let json = LOOPS.lock().map(|guard| guard.clone()).unwrap_or_default();
             self.as_mut().set_loops(QString::from(json.as_str()));
+        }
+
+        let waveform_rev = WAVEFORM_REV.load(Ordering::Acquire);
+        if waveform_rev != LAST_WAVEFORM_REV.load(Ordering::Relaxed) {
+            LAST_WAVEFORM_REV.store(waveform_rev, Ordering::Relaxed);
+            let json = WAVEFORM.lock().map(|guard| guard.clone()).unwrap_or_default();
+            self.as_mut().set_waveform(QString::from(json.as_str()));
         }
         if let Some(error) = PENDING_CONNECTION_ERROR
             .lock()

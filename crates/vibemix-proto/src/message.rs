@@ -241,6 +241,9 @@ pub enum ControlMessage {
     LoopList {
         json: String,
     },
+    LoopWaveform {
+        json: String,
+    },
     SetLayout {
         strips_per_row: u32,
         buses_per_row: u32,
@@ -792,6 +795,10 @@ impl ControlMessage {
                 addr: addr::LOOP_LIST.to_string(),
                 args: vec![OscType::String(json.clone())],
             },
+            LoopWaveform { json } => OscMessage {
+                addr: addr::LOOP_WAVEFORM.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
             SetLayout {
                 strips_per_row,
                 buses_per_row,
@@ -1252,6 +1259,9 @@ impl ControlMessage {
                 json: string(args, 0)?,
             }),
             addr::LOOP_LIST => Some(ControlMessage::LoopList {
+                json: string(args, 0)?,
+            }),
+            addr::LOOP_WAVEFORM => Some(ControlMessage::LoopWaveform {
                 json: string(args, 0)?,
             }),
             addr::LAYOUT => Some(ControlMessage::SetLayout {

@@ -48,6 +48,9 @@ pub struct RecorderSettings {
     /// WAV bit depth: 16, 24, or 32 (float).
     #[serde(default = "default_bit_depth")]
     pub bit_depth: u8,
+    /// Folder for saved loops. Empty means `VIBEMIX_CONFIG_DIR/loops`.
+    #[serde(default)]
+    pub save_dir: String,
     /// Apply the automatic JACK/plugin latency offset.
     #[serde(default = "default_true")]
     pub auto_latency: bool,
@@ -75,6 +78,7 @@ impl Default for RecorderSettings {
         Self {
             sources: Vec::new(),
             bit_depth: 24,
+            save_dir: String::new(),
             auto_latency: true,
             transient: true,
             nudge_samples: 0,
@@ -139,6 +143,9 @@ pub struct RecorderStatus {
     pub peak: f32,
     #[serde(default)]
     pub loop_beats: f32,
+    /// Default loop folder, sent so the GUI can pre-select it.
+    #[serde(default)]
+    pub loops_dir: String,
     #[serde(default)]
     pub message: String,
 }
@@ -151,6 +158,7 @@ impl Default for RecorderStatus {
             frames: 0,
             peak: 0.0,
             loop_beats: 0.0,
+            loops_dir: String::new(),
             message: String::new(),
         }
     }
@@ -201,6 +209,16 @@ pub enum RecorderAction {
         slot: u32,
         name: String,
     },
+    /// Ask the engine for a high-resolution waveform of a slot.
+    Waveform { slot: u32 },
+}
+
+/// High-resolution peak envelope for the loop editor.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoopWaveform {
+    pub slot: u32,
+    #[serde(default)]
+    pub peaks: Vec<f32>,
 }
 
 /// Rotate an interleaved stereo buffer left by `nudge` samples.

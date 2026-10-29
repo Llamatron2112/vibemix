@@ -548,8 +548,11 @@ through a separate launcher window.
   Buffers are retired through a garbage queue, so no allocation or free happens
   on the audio thread.
 - WAV files are written by the control thread at 16-bit, 24-bit or 32-bit
-  float. The session stores loop metadata and paths; the files live in
-  `VIBEMIX_CONFIG_DIR/loops/` by default.
+  float, into the folder chosen in the GUI (default
+  `VIBEMIX_CONFIG_DIR/loops/`) with a timestamped name. The session stores loop
+  metadata and paths.
+- The editor requests an 8192-bucket envelope on demand so start/end zoom stays
+  detailed; the launcher cards keep the smaller 512-bucket envelope.
 
 
 
