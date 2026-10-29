@@ -79,6 +79,8 @@ struct PendingWaveform {
     end: u64,
     nudge: Option<i64>,
     seq: u64,
+    buckets: u32,
+    base: bool,
 }
 
 const LOOP_PEAK_BUCKETS: usize = 512;
@@ -3637,7 +3639,9 @@ impl Controller {
         if frames == 0 || runtime.raw.len() < frames * 2 {
             return;
         }
-        let (start, end) = {
+        let (start, end) = if request.base {
+            (0usize, frames)
+        } else {
             let start = (request.start as usize).min(frames - 1);
             let end = (request.end as usize).min(frames);
             if end <= start {
@@ -3646,15 +3650,24 @@ impl Controller {
                 (start, end)
             }
         };
-        let nudge = request
-            .nudge
-            .unwrap_or(runtime.slot.nudge_samples)
-            .rem_euclid(frames as i64) as usize;
+        let nudge = if request.base {
+            0
+        } else {
+            request
+                .nudge
+                .unwrap_or(runtime.slot.nudge_samples)
+                .rem_euclid(frames as i64) as usize
+        };
         let span = end - start;
-        let mut peaks = vec![0.0f32; LOOP_WAVEFORM_BUCKETS];
+        let buckets = if request.buckets == 0 {
+            LOOP_WAVEFORM_BUCKETS
+        } else {
+            (request.buckets as usize).clamp(512, 32_768)
+        };
+        let mut peaks = vec![0.0f32; buckets];
         for (bucket, peak) in peaks.iter_mut().enumerate() {
-            let from = start + span * bucket / LOOP_WAVEFORM_BUCKETS;
-            let to = (start + span * (bucket + 1) / LOOP_WAVEFORM_BUCKETS)
+            let from = start + span * bucket / buckets;
+            let to = (start + span * (bucket + 1) / buckets)
                 .max(from + 1)
                 .min(end);
             for frame in from..to {
@@ -3673,6 +3686,7 @@ impl Controller {
             seq: request.seq,
             peaks,
             transients: runtime.transients.clone(),
+            base: request.base,
         };
         if let Ok(json) = serde_json::to_string(&json) {
             self.send_message(&ControlMessage::LoopWaveform { json }, address);
@@ -3926,6 +3940,8 @@ impl Controller {
                 end,
                 nudge,
                 seq,
+                buckets,
+                base,
             } => {
                 self.pending_waveform = Some(PendingWaveform {
                     slot,
@@ -3933,6 +3949,8 @@ impl Controller {
                     end,
                     nudge,
                     seq,
+                    buckets,
+                    base,
                 });
             }
             RecorderAction::SnapTransient { slot, frame } => {

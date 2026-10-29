@@ -224,6 +224,12 @@ pub enum RecorderAction {
         nudge: Option<i64>,
         #[serde(default)]
         seq: u64,
+        /// Number of peak buckets to return (0 = engine default).
+        #[serde(default)]
+        buckets: u32,
+        /// Return a raw, unrotated whole-loop envelope for the editor fallback.
+        #[serde(default)]
+        base: bool,
     },
     /// Make a transient the loop start. `frame` is in raw (unrotated) frames.
     SnapTransient { slot: u32, frame: u64 },
@@ -249,6 +255,8 @@ pub struct LoopWaveform {
     /// Raw (unrotated) detected onsets; the GUI maps them with `nudge`.
     #[serde(default)]
     pub transients: Vec<Transient>,
+    #[serde(default)]
+    pub base: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

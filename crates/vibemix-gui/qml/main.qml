@@ -5669,6 +5669,7 @@ ApplicationWindow {
         id: loopEditor
         property int slotId: -1
         property var editorPeaks: []
+        property var basePeaks: []
         property var waveTransients: []
         property real viewStart: 0
         property real viewEnd: 0
@@ -5680,6 +5681,7 @@ ApplicationWindow {
         property bool navigating: false
         property bool applying: false
         property int waveSeq: 0
+        property int acceptedSeq: 0
 
         function currentSlot() { return root.loopById(slotId) }
         function currentManual() {
@@ -5718,16 +5720,34 @@ ApplicationWindow {
                 waveStart = view.start
                 waveEnd = view.end
             }
+            var full = view.start === 0 && view.end === slot.frames
             root.sendRecorderAction({
                 action: "waveform",
                 slot: slot.id,
                 start: view.start,
                 end: view.end,
                 nudge: (nudge === undefined || nudge === null) ? null : nudge,
-                seq: waveSeq
+                seq: waveSeq,
+                buckets: full ? 16384 : 8192,
+                base: false
             })
             editorWave.requestPaint()
             ruler.requestPaint()
+        }
+        function requestBase() {
+            var slot = currentSlot()
+            if (!slot || !slot.frames) return
+            waveSeq += 1
+            root.sendRecorderAction({
+                action: "waveform",
+                slot: slot.id,
+                start: 0,
+                end: slot.frames,
+                nudge: null,
+                seq: waveSeq,
+                buckets: 16384,
+                base: true
+            })
         }
         function fitView() {
             var slot = currentSlot()
@@ -5760,6 +5780,13 @@ ApplicationWindow {
             var frames = Math.max(1, slot.frames)
             return ((raw - displayTotal()) % frames + frames) % frames
         }
+        function peakMax(peaks, from, to) {
+            var value = 0
+            for (var i = Math.max(0, from); i < to && i < peaks.length; i++) {
+                value = Math.max(value, peaks[i])
+            }
+            return value
+        }
         function firstTransientFrame() {
             if (waveTransients.length === 0) return -1
             var best = waveTransients[0].frame
@@ -5789,6 +5816,7 @@ ApplicationWindow {
         function openFor(id) {
             slotId = id
             editorPeaks = []
+            basePeaks = []
             waveTransients = []
             viewStart = 0
             viewEnd = 0
@@ -5800,6 +5828,8 @@ ApplicationWindow {
             navigating = false
             applying = false
             waveSeq = 0
+            acceptedSeq = 0
+            requestBase()
             requestWaveform(null, true)
             visible = true
         }
@@ -5810,8 +5840,19 @@ ApplicationWindow {
                 try {
                     var wave = JSON.parse(backend.waveform)
                     if (wave.slot !== loopEditor.slotId) return
-                    if (wave.seq !== loopEditor.waveSeq) return
-                    loopEditor.editorPeaks = wave.peaks || []
+                    var slot = loopEditor.currentSlot()
+                    var frames = slot ? Math.max(1, slot.frames) : 1
+                    var peaks = wave.peaks || []
+                    if (wave.base) {
+                        loopEditor.basePeaks = peaks
+                        editorWave.requestPaint()
+                        return
+                    }
+                    if (wave.seq < loopEditor.acceptedSeq) return
+                    if (Math.abs(wave.start - loopEditor.viewStart) > 0.5
+                        || Math.abs(wave.end - loopEditor.viewEnd) > 0.5) return
+                    loopEditor.acceptedSeq = wave.seq
+                    loopEditor.editorPeaks = peaks
                     loopEditor.waveTransients = wave.transients || []
                     loopEditor.waveStart = wave.start
                     loopEditor.waveEnd = wave.end
@@ -5920,7 +5961,9 @@ ApplicationWindow {
                         }
                         var span = Math.max(1, viewEnd - viewStart)
                         var full = loopEditor.editorPeaks.length === 0
-                        var peaks = full ? (slot.peaks || []) : loopEditor.editorPeaks
+                        var peaks = full
+                            ? (loopEditor.basePeaks.length > 0 ? loopEditor.basePeaks : (slot.peaks || []))
+                            : loopEditor.editorPeaks
                         if (!peaks || peaks.length === 0) return
 
                         ctx.strokeStyle = root.borderColor
@@ -5935,17 +5978,31 @@ ApplicationWindow {
                         ctx.strokeStyle = root.mutedText
                         ctx.beginPath()
                         for (var x = 0; x < width; x++) {
-                            var frame = viewStart + (x / Math.max(1, width - 1)) * span
-                            var index
+                            var a = 0
                             if (full) {
-                                var frac = frame / frames
-                                index = Math.floor(((phase + frac) % 1) * peaks.length) % peaks.length
+                                var f0 = viewStart + (x / Math.max(1, width)) * span
+                                var f1 = viewStart + ((x + 1) / Math.max(1, width)) * span
+                                var p0 = (((f0 / frames) + phase) % 1 + 1) % 1
+                                var p1 = (((f1 / frames) + phase) % 1 + 1) % 1
+                                var i0 = Math.floor(p0 * peaks.length)
+                                var i1 = Math.floor(p1 * peaks.length)
+                                if (i1 <= i0) i1 = i0 + 1
+                                if (p1 >= p0) {
+                                    a = loopEditor.peakMax(peaks, i0, Math.min(peaks.length, i1))
+                                } else {
+                                    a = Math.max(
+                                        loopEditor.peakMax(peaks, i0, peaks.length),
+                                        loopEditor.peakMax(peaks, 0, Math.min(peaks.length, i1))
+                                    )
+                                }
                             } else {
-                                index = Math.floor((x / Math.max(1, width - 1)) * (peaks.length - 1))
+                                var j0 = Math.floor((x / Math.max(1, width)) * peaks.length)
+                                var j1 = Math.max(j0 + 1, Math.floor(((x + 1) / Math.max(1, width)) * peaks.length))
+                                a = loopEditor.peakMax(peaks, j0, Math.min(peaks.length, j1))
                             }
-                            var a = peaks[index] * height * 0.45
-                            ctx.moveTo(x, height * 0.5 - a)
-                            ctx.lineTo(x, height * 0.5 + a)
+                            var amp = a * height * 0.45
+                            ctx.moveTo(x, height * 0.5 - amp)
+                            ctx.lineTo(x, height * 0.5 + amp)
                         }
                         ctx.stroke()
 
