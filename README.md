@@ -35,7 +35,10 @@ small OSC control protocol.
   16/24-bit or 32-bit float export. The editor is a free pan/zoom waveform:
   drag horizontally to pan and vertically to zoom, Alt-drag to nudge (Shift =
   one sample/pixel), and Ctrl+click a transient marker to make it the loop
-  start. A musical ruler and a "zero seam" snap help with alignment and clicks.
+  start. Spectral-flux onset detection and a high-frequency energy strip expose
+  transients even on compressed/saturated material; when zoomed in far enough
+  the editor draws the actual samples. A musical ruler and a "zero seam" snap
+  help with alignment and clicks.
 
 ## Using the UI
 
@@ -64,7 +67,8 @@ small OSC control protocol.
   end. Drag horizontally to pan and vertically to zoom, Alt-drag to nudge
   (Shift = one sample per pixel), or type an exact manual value. Transient
   markers can be clicked with Ctrl to make that hit the loop start; "snap
-  first" and "zero seam" are shortcuts. The zoomed window is refreshed while
+  first" and "zero seam" are shortcuts. The HF strip shows high-frequency
+  energy; close zoom switches to raw samples. The window is refreshed while
   nudging and panning. A MIDI clock is required to record.
 - **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
   matrix; pick the device on each axis. Tick a cell to connect. Only

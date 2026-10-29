@@ -19,8 +19,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   drag horizontally to pan and vertically to zoom, Alt-drag to nudge (Shift =
   one sample per pixel), or type an exact value. Multiple transient markers are
   shown; Ctrl+click one to make it the loop start, or use "snap first"/"zero
-  seam". The visible window is re-requested at the preview nudge while
-  dragging, so it stays sharp. Loops are stored in the session and
+  seam". Onsets now come from spectral flux (FFT) rather than amplitude, with a
+  high-frequency energy strip and raw-sample drawing at close zoom. The visible
+  window is re-requested at the preview nudge while dragging, so it stays
+  sharp. Loops are stored in the session and
   under `VIBEMIX_CONFIG_DIR/loops/` by default.
 
 ## [1.0.2] - 2026-10-22

@@ -556,11 +556,18 @@ through a separate launcher window.
   pan/zoom (horizontal drag pans, vertical drag zooms). Alt-drag sends throttled
   window requests with a temporary nudge override (audio is unchanged until
   release), so the zoomed view keeps its resolution while being dragged.
-- The controller caches multiple raw transient onsets per loop. They are sent
-  with each window request; the GUI maps them through the current nudge and
-  draws markers. Ctrl+click on a marker sets the total nudge to that raw frame,
+- The controller caches multiple raw transient onsets per loop, detected with
+  spectral flux (short-time FFT, log-magnitude positive differences weighted
+  toward high bins, local adaptive peak picking). This works on compressed or
+  saturated material where an amplitude envelope is flat. They are sent with
+  each window request; the GUI maps them through the current nudge and draws
+  markers. Ctrl+click on a marker sets the total nudge to that raw frame,
   making it the loop start. A seam snap searches ±5 ms for the lowest
   discontinuity/zero-crossing score and applies the shift.
+- Narrow editor windows (≤ 16384 samples) are returned as signed mono samples
+  so the actual waveform is drawn at close zoom; every response also carries a
+  normalized first-difference (high-pass) energy strip for visually locating
+  high-frequency-rich transients.
 
 
 

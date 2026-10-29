@@ -5670,6 +5670,8 @@ ApplicationWindow {
         property int slotId: -1
         property var editorPeaks: []
         property var basePeaks: []
+        property var waveSamples: []
+        property var waveHf: []
         property var waveTransients: []
         property real viewStart: 0
         property real viewEnd: 0
@@ -5717,6 +5719,8 @@ ApplicationWindow {
             waveSeq += 1
             if (clearPeaks) {
                 editorPeaks = []
+                waveSamples = []
+                waveHf = []
                 waveStart = view.start
                 waveEnd = view.end
             }
@@ -5817,6 +5821,8 @@ ApplicationWindow {
             slotId = id
             editorPeaks = []
             basePeaks = []
+            waveSamples = []
+            waveHf = []
             waveTransients = []
             viewStart = 0
             viewEnd = 0
@@ -5853,6 +5859,8 @@ ApplicationWindow {
                         || Math.abs(wave.end - loopEditor.viewEnd) > 0.5) return
                     loopEditor.acceptedSeq = wave.seq
                     loopEditor.editorPeaks = peaks
+                    loopEditor.waveSamples = wave.samples || []
+                    loopEditor.waveHf = wave.hf || []
                     loopEditor.waveTransients = wave.transients || []
                     loopEditor.waveStart = wave.start
                     loopEditor.waveEnd = wave.end
@@ -5960,11 +5968,12 @@ ApplicationWindow {
                             viewEnd = frames
                         }
                         var span = Math.max(1, viewEnd - viewStart)
-                        var full = loopEditor.editorPeaks.length === 0
+                        var samples = loopEditor.waveSamples
+                        var full = samples.length === 0 && loopEditor.editorPeaks.length === 0
                         var peaks = full
                             ? (loopEditor.basePeaks.length > 0 ? loopEditor.basePeaks : (slot.peaks || []))
                             : loopEditor.editorPeaks
-                        if (!peaks || peaks.length === 0) return
+                        if (samples.length === 0 && (!peaks || peaks.length === 0)) return
 
                         ctx.strokeStyle = root.borderColor
                         ctx.beginPath()
@@ -5975,36 +5984,79 @@ ApplicationWindow {
                         var total = loopEditor.displayTotal()
                         var phase = ((total % frames) + frames) % frames / frames
 
-                        ctx.strokeStyle = root.mutedText
-                        ctx.beginPath()
-                        for (var x = 0; x < width; x++) {
-                            var a = 0
-                            if (full) {
-                                var f0 = viewStart + (x / Math.max(1, width)) * span
-                                var f1 = viewStart + ((x + 1) / Math.max(1, width)) * span
-                                var p0 = (((f0 / frames) + phase) % 1 + 1) % 1
-                                var p1 = (((f1 / frames) + phase) % 1 + 1) % 1
-                                var i0 = Math.floor(p0 * peaks.length)
-                                var i1 = Math.floor(p1 * peaks.length)
-                                if (i1 <= i0) i1 = i0 + 1
-                                if (p1 >= p0) {
-                                    a = loopEditor.peakMax(peaks, i0, Math.min(peaks.length, i1))
-                                } else {
-                                    a = Math.max(
-                                        loopEditor.peakMax(peaks, i0, peaks.length),
-                                        loopEditor.peakMax(peaks, 0, Math.min(peaks.length, i1))
-                                    )
-                                }
-                            } else {
-                                var j0 = Math.floor((x / Math.max(1, width)) * peaks.length)
-                                var j1 = Math.max(j0 + 1, Math.floor(((x + 1) / Math.max(1, width)) * peaks.length))
-                                a = loopEditor.peakMax(peaks, j0, Math.min(peaks.length, j1))
+                        if (samples.length > 1) {
+                            ctx.strokeStyle = root.mutedText
+                            ctx.beginPath()
+                            for (var n = 0; n < samples.length; n++) {
+                                var sx = n / Math.max(1, samples.length - 1) * width
+                                var sample = Math.max(-1.5, Math.min(1.5, samples[n]))
+                                var sy = height * 0.5 - sample * height * 0.45
+                                if (n === 0) ctx.moveTo(sx, sy)
+                                else ctx.lineTo(sx, sy)
                             }
-                            var amp = a * height * 0.45
-                            ctx.moveTo(x, height * 0.5 - amp)
-                            ctx.lineTo(x, height * 0.5 + amp)
+                            ctx.stroke()
+                        } else {
+                            ctx.strokeStyle = root.mutedText
+                            ctx.beginPath()
+                            for (var x = 0; x < width; x++) {
+                                var a = 0
+                                if (full) {
+                                    var f0 = viewStart + (x / Math.max(1, width)) * span
+                                    var f1 = viewStart + ((x + 1) / Math.max(1, width)) * span
+                                    var p0 = (((f0 / frames) + phase) % 1 + 1) % 1
+                                    var p1 = (((f1 / frames) + phase) % 1 + 1) % 1
+                                    var i0 = Math.floor(p0 * peaks.length)
+                                    var i1 = Math.floor(p1 * peaks.length)
+                                    if (i1 <= i0) i1 = i0 + 1
+                                    if (p1 >= p0) {
+                                        a = loopEditor.peakMax(peaks, i0, Math.min(peaks.length, i1))
+                                    } else {
+                                        a = Math.max(
+                                            loopEditor.peakMax(peaks, i0, peaks.length),
+                                            loopEditor.peakMax(peaks, 0, Math.min(peaks.length, i1))
+                                        )
+                                    }
+                                } else {
+                                    var j0 = Math.floor((x / Math.max(1, width)) * peaks.length)
+                                    var j1 = Math.max(j0 + 1, Math.floor(((x + 1) / Math.max(1, width)) * peaks.length))
+                                    a = loopEditor.peakMax(peaks, j0, Math.min(peaks.length, j1))
+                                }
+                                var amp = a * height * 0.45
+                                ctx.moveTo(x, height * 0.5 - amp)
+                                ctx.lineTo(x, height * 0.5 + amp)
+                            }
+                            ctx.stroke()
                         }
-                        ctx.stroke()
+
+                        // High-pass energy strip: shows where the high-frequency
+                        // content is even when the amplitude waveform is saturated.
+                        var hf = loopEditor.waveHf
+                        if (hf.length > 1) {
+                            var hfHeight = 30
+                            ctx.fillStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.20)
+                            ctx.beginPath()
+                            ctx.moveTo(0, 0)
+                            for (var h = 0; h < hf.length; h++) {
+                                var hx = h / Math.max(1, hf.length - 1) * width
+                                var hy = hfHeight - Math.max(0, Math.min(1, hf[h])) * hfHeight
+                                ctx.lineTo(hx, hy)
+                            }
+                            ctx.lineTo(width, 0)
+                            ctx.closePath()
+                            ctx.fill()
+                            ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.65)
+                            ctx.beginPath()
+                            for (var h2 = 0; h2 < hf.length; h2++) {
+                                var hx2 = h2 / Math.max(1, hf.length - 1) * width
+                                var hy2 = hfHeight - Math.max(0, Math.min(1, hf[h2])) * hfHeight
+                                if (h2 === 0) ctx.moveTo(hx2, hy2)
+                                else ctx.lineTo(hx2, hy2)
+                            }
+                            ctx.stroke()
+                            ctx.fillStyle = root.mutedText
+                            ctx.font = "9px monospace"
+                            ctx.fillText("HF", 3, hfHeight - 3)
+                        }
 
                         // Beat grid, clipped to the visible window.
                         var beats = Math.max(1, slot.loop_beats || 1)

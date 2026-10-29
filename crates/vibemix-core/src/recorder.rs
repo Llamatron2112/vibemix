@@ -6,6 +6,7 @@
 //! plain data types.
 
 use serde::{Deserialize, Serialize};
+use realfft::RealFftPlanner;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -252,6 +253,13 @@ pub struct LoopWaveform {
     pub seq: u64,
     #[serde(default)]
     pub peaks: Vec<f32>,
+    /// Signed mono samples for a narrow window, so the editor can draw the
+    /// actual waveform (and its high-frequency detail) when zoomed in.
+    #[serde(default)]
+    pub samples: Vec<f32>,
+    /// High-pass (first-difference) energy envelope for the window.
+    #[serde(default)]
+    pub hf: Vec<f32>,
     /// Raw (unrotated) detected onsets; the GUI maps them with `nudge`.
     #[serde(default)]
     pub transients: Vec<Transient>,
@@ -360,106 +368,139 @@ pub fn detect_transient(
     Some(onset as i64)
 }
 
-/// Detect multiple onsets in a loop, returned in raw frame coordinates.
+/// Detect onsets with spectral flux, returned in raw frame coordinates.
 ///
-/// Uses a short-time amplitude envelope and its positive difference, then picks
-/// local maxima with an adaptive threshold and a 20 ms minimum spacing. This
-/// catches kick attacks and other percussive hits without pulling in a full
-/// spectral analyser.
+/// Amplitude-only detection fails on compressed or saturated material where
+/// the envelope is nearly flat. This uses a short-time FFT and sums positive
+/// log-magnitude changes, weighted towards the higher bins, then picks local
+/// maxima against a local adaptive threshold. The result is not capped at a
+/// small marker count, so the whole loop is scanned.
 pub fn detect_transients(src: &[f32], frames: usize, sample_rate: u32) -> Vec<Transient> {
-    if frames == 0 || sample_rate == 0 {
+    if frames < 256 || sample_rate == 0 {
         return Vec::new();
     }
-    let hop = (sample_rate as usize / 1000).max(16);
-    let window = hop * 2;
-    if frames < window * 2 {
+    let fft_size = if frames >= 2048 {
+        1024
+    } else {
+        (frames / 2).next_power_of_two().clamp(128, 1024)
+    };
+    let hop = (fft_size / 8).max(32);
+    if frames < fft_size + hop {
         return Vec::new();
     }
+    let mono: Vec<f32> = (0..frames)
+        .map(|i| (src[i * 2] + src[i * 2 + 1]) * 0.5)
+        .collect();
+    let hann: Vec<f32> = (0..fft_size)
+        .map(|i| {
+            let phase = std::f32::consts::TAU * i as f32 / (fft_size - 1) as f32;
+            0.5 - 0.5 * phase.cos()
+        })
+        .collect();
 
-    let mut positions = Vec::new();
-    let mut envelope = Vec::new();
+    let mut planner = RealFftPlanner::<f32>::new();
+    let r2c = planner.plan_fft_forward(fft_size);
+    let mut input = r2c.make_input_vec();
+    let mut spectrum = r2c.make_output_vec();
+    let mut previous = vec![0.0f32; spectrum.len()];
+    let mut flux = Vec::new();
+    let mut starts = Vec::new();
     let mut pos = 0;
-    while pos + window <= frames {
-        let mut sum = 0.0f32;
-        for i in pos..pos + window {
-            let mono = (src[i * 2] + src[i * 2 + 1]) * 0.5;
-            sum += mono * mono;
+    while pos + fft_size <= frames {
+        for i in 0..fft_size {
+            input[i] = mono[pos + i] * hann[i];
         }
-        envelope.push((sum / window as f32).sqrt());
-        positions.push(pos);
+        if r2c.process(&mut input, &mut spectrum).is_err() {
+            break;
+        }
+        let mut value = 0.0f32;
+        for (bin, coefficient) in spectrum.iter().enumerate() {
+            let magnitude = coefficient.norm();
+            let log_magnitude = (1.0 + magnitude * 100.0).ln();
+            let difference = (log_magnitude - previous[bin]).max(0.0);
+            let weight = 1.0 + 2.0 * bin as f32 / spectrum.len() as f32;
+            value += difference * weight;
+            previous[bin] = log_magnitude;
+        }
+        flux.push(value);
+        starts.push(pos);
         pos += hop;
     }
-    if envelope.len() < 2 {
+    if flux.len() < 3 {
         return Vec::new();
     }
 
-    let onset: Vec<f32> = envelope
-        .windows(2)
-        .map(|pair| (pair[1] - pair[0]).max(0.0))
-        .collect();
-    let peak = onset.iter().copied().fold(0.0f32, f32::max);
+    let peak = flux.iter().copied().fold(0.0f32, f32::max);
     if peak <= 1.0e-6 {
         return Vec::new();
     }
-    let threshold = peak * 0.08;
-    let min_gap = (sample_rate as usize * 20 / 1000).max(hop);
+    let normalized: Vec<f32> = flux.iter().map(|value| value / peak).collect();
+
+    // Local mean/std over roughly one second, using prefix sums.
+    let local = ((sample_rate as f32 * 0.5 / hop as f32) as usize).max(4);
+    let mut prefix = Vec::with_capacity(normalized.len() + 1);
+    let mut prefix_sq = Vec::with_capacity(normalized.len() + 1);
+    prefix.push(0.0f64);
+    prefix_sq.push(0.0f64);
+    for value in &normalized {
+        let v = *value as f64;
+        prefix.push(prefix.last().copied().unwrap_or(0.0) + v);
+        prefix_sq.push(prefix_sq.last().copied().unwrap_or(0.0) + v * v);
+    }
+    let threshold_at = |index: usize| -> f32 {
+        let from = index.saturating_sub(local);
+        let to = (index + local + 1).min(normalized.len());
+        let count = (to - from).max(1) as f64;
+        let sum = prefix[to] - prefix[from];
+        let sum_sq = prefix_sq[to] - prefix_sq[from];
+        let mean = sum / count;
+        let variance = (sum_sq / count - mean * mean).max(0.0);
+        (mean + 1.5 * variance.sqrt()) as f32
+    };
+
+    let min_gap = (sample_rate as usize * 30 / 1000).max(hop);
     let mut out = Vec::new();
     let mut last = usize::MAX;
-
-    for i in 0..onset.len() {
-        if onset[i] < threshold {
+    for i in 0..normalized.len() {
+        let value = normalized[i];
+        if value < 0.02 || value < threshold_at(i) {
             continue;
         }
         let from = i.saturating_sub(2);
-        let to = (i + 2).min(onset.len() - 1);
-        if onset[from..=to].iter().any(|value| *value > onset[i]) {
+        let to = (i + 2).min(normalized.len() - 1);
+        if normalized[from..=to].iter().any(|other| *other > value) {
             continue;
         }
-        let frame = positions[i + 1];
-        if last != usize::MAX && frame.saturating_sub(last) < min_gap {
+        let approx = starts[i];
+        if last != usize::MAX && approx.saturating_sub(last) < min_gap {
             continue;
         }
-        // The envelope hop starts before the actual attack; refine to the
-        // first sample above 15 % of the local peak.
-        let scan_start = frame.saturating_sub(hop);
-        let scan_end = (frame + window * 2).min(frames);
+        let search_from = approx.saturating_sub(hop);
+        let search_to = (approx + fft_size).min(frames);
         let mut local_peak = 0.0f32;
-        for i in scan_start..scan_end {
-            let mono = (src[i * 2] + src[i * 2 + 1]) * 0.5;
-            local_peak = local_peak.max(mono.abs());
+        for j in search_from..search_to {
+            let previous = if j > 0 { mono[j - 1] } else { 0.0 };
+            local_peak = local_peak.max((mono[j] - previous).abs());
         }
         let refined = if local_peak > 1.0e-6 {
-            let threshold = local_peak * 0.15;
-            (scan_start..scan_end)
-                .find(|i| {
-                    let mono = (src[i * 2] + src[i * 2 + 1]) * 0.5;
-                    mono.abs() >= threshold
+            let threshold = local_peak * 0.2;
+            (search_from..search_to)
+                .find(|j| {
+                    let previous = if *j > 0 { mono[j - 1] } else { 0.0 };
+                    (mono[*j] - previous).abs() >= threshold
                 })
-                .unwrap_or(frame)
+                .unwrap_or(approx)
         } else {
-            frame
+            approx
         };
         out.push(Transient {
             frame: refined as u64,
-            strength: (onset[i] / peak).clamp(0.0, 1.0),
+            strength: value.clamp(0.0, 1.0),
         });
         last = refined;
-        if out.len() >= 128 {
+        if out.len() >= 4096 {
             break;
         }
-    }
-
-    // A loop that begins with a hit has no rise at frame 0.
-    if envelope[0] > peak * 0.25
-        && out.first().map(|transient| transient.frame > window as u64).unwrap_or(true)
-    {
-        out.insert(
-            0,
-            Transient {
-                frame: 0,
-                strength: 1.0,
-            },
-        );
     }
     out
 }
@@ -563,6 +604,34 @@ mod tests {
         let start = snapped.rem_euclid(frames as i64) as usize;
         let first = (src[start * 2] + src[start * 2 + 1]) * 0.5;
         assert!(first.abs() < 0.35, "first={first}");
+    }
+
+    #[test]
+    fn detects_high_frequency_bursts_on_a_saturated_tone() {
+        let sample_rate = 48_000u32;
+        let frames = sample_rate as usize * 2;
+        let mut src = vec![0.0f32; frames * 2];
+        let onsets = [9_600usize, 28_800, 48_000];
+        for i in 0..frames {
+            let low = (i as f32 * std::f32::consts::TAU * 100.0 / sample_rate as f32).sin() * 0.9;
+            let mut value = low;
+            for onset in onsets {
+                if i >= onset && i < onset + 96 {
+                    value += (i as f32 * std::f32::consts::TAU * 8000.0 / sample_rate as f32).sin() * 0.3;
+                }
+            }
+            value = value.clamp(-0.9, 0.9);
+            src[i * 2] = value;
+            src[i * 2 + 1] = value;
+        }
+        let found = detect_transients(&src, frames, sample_rate);
+        for expected in onsets {
+            assert!(
+                found.iter().any(|t| t.frame.abs_diff(expected as u64) < 512),
+                "missing burst {expected}: {:?}",
+                found.iter().map(|t| t.frame).collect::<Vec<_>>()
+            );
+        }
     }
 
     #[test]

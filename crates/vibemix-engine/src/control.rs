@@ -3659,25 +3659,70 @@ impl Controller {
                 .rem_euclid(frames as i64) as usize
         };
         let span = end - start;
+        const RAW_SAMPLE_LIMIT: usize = 16_384;
+        let samples = if !request.base && span <= RAW_SAMPLE_LIMIT {
+            (start..end)
+                .map(|frame| {
+                    let raw = (nudge + frame) % frames;
+                    (runtime.raw[raw * 2] + runtime.raw[raw * 2 + 1]) * 0.5
+                })
+                .collect::<Vec<f32>>()
+        } else {
+            Vec::new()
+        };
         let buckets = if request.buckets == 0 {
             LOOP_WAVEFORM_BUCKETS
         } else {
             (request.buckets as usize).clamp(512, 32_768)
         };
-        let mut peaks = vec![0.0f32; buckets];
-        for (bucket, peak) in peaks.iter_mut().enumerate() {
-            let from = start + span * bucket / buckets;
-            let to = (start + span * (bucket + 1) / buckets)
-                .max(from + 1)
-                .min(end);
-            for frame in from..to {
-                let raw = (nudge + frame) % frames;
-                let index = raw * 2;
-                *peak = peak
-                    .max(runtime.raw[index].abs())
-                    .max(runtime.raw[index + 1].abs());
+        let peaks = if samples.is_empty() {
+            let mut peaks = vec![0.0f32; buckets];
+            for (bucket, peak) in peaks.iter_mut().enumerate() {
+                let from = start + span * bucket / buckets;
+                let to = (start + span * (bucket + 1) / buckets)
+                    .max(from + 1)
+                    .min(end);
+                for frame in from..to {
+                    let raw = (nudge + frame) % frames;
+                    let index = raw * 2;
+                    *peak = peak
+                        .max(runtime.raw[index].abs())
+                        .max(runtime.raw[index + 1].abs());
+                }
             }
-        }
+            peaks
+        } else {
+            Vec::new()
+        };
+        // High-pass energy (first difference) for the visual HF strip. Long
+        // windows are skipped; zooming in brings it back.
+        const HF_BUCKETS: usize = 2048;
+        let hf = if !request.base && span <= self.engine.sample_rate() as usize * 10 {
+            let mut hf = vec![0.0f32; HF_BUCKETS];
+            for (bucket, value) in hf.iter_mut().enumerate() {
+                let from = start + span * bucket / HF_BUCKETS;
+                let to = (start + span * (bucket + 1) / HF_BUCKETS)
+                    .max(from + 1)
+                    .min(end);
+                for frame in from..to {
+                    let raw = (nudge + frame) % frames;
+                    let previous = (raw + frames - 1) % frames;
+                    let mono = (runtime.raw[raw * 2] + runtime.raw[raw * 2 + 1]) * 0.5;
+                    let previous =
+                        (runtime.raw[previous * 2] + runtime.raw[previous * 2 + 1]) * 0.5;
+                    *value = value.max((mono - previous).abs());
+                }
+            }
+            let peak = hf.iter().copied().fold(0.0f32, f32::max);
+            if peak > 1.0e-6 {
+                for value in &mut hf {
+                    *value /= peak;
+                }
+            }
+            hf
+        } else {
+            Vec::new()
+        };
         let json = LoopWaveform {
             slot: request.slot,
             start: start as u64,
@@ -3685,6 +3730,8 @@ impl Controller {
             nudge: nudge as i64,
             seq: request.seq,
             peaks,
+            samples,
+            hf,
             transients: runtime.transients.clone(),
             base: request.base,
         };
