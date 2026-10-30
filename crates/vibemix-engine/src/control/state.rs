@@ -154,6 +154,8 @@ pub(super) fn build_state_json(
         "transport_ui": model.transport_ui,
         "layout": model.layout,
         "midi_sync": model.midi_sync,
+        "midi_connections": model.midi_connections,
+        "midi_out_connections": model.midi_out_connections,
         "clock": model.clock,
         "recorder": model.recorder,
         "strip_capacity": params.strip_count(),

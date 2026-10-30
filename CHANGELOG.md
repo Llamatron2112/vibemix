@@ -152,8 +152,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   so it is sample-accurate and does not drift, with `START`/`STOP` and a
   reset-to-zero stop.
 - **MIDI routing** (`Options → MIDI routing…`): connect external MIDI outputs
-  to `midi_in` and `midi_out` to external MIDI inputs; the output patch is
-  saved with the session.
+  to `midi_in` and `midi_out` to external MIDI inputs. Both patches are saved
+  with the session and mark it modified, so the unsaved-changes prompt covers
+  them.
 - The top-bar menu can hide the **DSP usage readout** independently of the
   other transport readouts; the choice is saved in the session.
 - **Load the last used session on startup** from the File menu. The preference

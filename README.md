@@ -83,7 +83,8 @@ small OSC control protocol.
   matrix; pick the device on each axis. Tick a cell to connect. Only
   connections involving vibemix ports are editable.
 - **MIDI routing**: `Options → MIDI routing…` connects external MIDI outputs
-  to vibemix's `midi_in` and its `midi_out` to external MIDI inputs.
+  to vibemix's `midi_in` and its `midi_out` to external MIDI inputs. Both
+  patches are saved with the session.
 - **MIDI clock**: `Options → MIDI clock` selects *MIDI in (slave)* or
   *Internal (master)*. As master, the BPM readout opens a tempo dialog and the
   transport button starts/stops the internal 24 PPQN clock, sent to

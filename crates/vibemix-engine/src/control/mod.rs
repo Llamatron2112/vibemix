@@ -1429,13 +1429,27 @@ impl Controller {
             }
             ControlMessage::Connect { source, sink } => {
                 let outcome = self.engine.connect_port(&source, &sink);
+                let changed = outcome.is_ok();
                 self.record_connection(outcome, source, sink);
-                Actions::default()
+                if changed {
+                    self.engine.capture_connections(&mut self.model);
+                }
+                Actions {
+                    snapshot: changed,
+                    catalog: false,
+                }
             }
             ControlMessage::Disconnect { source, sink } => {
                 let outcome = self.engine.disconnect_port(&source, &sink);
+                let changed = outcome.is_ok();
                 self.record_connection(outcome, source, sink);
-                Actions::default()
+                if changed {
+                    self.engine.capture_connections(&mut self.model);
+                }
+                Actions {
+                    snapshot: changed,
+                    catalog: false,
+                }
             }
             ControlMessage::Catalog { .. }
             | ControlMessage::State { .. }

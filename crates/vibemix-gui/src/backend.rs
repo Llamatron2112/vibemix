@@ -780,6 +780,8 @@ fn split_state(value: &serde_json::Value) -> (String, String) {
         "buses": buses_structure,
         "beats_per_bar": value.get("beats_per_bar").cloned().unwrap_or(serde_json::json!(4.0)),
         "midi_bindings": value.get("midi_bindings").cloned().unwrap_or(serde_json::json!([])),
+        "midi_connections": value.get("midi_connections").cloned().unwrap_or(serde_json::Value::Null),
+        "midi_out_connections": value.get("midi_out_connections").cloned().unwrap_or(serde_json::Value::Null),
         "transport_ui": value.get("transport_ui").cloned().unwrap_or(serde_json::json!({})),
         "clock": value.get("clock").cloned().unwrap_or(serde_json::json!({})),
         "recorder": value.get("recorder").cloned().unwrap_or(serde_json::json!({})),
@@ -2089,6 +2091,22 @@ mod tests {
         let (strips, buses) = extract_ids(&value);
         assert_eq!(strips, vec![0, 2]);
         assert_eq!(buses, vec![0]);
+    }
+
+    #[test]
+    fn split_state_keeps_midi_connections() {
+        let json =
+            r#"{"strips":[],"buses":[],"midi_connections":["in"],"midi_out_connections":["out"]}"#;
+        let value: serde_json::Value = serde_json::from_str(json).expect("parse");
+        let (structure, _values) = split_state(&value);
+        assert!(
+            structure.contains("\"midi_connections\":[\"in\"]"),
+            "{structure}"
+        );
+        assert!(
+            structure.contains("\"midi_out_connections\":[\"out\"]"),
+            "{structure}"
+        );
     }
 
     #[test]
