@@ -1,5 +1,41 @@
 use std::path::PathBuf;
 
+use serde::{Deserialize, Serialize};
+
+/// Global launch preferences, stored next to the other configuration files.
+///
+/// This is deliberately not part of a session: it controls what happens before
+/// a session is loaded.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct StartupSettings {
+    /// Open the last saved/opened session when the engine starts.
+    #[serde(default)]
+    pub load_last_session: bool,
+    /// Last session path opened or saved by the GUI.
+    #[serde(default)]
+    pub last_session: String,
+}
+
+pub fn startup_settings_path() -> PathBuf {
+    config_dir().join("startup.json")
+}
+
+/// Read the launch preferences, falling back to defaults when the file is
+/// missing or unreadable.
+pub fn load_startup_settings() -> StartupSettings {
+    std::fs::read_to_string(startup_settings_path())
+        .ok()
+        .and_then(|text| serde_json::from_str(&text).ok())
+        .unwrap_or_default()
+}
+
+pub fn save_startup_settings(settings: &StartupSettings) -> std::io::Result<()> {
+    let dir = config_dir();
+    std::fs::create_dir_all(&dir)?;
+    let text = serde_json::to_string_pretty(settings).map_err(std::io::Error::other)?;
+    write_atomic(&startup_settings_path(), text)
+}
+
 /// The vibemix configuration directory, shared by the engine and the GUI.
 ///
 /// `VIBEMIX_CONFIG_DIR` overrides `$XDG_CONFIG_HOME/vibemix`, which falls back
@@ -43,6 +79,21 @@ pub fn write_atomic(path: &std::path::Path, contents: impl AsRef<[u8]>) -> std::
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn startup_settings_roundtrip() {
+        let settings = StartupSettings {
+            load_last_session: true,
+            last_session: "/tmp/mix.toml".to_string(),
+        };
+        let text = serde_json::to_string_pretty(&settings).unwrap();
+        let parsed: StartupSettings = serde_json::from_str(&text).unwrap();
+        assert_eq!(parsed, settings);
+
+        let defaults: StartupSettings = serde_json::from_str("{}").unwrap();
+        assert!(!defaults.load_last_session);
+        assert!(defaults.last_session.is_empty());
+    }
 
     #[test]
     fn write_atomic_replaces_contents_and_leaves_no_temp() {

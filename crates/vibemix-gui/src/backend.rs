@@ -17,6 +17,7 @@ static VIEW: OnceLock<Mutex<View>> = OnceLock::new();
 static PENDING_REPORT: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_SESSION: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
 static SESSION_PATH: Mutex<String> = Mutex::new(String::new());
+static STARTUP_WRITE: Mutex<()> = Mutex::new(());
 static SESSION_DIR: Mutex<String> = Mutex::new(String::new());
 static SAVED_STATE: Mutex<String> = Mutex::new(String::new());
 static RECENT: Mutex<Vec<String>> = Mutex::new(Vec::new());
@@ -174,6 +175,18 @@ fn note_recent(path: &str) {
     save_recent();
 }
 
+/// Read-modify-write the global launch preferences. The engine reads the same
+/// file at startup, and the GUI only writes it when a session is loaded/saved
+/// or the startup toggle changes.
+fn update_startup_settings(update: impl FnOnce(&mut vibemix_core::config::StartupSettings)) {
+    let _guard = STARTUP_WRITE.lock();
+    let mut settings = vibemix_core::config::load_startup_settings();
+    update(&mut settings);
+    if let Err(error) = vibemix_core::config::save_startup_settings(&settings) {
+        tracing::warn!(%error, "failed to save startup settings");
+    }
+}
+
 pub fn init(engine_socket: PathBuf) -> Result<(), String> {
     // Our own socket lives next to the engine's, in the same private directory.
     let directory = engine_socket
@@ -299,6 +312,9 @@ fn receive_loop(socket: UnixDatagram) {
                                 *current = path.clone();
                             }
                             note_recent(&path);
+                            update_startup_settings(|settings| {
+                                settings.last_session = path.clone();
+                            });
                         }
                     } else {
                         DIRTY.store(true, Ordering::SeqCst);
@@ -803,6 +819,7 @@ pub mod qobject {
         #[qproperty(QString, ports)]
         #[qproperty(QString, connection_error)]
         #[qproperty(bool, dirty)]
+        #[qproperty(bool, load_last_session)]
         #[qproperty(QString, session_result)]
         #[qproperty(QString, session_path)]
         #[qproperty(QString, session_dir)]
@@ -1095,6 +1112,10 @@ pub mod qobject {
         fn set_midi_sync(&self, on: bool);
 
         #[qinvokable]
+        #[cxx_name = "setLoadLastSessionOnStartup"]
+        fn set_load_last_session_on_startup(self: Pin<&mut Self>, on: bool);
+
+        #[qinvokable]
         #[cxx_name = "setStripMidiChannel"]
         fn set_strip_midi_channel(&self, strip: i32, channel: i32);
 
@@ -1166,6 +1187,7 @@ pub struct BackendRust {
     ports: QString,
     connection_error: QString,
     dirty: bool,
+    load_last_session: bool,
     session_result: QString,
     session_path: QString,
     session_dir: QString,
@@ -1204,6 +1226,8 @@ impl Default for BackendRust {
             ports: QString::from("[]"),
             connection_error: QString::from(""),
             dirty: false,
+            load_last_session: vibemix_core::config::load_startup_settings()
+                .load_last_session,
             session_result: QString::from(""),
             session_path: QString::from(""),
             session_dir: QString::from(
@@ -1890,6 +1914,12 @@ impl qobject::Backend {
     pub fn set_midi_sync(&self, on: bool) {
         note_action("midi sync");
         send(ControlMessage::SetMidiSync { on });
+    }
+
+    pub fn set_load_last_session_on_startup(mut self: Pin<&mut Self>, on: bool) {
+        note_action("load last session on startup");
+        update_startup_settings(|settings| settings.load_last_session = on);
+        self.as_mut().set_load_last_session(on);
     }
 
     pub fn set_strip_midi_channel(&self, strip: i32, channel: i32) {

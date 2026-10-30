@@ -78,7 +78,10 @@ PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
 - The engine autosaves the session (`autosave.toml`, with the owning pid in
   `autosave.pid`) every 60 s when it changed and removes it on a clean exit. On
   start without `--session`, a leftover autosave whose owner is gone is
-  restored (and kept as `autosave.recovered.toml`). `packaging/vibemix`
+  restored (and kept as `autosave.recovered.toml`), which takes priority over
+  the "Load last session on startup" option. That option reads
+  `startup.json`; the GUI records the last opened/saved path there. An explicit
+  `--session` still wins. `packaging/vibemix`
   supervises the engine and restarts it after a crash; control messages are
   handled under `catch_unwind` so a handler bug cannot end the process.
 - `just gui-load` measures the GUI headless (see `scripts/gui-load.py`). Known

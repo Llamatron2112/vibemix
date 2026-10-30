@@ -1297,6 +1297,13 @@ ApplicationWindow {
             }
             MenuSeparator { }
             MenuItem {
+                text: "Load last session on startup"
+                checkable: true
+                checked: backend.load_last_session
+                onTriggered: backend.setLoadLastSessionOnStartup(checked)
+            }
+            MenuSeparator { }
+            MenuItem {
                 text: "Quit"
                 onTriggered: root.requestQuit()
             }

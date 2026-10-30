@@ -403,6 +403,7 @@ impl Controller {
         vst3: vibemix_vst3::Host,
         clap: vibemix_clap::Host,
         plugins: Vec<PluginEntry>,
+        startup_session: Option<String>,
     ) -> std::io::Result<Self> {
         socket.set_read_timeout(Some(METER_INTERVAL / 2))?;
 
@@ -446,7 +447,7 @@ impl Controller {
             vst3_ui_safe: Arc::new(Mutex::new(HashMap::new())),
             clap_ui_safe: Arc::new(Mutex::new(HashMap::new())),
             missing_report,
-            pending_session: None,
+            pending_session: startup_session.map(|path| (true, path, String::new())),
             pending_ports: None,
             pending_connect_result: None,
             sample_rate,

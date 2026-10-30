@@ -208,7 +208,7 @@ fn main() -> Result<()> {
         }
     };
 
-    let mut model = load_or_default(&args)?;
+    let (mut model, startup_session) = load_or_default(&args)?;
     control::clamp_to_capacity(&mut model, args.strips, args.buses);
 
     let params = Arc::new(SharedParams::new(args.strips, args.buses));
@@ -247,12 +247,21 @@ fn main() -> Result<()> {
     );
 
     let mut controller = control::Controller::new(
-        socket, params, meters, model, engine, host, vst3, clap, plugins,
+        socket,
+        params,
+        meters,
+        model,
+        engine,
+        host,
+        vst3,
+        clap,
+        plugins,
+        startup_session.clone(),
     )
     .context("start the controller")?;
 
     tracing::info!(
-        session = %args.session.as_deref().unwrap_or("default"),
+        session = %startup_session.as_deref().unwrap_or("default"),
         "control ready; press Ctrl-C to quit"
     );
 
@@ -510,16 +519,33 @@ fn run_smoke_ui(uri: &str) -> ! {
     std::process::exit(0);
 }
 
-fn load_or_default(args: &Args) -> Result<MixerModel> {
-    match &args.session {
-        Some(path) => {
-            let text =
-                std::fs::read_to_string(path).with_context(|| format!("read session {path}"))?;
-            let model = toml::from_str(&text).with_context(|| format!("parse session {path}"))?;
-            Ok(model)
-        }
-        None => Ok(recover_autosave().unwrap_or_else(MixerModel::default_minimal)),
+fn load_or_default(args: &Args) -> Result<(MixerModel, Option<String>)> {
+    if let Some(path) = &args.session {
+        let text = std::fs::read_to_string(path).with_context(|| format!("read session {path}"))?;
+        let model = toml::from_str(&text).with_context(|| format!("parse session {path}"))?;
+        return Ok((model, Some(path.clone())));
     }
+    // Crash recovery wins over the "load last session" preference: the
+    // autosave is the work that was actually in progress.
+    if let Some(model) = recover_autosave() {
+        return Ok((model, None));
+    }
+    let startup = vibemix_core::config::load_startup_settings();
+    let path = startup.last_session.trim();
+    if startup.load_last_session && !path.is_empty() {
+        match std::fs::read_to_string(path) {
+            Ok(text) => match toml::from_str::<MixerModel>(&text) {
+                Ok(model) => return Ok((model, Some(path.to_string()))),
+                Err(error) => {
+                    tracing::warn!(%error, path, "failed to parse the last session; starting fresh")
+                }
+            },
+            Err(error) => {
+                tracing::warn!(%error, path, "failed to read the last session; starting fresh")
+            }
+        }
+    }
+    Ok((MixerModel::default_minimal(), None))
 }
 
 /// Restores the autosave left behind by an engine that did not shut down

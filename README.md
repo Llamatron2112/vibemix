@@ -27,7 +27,8 @@ small OSC control protocol.
 - **MIDI and keyboard bindings** for mixer buttons (mute/solo/bypass): learn a
   control change or a key combo, saved with the session.
 - Sessions (TOML) with plugin state, patch info, and window geometry; File menu
-  with Open/Save/Save As/Recent and an unsaved-changes prompt.
+  with Open/Save/Save As/Recent, an option to reload the last used session at
+  launch, and an unsaved-changes prompt.
 - Metering with selectable taps (strip IN/GAIN/OUT; bus IN/SEND/RET/OUT).
 - **Loop recorder** with bar-aligned capture from the MIDI clock, multi-source
   strip/bus taps, automatic latency and transient alignment, circular nudge,

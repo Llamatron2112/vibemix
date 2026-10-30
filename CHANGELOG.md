@@ -146,6 +146,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - The top-bar menu can hide the **DSP usage readout** independently of the
   other transport readouts; the choice is saved in the session.
+- **Load the last used session on startup** from the File menu. The preference
+  is global (kept in `startup.json`), the last opened/saved path is remembered,
+  and crash-recovery autosaves still take priority.
 - **Loop recorder** (`Options → Recorder…`): capture a bar-aligned loop from
   the MIDI clock, summing any strips/buses at selectable taps. Takes get
   automatic JACK/plugin latency compensation, optional transient alignment and
