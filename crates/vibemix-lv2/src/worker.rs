@@ -58,7 +58,11 @@ impl WorkMessage {
         message.len = size;
         if size > 0 && !data.is_null() {
             unsafe {
-                ptr::copy_nonoverlapping(data as *const u8, message.data.as_mut_ptr(), size as usize)
+                ptr::copy_nonoverlapping(
+                    data as *const u8,
+                    message.data.as_mut_ptr(),
+                    size as usize,
+                )
             };
         }
         Some(message)
@@ -137,6 +141,9 @@ impl Worker {
     }
 
     pub fn deliver_responses(&mut self) {
+        if self.interface.is_null() {
+            return;
+        }
         while let Ok(message) = self.responses.pop() {
             if self.interface.is_null() {
                 continue;
@@ -151,6 +158,13 @@ impl Worker {
                     );
                 }
             }
+        }
+        // Per the worker spec, tell the plugin once all of this block's
+        // responses have been delivered.
+        // SAFETY: `interface` is the plugin's worker interface, valid for the
+        // life of the instance this worker is attached to.
+        if let Some(end_run) = unsafe { (*self.interface).end_run } {
+            unsafe { end_run(self.instance) };
         }
     }
 }

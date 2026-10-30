@@ -1,10 +1,12 @@
 mod atom;
+#[cfg(test)]
+mod fuzz_tests;
 pub mod host;
 mod state;
 pub mod ui;
 pub mod ui_ipc;
-pub mod ui_server;
 mod ui_outputs;
+pub mod ui_server;
 pub mod urid;
 mod worker;
 

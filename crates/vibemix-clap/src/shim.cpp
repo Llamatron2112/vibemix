@@ -16,6 +16,7 @@
 #include <time.h>
 
 #include <atomic>
+#include <cmath>
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -131,6 +132,30 @@ static void module_release(const std::string& path) {
 // Hosted instance
 // ---------------------------------------------------------------------------
 
+// Audio-thread work uses only storage reserved in `clap_open`: nothing in
+// `clap_run` / `clap_set_param_rt` / `clap_midi_event` may allocate or block.
+constexpr size_t kEventSlots = 1024;
+constexpr size_t kEventBytes = 192;
+struct EventSlot {
+  alignas(8) uint8_t bytes[kEventBytes];
+};
+static_assert(sizeof(clap_event_param_value_t) <= kEventBytes, "event slot too small");
+static_assert(sizeof(clap_event_midi_t) <= kEventBytes, "event slot too small");
+static_assert(sizeof(clap_event_transport_t) <= kEventBytes, "event slot too small");
+
+struct InEvents {
+  std::vector<const clap_event_header_t*> events;
+};
+
+// Parameter changes the plugin reports through its output event list.
+struct OutParam {
+  clap_id id;
+  double value;
+};
+struct OutEvents {
+  std::vector<OutParam> params;
+};
+
 struct Port {
   bool is_input = false;
   bool is_main = false;
@@ -180,6 +205,17 @@ struct Hosted {
   // Plugin -> host parameter edits captured from output events.
   std::mutex edit_mutex;
   std::vector<ParamEdit> param_edits;
+
+  // Pre-sized audio-thread scratch (see `kEventSlots`).
+  uint32_t max_frames = 8192;
+  std::vector<EventSlot> in_storage;
+  InEvents in_ctx;
+  OutEvents out_ctx;
+  std::vector<clap_audio_buffer_t> in_buffers;
+  std::vector<clap_audio_buffer_t> out_buffers;
+  // Last value sent to the plugin per parameter (NaN = never), so the audio
+  // thread only queues changes.
+  std::vector<float> last_sent;
 
   // Per-block MIDI (audio thread only).
   std::vector<clap_event_midi_t> midi;
@@ -309,10 +345,6 @@ static const void* host_get_extension(const clap_host_t* host, const char* id) {
 // Event lists
 // ---------------------------------------------------------------------------
 
-struct InEvents {
-  std::vector<const clap_event_header_t*> events;
-};
-
 static uint32_t in_events_size(const clap_input_events_t* list) {
   return static_cast<uint32_t>(static_cast<InEvents*>(list->ctx)->events.size());
 }
@@ -321,15 +353,16 @@ static const clap_event_header_t* in_events_get(const clap_input_events_t* list,
   return index < ctx->events.size() ? ctx->events[index] : nullptr;
 }
 
-struct OutEvents {
-  std::vector<std::vector<uint8_t>> events;
-};
-
 static bool out_events_push(const clap_output_events_t* list, const clap_event_header_t* event) {
   auto* ctx = static_cast<OutEvents*>(list->ctx);
   if (!event || event->size == 0) return false;
-  ctx->events.emplace_back(static_cast<const uint8_t*>(static_cast<const void*>(event)),
-                           static_cast<const uint8_t*>(static_cast<const void*>(event)) + event->size);
+  // Only parameter moves are of interest; everything else is accepted and
+  // dropped. Never grows past the capacity reserved at open.
+  if (event->space_id == CLAP_CORE_EVENT_SPACE_ID && event->type == CLAP_EVENT_PARAM_VALUE &&
+      event->size >= sizeof(clap_event_param_value_t) && ctx->params.size() < ctx->params.capacity()) {
+    const auto* ev = reinterpret_cast<const clap_event_param_value_t*>(event);
+    ctx->params.push_back(OutParam{ev->param_id, ev->value});
+  }
   return true;
 }
 
@@ -547,6 +580,31 @@ extern "C" void* clap_open(const char* bundle, const char* plugin_id, double sam
     module_release(bundle);
     return nullptr;
   }
+  // Everything the audio thread touches is allocated here, once.
+  h->max_frames = max;
+  h->in_storage.reserve(kEventSlots);
+  h->in_ctx.events.reserve(kEventSlots);
+  h->out_ctx.params.reserve(kEventSlots);
+  h->midi.reserve(512);
+  h->param_edits.reserve(kEventSlots);
+  h->pending_params.reserve(2 * kEventSlots);
+  h->in_buffers.resize(h->in_ports.size());
+  h->out_buffers.resize(h->out_ports.size());
+  h->last_sent.assign(h->param_ids.size(), std::nanf(""));
+  // Non-main buses get their own buffers (silence in, scratch out) so the
+  // plugin never sees a null channel pointer; the sidechain bus is one of them.
+  for (size_t i = 0; i < h->in_ports.size(); ++i) {
+    if (i == h->main_in_index) continue;
+    Port& port = h->in_ports[i];
+    port.storage.assign(static_cast<size_t>(port.channels) * max, 0.0f);
+    for (uint32_t ch = 0; ch < port.channels; ++ch) port.ptrs[ch] = port.storage.data() + ch * max;
+  }
+  for (size_t i = 0; i < h->out_ports.size(); ++i) {
+    if (i == h->main_out_index) continue;
+    Port& port = h->out_ports[i];
+    port.storage.assign(static_cast<size_t>(port.channels) * max, 0.0f);
+    for (uint32_t ch = 0; ch < port.channels; ++ch) port.ptrs[ch] = port.storage.data() + ch * max;
+  }
   // CLAP requires `start_processing` on the audio thread; defer it to the first
   // `clap_run`.
   h->want_start_processing = true;
@@ -612,19 +670,19 @@ extern "C" void clap_connect_output(void* handle, int channel, float* data) {
 extern "C" void clap_write_sidechain(void* handle, const float* left, const float* right, int frames) {
   Hosted* h = static_cast<Hosted*>(handle);
   if (!h || h->sidechain_port < 0 || frames <= 0) return;
+  if (static_cast<uint32_t>(frames) > h->max_frames) frames = static_cast<int>(h->max_frames);
   Port& port = h->in_ports[h->sidechain_port];
-  if (port.channels == 0) return;
-  if (port.storage.size() < static_cast<size_t>(port.channels) * frames)
-    port.storage.resize(static_cast<size_t>(port.channels) * frames, 0.0f);
+  // Storage and pointers were set up at open (`channels * max_frames`).
+  if (port.channels == 0 || port.storage.size() < static_cast<size_t>(port.channels) * h->max_frames)
+    return;
   for (uint32_t ch = 0; ch < port.channels; ++ch) {
-    float* dst = port.storage.data() + ch * frames;
+    float* dst = port.ptrs[ch];
     const float* src = ch == 0 ? left : (ch == 1 ? right : nullptr);
     if (src) {
       std::memcpy(dst, src, sizeof(float) * frames);
     } else {
       std::memset(dst, 0, sizeof(float) * frames);
     }
-    port.ptrs[ch] = dst;
   }
 }
 
@@ -632,84 +690,87 @@ extern "C" void clap_write_sidechain(void* handle, const float* left, const floa
 // Processing
 // ---------------------------------------------------------------------------
 
-static void apply_output_events(Hosted* h, const OutEvents& out) {
-  std::lock_guard<std::mutex> lock(h->edit_mutex);
-  for (const auto& bytes : out.events) {
-    if (bytes.size() < sizeof(clap_event_header_t)) continue;
-    const auto* header = reinterpret_cast<const clap_event_header_t*>(bytes.data());
-    if (header->type != CLAP_EVENT_PARAM_VALUE) continue;
-    const auto* ev = reinterpret_cast<const clap_event_param_value_t*>(bytes.data());
+static void apply_output_events(Hosted* h, OutEvents& out) {
+  if (out.params.empty()) return;
+  // Never block the audio thread: if the control thread is draining edits,
+  // keep the events queued and apply them next block.
+  std::unique_lock<std::mutex> lock(h->edit_mutex, std::try_to_lock);
+  if (!lock.owns_lock()) return;
+  for (const OutParam& param : out.params) {
     for (uint32_t i = 0; i < h->param_ids.size(); ++i) {
-      if (h->param_ids[i] == ev->param_id) {
-        h->param_edits.push_back(ParamEdit{i, static_cast<float>(ev->value)});
+      if (h->param_ids[i] == param.id) {
+        if (h->param_edits.size() < h->param_edits.capacity())
+          h->param_edits.push_back(ParamEdit{i, static_cast<float>(param.value)});
         break;
       }
     }
   }
+  out.params.clear();
+}
+
+// Copies an event into the next pre-reserved slot and lists it for the plugin.
+static void queue_event(Hosted* h, const void* event, uint32_t size) {
+  if (size > kEventBytes || size < sizeof(clap_event_header_t)) return;
+  if (h->in_storage.size() >= h->in_storage.capacity() ||
+      h->in_ctx.events.size() >= h->in_ctx.events.capacity())
+    return;
+  h->in_storage.emplace_back();
+  EventSlot& slot = h->in_storage.back();
+  std::memcpy(slot.bytes, event, size);
+  h->in_ctx.events.push_back(reinterpret_cast<const clap_event_header_t*>(slot.bytes));
 }
 
 extern "C" void clap_run(void* handle, int frames) {
   Hosted* h = static_cast<Hosted*>(handle);
   if (!h || !h->plugin || !h->plugin->process || frames <= 0) return;
+  if (static_cast<uint32_t>(frames) > h->max_frames) frames = static_cast<int>(h->max_frames);
 
-  std::vector<std::vector<uint8_t>> storage;
-  InEvents in_ctx;
-  OutEvents out_ctx;
+  h->in_storage.clear();
+  h->in_ctx.events.clear();
 
-  // Host parameter changes queued by the control thread.
+  // Host parameter changes queued by the control thread (skipped, and retried
+  // next block, if the lock is contended).
   {
     std::unique_lock<std::mutex> lock(h->pending_mutex, std::try_to_lock);
     if (lock.owns_lock()) {
-      for (const auto& ev : h->pending_params) {
-        auto* bytes = reinterpret_cast<const uint8_t*>(static_cast<const void*>(&ev));
-        storage.emplace_back(bytes, bytes + ev.header.size);
-      }
+      for (const auto& ev : h->pending_params) queue_event(h, &ev, ev.header.size);
       h->pending_params.clear();
     }
   }
   // MIDI events for this block.
-  for (const auto& ev : h->midi) {
-    auto* bytes = reinterpret_cast<const uint8_t*>(static_cast<const void*>(&ev));
-    storage.emplace_back(bytes, bytes + ev.header.size);
-  }
+  for (const auto& ev : h->midi) queue_event(h, &ev, ev.header.size);
   h->midi.clear();
   // Transport.
-  if (h->transport_valid) {
-    auto* bytes = reinterpret_cast<const uint8_t*>(static_cast<const void*>(&h->transport));
-    storage.emplace_back(bytes, bytes + h->transport.header.size);
-  }
+  if (h->transport_valid) queue_event(h, &h->transport, h->transport.header.size);
 
-  in_ctx.events.reserve(storage.size());
-  for (const auto& bytes : storage)
-    in_ctx.events.push_back(reinterpret_cast<const clap_event_header_t*>(bytes.data()));
-  clap_input_events_t in_list{&in_ctx, in_events_size, in_events_get};
-  clap_output_events_t out_list{&out_ctx, out_events_push};
+  clap_input_events_t in_list{&h->in_ctx, in_events_size, in_events_get};
+  clap_output_events_t out_list{&h->out_ctx, out_events_push};
 
-  std::vector<clap_audio_buffer_t> in_buffers(h->in_ports.size());
   for (size_t i = 0; i < h->in_ports.size(); ++i) {
-    in_buffers[i].data32 = h->in_ports[i].ptrs.empty() ? nullptr : h->in_ports[i].ptrs.data();
-    in_buffers[i].data64 = nullptr;
-    in_buffers[i].channel_count = h->in_ports[i].channels;
-    in_buffers[i].latency = 0;
-    in_buffers[i].constant_mask = 0;
+    clap_audio_buffer_t& buffer = h->in_buffers[i];
+    buffer.data32 = h->in_ports[i].ptrs.empty() ? nullptr : h->in_ports[i].ptrs.data();
+    buffer.data64 = nullptr;
+    buffer.channel_count = h->in_ports[i].channels;
+    buffer.latency = 0;
+    buffer.constant_mask = 0;
   }
-  std::vector<clap_audio_buffer_t> out_buffers(h->out_ports.size());
   for (size_t i = 0; i < h->out_ports.size(); ++i) {
-    out_buffers[i].data32 = h->out_ports[i].ptrs.empty() ? nullptr : h->out_ports[i].ptrs.data();
-    out_buffers[i].data64 = nullptr;
-    out_buffers[i].channel_count = h->out_ports[i].channels;
-    out_buffers[i].latency = 0;
-    out_buffers[i].constant_mask = 0;
+    clap_audio_buffer_t& buffer = h->out_buffers[i];
+    buffer.data32 = h->out_ports[i].ptrs.empty() ? nullptr : h->out_ports[i].ptrs.data();
+    buffer.data64 = nullptr;
+    buffer.channel_count = h->out_ports[i].channels;
+    buffer.latency = 0;
+    buffer.constant_mask = 0;
   }
 
   clap_process_t proc{};
   proc.steady_time = -1;
   proc.frames_count = static_cast<uint32_t>(frames);
   proc.transport = h->transport_valid ? &h->transport : nullptr;
-  proc.audio_inputs = in_buffers.data();
-  proc.audio_inputs_count = static_cast<uint32_t>(in_buffers.size());
-  proc.audio_outputs = out_buffers.data();
-  proc.audio_outputs_count = static_cast<uint32_t>(out_buffers.size());
+  proc.audio_inputs = h->in_buffers.data();
+  proc.audio_inputs_count = static_cast<uint32_t>(h->in_buffers.size());
+  proc.audio_outputs = h->out_buffers.data();
+  proc.audio_outputs_count = static_cast<uint32_t>(h->out_buffers.size());
   proc.in_events = &in_list;
   proc.out_events = &out_list;
 
@@ -722,7 +783,7 @@ extern "C" void clap_run(void* handle, int frames) {
   h->plugin->process(h->plugin, &proc);
   tls_audio_thread = false;
 
-  apply_output_events(h, out_ctx);
+  apply_output_events(h, h->out_ctx);
 }
 
 extern "C" void clap_midi_event(void* handle, int32_t sample_offset, int32_t status, int32_t d1, int32_t d2) {
@@ -738,7 +799,7 @@ extern "C" void clap_midi_event(void* handle, int32_t sample_offset, int32_t sta
   ev.data[0] = static_cast<uint8_t>(status);
   ev.data[1] = static_cast<uint8_t>(d1);
   ev.data[2] = static_cast<uint8_t>(d2);
-  h->midi.push_back(ev);
+  if (h->midi.size() < h->midi.capacity()) h->midi.push_back(ev);
 }
 
 extern "C" void clap_set_position(void* handle, double seconds, double beats, double bpm, bool playing,
@@ -809,6 +870,34 @@ extern "C" void clap_set_param(void* handle, int index, float value) {
   ev.value = value;
   std::lock_guard<std::mutex> lock(h->pending_mutex);
   h->pending_params.push_back(ev);
+}
+
+// Audio-thread variant of `clap_set_param`: queues a change only when the value
+// differs from the last one sent, never blocks (a contended attempt is retried
+// next block) and never grows the queue.
+extern "C" void clap_set_param_rt(void* handle, int index, float value) {
+  Hosted* h = static_cast<Hosted*>(handle);
+  if (!h || index < 0 || static_cast<size_t>(index) >= h->param_ids.size() ||
+      static_cast<size_t>(index) >= h->last_sent.size())
+    return;
+  float& last = h->last_sent[static_cast<size_t>(index)];
+  if (last == value) return;
+  std::unique_lock<std::mutex> lock(h->pending_mutex, std::try_to_lock);
+  if (!lock.owns_lock() || h->pending_params.size() >= h->pending_params.capacity()) return;
+  clap_event_param_value_t ev{};
+  ev.header.size = sizeof(ev);
+  ev.header.time = 0;
+  ev.header.space_id = CLAP_CORE_EVENT_SPACE_ID;
+  ev.header.type = CLAP_EVENT_PARAM_VALUE;
+  ev.param_id = h->param_ids[static_cast<size_t>(index)];
+  ev.cookie = nullptr;
+  ev.note_id = -1;
+  ev.port_index = -1;
+  ev.channel = -1;
+  ev.key = -1;
+  ev.value = value;
+  h->pending_params.push_back(ev);
+  last = value;
 }
 
 extern "C" float clap_get_param(void* handle, int index) {

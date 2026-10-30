@@ -74,7 +74,12 @@ impl Host {
         if let Some(&urid) = self.urid_by_uri.get(uri) {
             return urid;
         }
-        let _ = send(self.fd, &UiMessage::UridRequest { uri: uri.to_string() });
+        let _ = send(
+            self.fd,
+            &UiMessage::UridRequest {
+                uri: uri.to_string(),
+            },
+        );
         let deadline = Instant::now() + Duration::from_secs(5);
         loop {
             while let Some(message) = self.frames.pop() {
@@ -145,7 +150,9 @@ extern "C" fn proxy_urid_map(user: *mut c_void, uri: *const c_char) -> u32 {
         return 0;
     }
     let host = unsafe { &mut *(user as *mut Host) };
-    let uri = unsafe { CStr::from_ptr(uri) }.to_string_lossy().into_owned();
+    let uri = unsafe { CStr::from_ptr(uri) }
+        .to_string_lossy()
+        .into_owned();
     host.map_uri(&uri)
 }
 

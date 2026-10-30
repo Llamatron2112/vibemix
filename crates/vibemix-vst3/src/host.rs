@@ -1,5 +1,22 @@
 //! VST3 hosting: discovery and instances, wrapping the C shim around the
 //! Steinberg SDK.
+//!
+//! # Safety model
+//!
+//! Every `unsafe` call here goes through the C++ shim with the opaque `handle`
+//! returned by the shim's `open`. The invariants are:
+//!
+//! - `handle` is non-null and live from `instantiate` until [`PluginInstance`]'s
+//!   `Drop`, which closes it. Channel buffers are `Box<[f32]>` owned by the
+//!   instance; `Drop::drop` runs before its fields are freed, so the shim never
+//!   sees a dangling buffer.
+//! - `InstanceHandle` and `View` copy the raw pointer without borrowing the
+//!   instance. They are only sound while the instance is alive; the engine
+//!   closes editors and drops handles before it retires an instance.
+//! - The shim bounds-checks parameter indices; Rust wrappers clamp frame counts
+//!   to `max_frames`, the size every shim buffer is allocated with.
+//! - `run` and the audio-thread setters must only be called from one thread at
+//!   a time (the engine's audio callback); everything else is control-thread.
 
 use std::ffi::{CStr, CString};
 use std::os::raw::{c_char, c_int, c_void};
@@ -172,7 +189,9 @@ impl Host {
         if ptr.is_null() {
             return Vec::new();
         }
-        let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        let text = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { vst3_string_free(ptr) };
         serde_json::from_str(&text).unwrap_or_default()
     }
@@ -209,8 +228,12 @@ impl Host {
             handle,
             in_channels,
             out_channels,
-            inputs: (0..in_channels).map(|_| vec![0.0f32; max_frames].into()).collect(),
-            outputs: (0..out_channels).map(|_| vec![0.0f32; max_frames].into()).collect(),
+            inputs: (0..in_channels)
+                .map(|_| vec![0.0f32; max_frames].into())
+                .collect(),
+            outputs: (0..out_channels)
+                .map(|_| vec![0.0f32; max_frames].into())
+                .collect(),
             controls: Vec::new(),
             max_frames,
         };
@@ -326,7 +349,10 @@ impl PluginInstance {
     }
 
     pub fn control_name(&self, param: usize) -> &str {
-        self.controls.get(param).map(|c| c.name.as_str()).unwrap_or("")
+        self.controls
+            .get(param)
+            .map(|c| c.name.as_str())
+            .unwrap_or("")
     }
 
     pub fn control_default(&self, param: usize) -> f32 {
@@ -449,13 +475,13 @@ impl PluginInstance {
 
     /// Writes a stereo sidechain signal into the plugin's sidechain input bus.
     pub fn write_sidechain(&self, left: &[f32], right: &[f32], frames: usize) {
+        // The shim copies `frames` samples from both slices into buffers sized
+        // for `max_frames`, so clamp to what is actually readable and writable.
+        let frames = frames.min(left.len()).min(right.len()).min(self.max_frames);
+        // SAFETY: `handle` is live; both slices hold at least `frames` samples
+        // and the shim's destination holds `max_frames` per channel.
         unsafe {
-            vst3_write_sidechain(
-                self.handle,
-                left.as_ptr(),
-                right.as_ptr(),
-                frames as c_int,
-            )
+            vst3_write_sidechain(self.handle, left.as_ptr(), right.as_ptr(), frames as c_int)
         };
     }
 

@@ -121,11 +121,7 @@ impl UridMap {
         extern "C" fn(LV2UridMapHandle, *const c_char) -> LV2Urid,
         extern "C" fn(LV2UridMapHandle, LV2Urid) -> *const c_char,
     ) {
-        (
-            self as *const UridMap as *mut c_void,
-            urid_map,
-            urid_unmap,
-        )
+        (self as *const UridMap as *mut c_void, urid_map, urid_unmap)
     }
 
     fn intern(&self, uri: &str) -> u32 {

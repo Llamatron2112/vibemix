@@ -559,13 +559,13 @@ mod tests {
             parsed.strips[0].plugins_post[0].sidechain[0].strip,
             StripId(0)
         );
-        assert_eq!(parsed.strips[0].plugins_post[0].sidechain[0].gain, Gain(0.6));
+        assert_eq!(
+            parsed.strips[0].plugins_post[0].sidechain[0].gain,
+            Gain(0.6)
+        );
         assert!(!parsed.strips[0].plugins_post[0].sidechain[0].pre_fader);
         assert_eq!(
-            parsed.buses[0]
-                .connections
-                .as_ref()
-                .map(|c| c.ret_l.len()),
+            parsed.buses[0].connections.as_ref().map(|c| c.ret_l.len()),
             Some(1)
         );
         assert_eq!(

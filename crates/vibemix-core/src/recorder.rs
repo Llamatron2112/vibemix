@@ -5,8 +5,8 @@
 //! and writes it to disk. Nothing here runs on the audio thread except the
 //! plain data types.
 
-use serde::{Deserialize, Serialize};
 use realfft::RealFftPlanner;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -233,9 +233,14 @@ pub enum RecorderAction {
         base: bool,
     },
     /// Make a transient the loop start. `frame` is in raw (unrotated) frames.
-    SnapTransient { slot: u32, frame: u64 },
+    SnapTransient {
+        slot: u32,
+        frame: u64,
+    },
     /// Shift the nudge to the nearest low-discontinuity point around the seam.
-    SnapSeam { slot: u32 },
+    SnapSeam {
+        slot: u32,
+    },
 }
 
 /// Peak envelope for the loop editor.
@@ -510,13 +515,7 @@ pub fn detect_transients(src: &[f32], frames: usize, sample_rate: u32) -> Vec<Tr
 /// The loop starts at `nudge` and ends at `nudge + frames - 1`; the score
 /// combines both edge amplitudes and their difference. The search is limited
 /// to `window_ms` so the musical position does not drift.
-pub fn snap_seam(
-    src: &[f32],
-    frames: usize,
-    nudge: i64,
-    sample_rate: u32,
-    window_ms: f32,
-) -> i64 {
+pub fn snap_seam(src: &[f32], frames: usize, nudge: i64, sample_rate: u32, window_ms: f32) -> i64 {
     if frames == 0 || sample_rate == 0 {
         return nudge;
     }
@@ -617,7 +616,8 @@ mod tests {
             let mut value = low;
             for onset in onsets {
                 if i >= onset && i < onset + 96 {
-                    value += (i as f32 * std::f32::consts::TAU * 8000.0 / sample_rate as f32).sin() * 0.3;
+                    value += (i as f32 * std::f32::consts::TAU * 8000.0 / sample_rate as f32).sin()
+                        * 0.3;
                 }
             }
             value = value.clamp(-0.9, 0.9);
@@ -627,7 +627,9 @@ mod tests {
         let found = detect_transients(&src, frames, sample_rate);
         for expected in onsets {
             assert!(
-                found.iter().any(|t| t.frame.abs_diff(expected as u64) < 512),
+                found
+                    .iter()
+                    .any(|t| t.frame.abs_diff(expected as u64) < 512),
                 "missing burst {expected}: {:?}",
                 found.iter().map(|t| t.frame).collect::<Vec<_>>()
             );

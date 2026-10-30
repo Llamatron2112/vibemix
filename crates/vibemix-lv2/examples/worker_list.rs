@@ -9,11 +9,7 @@ fn main() {
 
     for info in host.discover() {
         let has = |features: &[String]| features.iter().any(|uri| uri == WORKER);
-        let channels = format!(
-            "{}/{}",
-            info.audio_inputs.len(),
-            info.audio_outputs.len()
-        );
+        let channels = format!("{}/{}", info.audio_inputs.len(), info.audio_outputs.len());
         if has(&info.required_features) {
             required += 1;
             println!("REQ [{channels}] {}", info.name);

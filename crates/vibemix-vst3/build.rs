@@ -172,7 +172,10 @@ fn main() {
         .expect("run c++ for the test effect");
     assert!(status.success(), "failed to build the test VST3 effect");
 
-    println!("cargo:rustc-env=VIBEMIX_VST3_TEST_BUNDLE={}", bundle.display());
+    println!(
+        "cargo:rustc-env=VIBEMIX_VST3_TEST_BUNDLE={}",
+        bundle.display()
+    );
     println!("cargo:rerun-if-changed=src/shim.cpp");
     println!("cargo:rerun-if-changed=tests/test_effect.cpp");
 }

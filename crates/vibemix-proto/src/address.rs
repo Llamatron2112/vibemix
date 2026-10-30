@@ -78,6 +78,6 @@ pub const CONNECT: &str = "/vibemix/connect";
 pub const DISCONNECT: &str = "/vibemix/disconnect";
 pub const CONNECT_RESULT: &str = "/vibemix/connect/result";
 pub const METERS: &str = "/vibemix/meters";
-/// One part of a message too large for a single UDP datagram (see
+/// One part of a message too large for a single datagram (see
 /// [`crate::message::ChunkAssembler`]).
 pub const CHUNK: &str = "/vibemix/chunk";

@@ -325,6 +325,9 @@ pub struct FrameBuffer {
     buf: Vec<u8>,
 }
 
+/// Largest frame accepted from the peer.
+const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
+
 impl FrameBuffer {
     pub fn new() -> Self {
         Self { buf: Vec::new() }
@@ -351,6 +354,11 @@ impl FrameBuffer {
             return None;
         }
         let len = u32::from_le_bytes(self.buf[0..4].try_into().ok()?) as usize;
+        if len > MAX_FRAME_LEN {
+            // A corrupt length prefix would otherwise buffer without bound.
+            self.buf.clear();
+            return None;
+        }
         if self.buf.len() < 4 + len {
             return None;
         }

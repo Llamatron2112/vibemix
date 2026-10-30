@@ -8,11 +8,11 @@ use lv2_raw::core::LV2Descriptor;
 use lv2_raw::LV2Feature;
 
 use crate::atom::{AtomUrids, MidiEvent, SequenceWriter, TimePosition};
-use crate::urid::UridMap;
-use crate::worker::{Worker, WorkerInterface, WORKER_INTERFACE_URI, WORKER_SCHEDULE_URI};
 use crate::state::{StateEntry, StateInterface, StateProxy, STATE_INTERFACE_URI};
 use crate::ui::{self, UiCandidate, UiWindow};
 use crate::ui_outputs::{SharedOutputs, SharedUiInputs};
+use crate::urid::UridMap;
+use crate::worker::{Worker, WorkerInterface, WORKER_INTERFACE_URI, WORKER_SCHEDULE_URI};
 
 use std::sync::Arc;
 
@@ -176,10 +176,7 @@ impl Host {
         port.value(&predicate).iter().find_map(|node| {
             node.as_float()
                 .or_else(|| node.as_int().map(|value| value as f32))
-                .or_else(|| {
-                    node.as_bool()
-                        .map(|value| if value { 1.0 } else { 0.0 })
-                })
+                .or_else(|| node.as_bool().map(|value| if value { 1.0 } else { 0.0 }))
         })
     }
 
@@ -439,7 +436,12 @@ impl Host {
                 required_features: feature_uris(&plugin.required_features()),
                 optional_features: feature_uris(&plugin.optional_features()),
                 hostable: classified.hostable,
-                class_label: plugin.class().label().as_str().unwrap_or_default().to_string(),
+                class_label: plugin
+                    .class()
+                    .label()
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string(),
                 author: plugin
                     .author_name()
                     .and_then(|node| node.as_str().map(str::to_string))
@@ -646,7 +648,8 @@ impl Host {
                 .clamp(ATOM_BUFFER_BYTES, ATOM_BUFFER_MAX)
                 .next_multiple_of(8)
         };
-        let atom_input_bytes: Vec<usize> = atom_inputs.iter().map(|&i| atom_port_bytes(i)).collect();
+        let atom_input_bytes: Vec<usize> =
+            atom_inputs.iter().map(|&i| atom_port_bytes(i)).collect();
         let atom_output_bytes: Vec<usize> =
             atom_outputs.iter().map(|&i| atom_port_bytes(i)).collect();
         let max_atom_bytes = atom_input_bytes
@@ -671,7 +674,11 @@ impl Host {
             .required_features()
             .iter()
             .any(|node| node.as_uri() == Some(WORKER_SCHEDULE_URI));
-        let mut worker = if needs_worker { Some(Worker::new()) } else { None };
+        let mut worker = if needs_worker {
+            Some(Worker::new())
+        } else {
+            None
+        };
         let worker_feature = worker.as_ref().map(|worker| LV2Feature {
             uri: WORKER_SCHEDULE_C.as_ptr() as *const c_char,
             data: worker.schedule_feature_data(),
@@ -684,9 +691,9 @@ impl Host {
 
         let mut keep_worker = false;
         if let Some(worker_ref) = worker.as_mut() {
-            if let Some(interface) =
-                unsafe { instance_extension_data::<WorkerInterface>(&instance, WORKER_INTERFACE_URI) }
-            {
+            if let Some(interface) = unsafe {
+                instance_extension_data::<WorkerInterface>(&instance, WORKER_INTERFACE_URI)
+            } {
                 worker_ref.attach(interface.as_ptr(), instance.handle());
                 keep_worker = true;
             }
@@ -695,8 +702,9 @@ impl Host {
             worker = None;
         }
 
-        let state = unsafe { instance_extension_data::<StateInterface>(&instance, STATE_INTERFACE_URI) }
-            .map(|interface| StateProxy::new(interface.as_ptr(), instance.handle()));
+        let state =
+            unsafe { instance_extension_data::<StateInterface>(&instance, STATE_INTERFACE_URI) }
+                .map(|interface| StateProxy::new(interface.as_ptr(), instance.handle()));
 
         let mut input_buffers: Vec<Box<[f32]>> = (0..audio_inputs.len())
             .map(|_| vec![0.0f32; MAX_FRAMES].into_boxed_slice())
@@ -704,10 +712,8 @@ impl Host {
         let mut output_buffers: Vec<Box<[f32]>> = (0..audio_outputs.len())
             .map(|_| vec![0.0f32; MAX_FRAMES].into_boxed_slice())
             .collect();
-        let mut control_buffers: Vec<f32> = controls
-            .iter()
-            .map(|control| control.default)
-            .collect();
+        let mut control_buffers: Vec<f32> =
+            controls.iter().map(|control| control.default).collect();
         let mut control_output_buffers: Vec<f32> = vec![0.0f32; control_outputs.len()];
         let mut atom_buffers: Vec<Box<[u64]>> = Vec::new();
         for &bytes in &atom_input_bytes {
@@ -825,11 +831,14 @@ struct InputPort {
 
 /// Whether a port's name or symbol suggests it is a sidechain input.
 fn port_sidechain_hint(port: &lilv::port::Port) -> bool {
-    [port.name(), port.symbol()].into_iter().flatten().any(|node| {
-        node.as_str()
-            .map(|text| text.to_ascii_lowercase().contains("sidechain"))
-            .unwrap_or(false)
-    })
+    [port.name(), port.symbol()]
+        .into_iter()
+        .flatten()
+        .any(|node| {
+            node.as_str()
+                .map(|text| text.to_ascii_lowercase().contains("sidechain"))
+                .unwrap_or(false)
+        })
 }
 
 fn port_name(port: &lilv::port::Port, index: usize) -> String {
@@ -1123,8 +1132,7 @@ impl PluginInstance {
             let (size, format) = unsafe { (*words as usize, *words.add(1)) };
             let capacity = buffer.len() * std::mem::size_of::<u64>();
             let total = (std::mem::size_of::<u32>() * 2 + size).min(capacity);
-            let bytes =
-                unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, total) };
+            let bytes = unsafe { std::slice::from_raw_parts(buffer.as_ptr() as *const u8, total) };
             self.outputs.publish_atom(index - base, bytes, format);
         }
     }
@@ -1220,9 +1228,8 @@ mod tests {
         // A zeroed descriptor is exactly what a plugin with no extensions looks
         // like: `extension_data` is NULL.
         let descriptor = std::mem::MaybeUninit::<LV2Descriptor>::zeroed();
-        let data = unsafe {
-            descriptor_extension_data::<u8>(descriptor.as_ptr(), "http://example.com/x")
-        };
+        let data =
+            unsafe { descriptor_extension_data::<u8>(descriptor.as_ptr(), "http://example.com/x") };
         assert!(data.is_none());
     }
 
@@ -1234,9 +1241,8 @@ mod tests {
                 .cast::<*const c_void>()
         };
         unsafe { slot.write(present_extension as *const c_void) };
-        let data = unsafe {
-            descriptor_extension_data::<u8>(descriptor.as_ptr(), "http://example.com/x")
-        };
+        let data =
+            unsafe { descriptor_extension_data::<u8>(descriptor.as_ptr(), "http://example.com/x") };
         assert_eq!(data.map(|ptr| ptr.as_ptr() as usize), Some(0x1234));
     }
 }

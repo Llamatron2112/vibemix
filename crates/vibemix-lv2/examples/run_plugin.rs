@@ -32,7 +32,9 @@ fn main() {
     };
 
     if let (Some(index), Some(value)) = (
-        std::env::args().nth(3).and_then(|value| value.parse::<usize>().ok()),
+        std::env::args()
+            .nth(3)
+            .and_then(|value| value.parse::<usize>().ok()),
         std::env::args()
             .nth(4)
             .and_then(|value| value.parse::<f32>().ok()),

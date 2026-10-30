@@ -23,9 +23,8 @@ pub type RetrieveFn =
 
 #[repr(C)]
 pub struct StateInterface {
-    pub save: Option<
-        extern "C" fn(Handle, StoreFn, StateHandle, u32, *const *const LV2Feature) -> u32,
-    >,
+    pub save:
+        Option<extern "C" fn(Handle, StoreFn, StateHandle, u32, *const *const LV2Feature) -> u32>,
     pub restore: Option<
         extern "C" fn(Handle, RetrieveFn, StateHandle, u32, *const *const LV2Feature) -> u32,
     >,

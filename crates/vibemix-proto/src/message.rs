@@ -333,7 +333,7 @@ pub enum ControlMessage {
         sink: String,
         error: String,
     },
-    /// One part of a message too large for a single UDP datagram. `data` is a
+    /// One part of a message too large for a single datagram. `data` is a
     /// slice of the encoded inner message; the receiver concatenates the parts
     /// (ordered by `index`, grouped by `transfer`) and decodes the result.
     Chunk {
@@ -1353,7 +1353,7 @@ impl ControlMessage {
                 data: blob(args, 3)?,
             }),
             addr::METERS => {
-                let strip_count = int(args, 0)? as usize;
+                let strip_count = count(args, 0)?;
                 let strips_in_l = float_run(args, 1, strip_count)?;
                 let strips_in_r = float_run(args, 1 + strip_count, strip_count)?;
                 let strips_gain_l = float_run(args, 1 + strip_count * 2, strip_count)?;
@@ -1361,7 +1361,7 @@ impl ControlMessage {
                 let strips_out_l = float_run(args, 1 + strip_count * 4, strip_count)?;
                 let strips_out_r = float_run(args, 1 + strip_count * 5, strip_count)?;
                 let bus_count_index = 1 + strip_count * 6;
-                let bus_count = int(args, bus_count_index)? as usize;
+                let bus_count = count(args, bus_count_index)?;
                 let buses_in_l = float_run(args, bus_count_index + 1, bus_count)?;
                 let buses_in_r = float_run(args, bus_count_index + 1 + bus_count, bus_count)?;
                 let buses_gain_l = float_run(args, bus_count_index + 1 + bus_count * 2, bus_count)?;
@@ -1446,6 +1446,10 @@ pub const MAX_DATAGRAM: usize = 32 * 1024;
 /// `Chunk`. A per-chunk guard below keeps the final chunk off the boundary too.
 const CHUNK_SIZE: usize = MAX_DATAGRAM - 1;
 
+/// Upper bound on the chunks of one transfer (about 128 MiB), so a corrupt or
+/// hostile `total` cannot make the receiver allocate without limit.
+const MAX_CHUNKS: u32 = 4096;
+
 /// Source of ids that group a chunked transfer.
 static NEXT_TRANSFER: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
 
@@ -1478,6 +1482,9 @@ impl ChunkAssembler {
         else {
             return Some(message);
         };
+        if total == 0 || total > MAX_CHUNKS {
+            return None;
+        }
         if !self.active || self.transfer != transfer || self.total != total {
             self.active = true;
             self.transfer = transfer;
@@ -1510,7 +1517,19 @@ fn int(args: &[OscType], index: usize) -> Option<i32> {
     }
 }
 
+/// A length field from the message, which must be non-negative and cannot
+/// exceed the number of arguments that actually arrived: it sizes allocations
+/// and index arithmetic, so it is never trusted blindly.
+fn count(args: &[OscType], index: usize) -> Option<usize> {
+    let value = usize::try_from(int(args, index)?).ok()?;
+    (value <= args.len()).then_some(value)
+}
+
 fn float_run(args: &[OscType], start: usize, count: usize) -> Option<Vec<f32>> {
+    // Refuse before allocating if the run cannot possibly fit.
+    if start.checked_add(count)? > args.len() {
+        return None;
+    }
     let mut values = Vec::with_capacity(count);
     for offset in 0..count {
         values.push(float(args, start + offset)?);
@@ -1622,6 +1641,18 @@ mod tests {
             }
             other => panic!("unexpected decode: {other:?}"),
         }
+    }
+
+    #[test]
+    fn chunk_assembler_rejects_absurd_totals() {
+        let mut assembler = ChunkAssembler::new();
+        let message = ControlMessage::Chunk {
+            transfer: 1,
+            index: 0,
+            total: u32::MAX,
+            data: vec![0],
+        };
+        assert!(assembler.accept(message).is_none());
     }
 
     #[test]

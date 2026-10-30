@@ -20,7 +20,9 @@ fn main() {
             info.name,
             info.audio_inputs.len(),
             info.main_input_count,
-            info.audio_inputs.len().saturating_sub(info.main_input_count),
+            info.audio_inputs
+                .len()
+                .saturating_sub(info.main_input_count),
             info.audio_outputs.len(),
             info.controls.len(),
             info.atom_inputs.len(),

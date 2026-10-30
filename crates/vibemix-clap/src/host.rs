@@ -3,6 +3,23 @@
 //! Mirrors the shape of `vibemix-vst3::host`: discovery, instantiation, audio
 //! buffers, parameters, state and editors. Only audio-effect hosting is
 //! supported for now.
+//!
+//! # Safety model
+//!
+//! Every `unsafe` call here goes through the C++ shim with the opaque `handle`
+//! returned by the shim's `open`. The invariants are:
+//!
+//! - `handle` is non-null and live from `instantiate` until [`PluginInstance`]'s
+//!   `Drop`, which closes it. Channel buffers are `Box<[f32]>` owned by the
+//!   instance; `Drop::drop` runs before its fields are freed, so the shim never
+//!   sees a dangling buffer.
+//! - `InstanceHandle` and `View` copy the raw pointer without borrowing the
+//!   instance. They are only sound while the instance is alive; the engine
+//!   closes editors and drops handles before it retires an instance.
+//! - The shim bounds-checks parameter indices; Rust wrappers clamp frame counts
+//!   to `max_frames`, the size every shim buffer is allocated with.
+//! - `run` and the audio-thread setters must only be called from one thread at
+//!   a time (the engine's audio callback); everything else is control-thread.
 
 use std::collections::HashSet;
 use std::ffi::{CStr, CString};
@@ -30,7 +47,13 @@ extern "C" {
     fn clap_has_sidechain(handle: *mut c_void) -> c_int;
     fn clap_connect_input(handle: *mut c_void, channel: c_int, data: *mut f32);
     fn clap_connect_output(handle: *mut c_void, channel: c_int, data: *mut f32);
-    fn clap_write_sidechain(handle: *mut c_void, left: *const f32, right: *const f32, frames: c_int);
+    fn clap_write_sidechain(
+        handle: *mut c_void,
+        left: *const f32,
+        right: *const f32,
+        frames: c_int,
+    );
+    fn clap_set_param_rt(handle: *mut c_void, index: c_int, value: f32);
     fn clap_run(handle: *mut c_void, frames: c_int);
     fn clap_midi_event(handle: *mut c_void, sample_offset: i32, status: i32, d1: i32, d2: i32);
     #[allow(clippy::too_many_arguments)]
@@ -164,7 +187,9 @@ impl Host {
         if ptr.is_null() {
             return Vec::new();
         }
-        let text = unsafe { CStr::from_ptr(ptr) }.to_string_lossy().into_owned();
+        let text = unsafe { CStr::from_ptr(ptr) }
+            .to_string_lossy()
+            .into_owned();
         unsafe { clap_string_free(ptr) };
         serde_json::from_str(&text).unwrap_or_default()
     }
@@ -203,8 +228,12 @@ impl Host {
             handle,
             in_channels,
             out_channels,
-            inputs: (0..in_channels).map(|_| vec![0.0f32; max_frames].into()).collect(),
-            outputs: (0..out_channels).map(|_| vec![0.0f32; max_frames].into()).collect(),
+            inputs: (0..in_channels)
+                .map(|_| vec![0.0f32; max_frames].into())
+                .collect(),
+            outputs: (0..out_channels)
+                .map(|_| vec![0.0f32; max_frames].into())
+                .collect(),
             controls: Vec::new(),
             max_frames,
             has_sidechain,
@@ -332,7 +361,10 @@ impl PluginInstance {
     }
 
     pub fn control_name(&self, param: usize) -> &str {
-        self.controls.get(param).map(|c| c.name.as_str()).unwrap_or("")
+        self.controls
+            .get(param)
+            .map(|c| c.name.as_str())
+            .unwrap_or("")
     }
 
     pub fn control_default(&self, param: usize) -> f32 {
@@ -343,9 +375,12 @@ impl PluginInstance {
         &self.controls
     }
 
+    /// Queues a parameter change for the next [`run`](Self::run). Meant for the
+    /// audio thread: non-blocking, allocation-free, and only sends a value that
+    /// differs from the last one sent.
     pub fn set_control(&mut self, param: usize, value: f32) {
         if param < self.controls.len() {
-            unsafe { clap_set_param(self.handle, param as c_int, value) };
+            unsafe { clap_set_param_rt(self.handle, param as c_int, value) };
         }
     }
 
@@ -438,13 +473,13 @@ impl PluginInstance {
 
     /// Writes a stereo sidechain signal into the plugin's sidechain input bus.
     pub fn write_sidechain(&self, left: &[f32], right: &[f32], frames: usize) {
+        // The shim copies `frames` samples from both slices into buffers sized
+        // for `max_frames`, so clamp to what is actually readable and writable.
+        let frames = frames.min(left.len()).min(right.len()).min(self.max_frames);
+        // SAFETY: `handle` is live; both slices hold at least `frames` samples
+        // and the shim's destination holds `max_frames` per channel.
         unsafe {
-            clap_write_sidechain(
-                self.handle,
-                left.as_ptr(),
-                right.as_ptr(),
-                frames as c_int,
-            )
+            clap_write_sidechain(self.handle, left.as_ptr(), right.as_ptr(), frames as c_int)
         };
     }
 
@@ -595,7 +630,13 @@ fn restore_blob(handle: *mut c_void, state: &[u8]) {
     if state.is_empty() {
         return;
     }
-    unsafe { clap_load_state(handle, state.as_ptr() as *const c_char, state.len() as c_int) };
+    unsafe {
+        clap_load_state(
+            handle,
+            state.as_ptr() as *const c_char,
+            state.len() as c_int,
+        )
+    };
 }
 
 /// Hex-encodes a state blob for storage in the session's string field.

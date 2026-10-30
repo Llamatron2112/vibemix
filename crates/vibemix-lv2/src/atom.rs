@@ -91,8 +91,8 @@ pub fn for_each_event(sequence: &[u8], mut f: impl FnMut(&[u8])) {
     let end = (SEQUENCE_BODY + size).min(sequence.len());
     let mut offset = SEQUENCE_BODY + 8; // skip the atom header and the sequence body head
     while offset + 16 <= end {
-        let atom_size = u32::from_ne_bytes(sequence[offset + 8..offset + 12].try_into().unwrap())
-            as usize;
+        let atom_size =
+            u32::from_ne_bytes(sequence[offset + 8..offset + 12].try_into().unwrap()) as usize;
         let atom_end = offset + 16 + atom_size;
         if atom_end > end {
             break;
@@ -114,8 +114,9 @@ pub struct SequenceWriter<'a> {
 impl<'a> SequenceWriter<'a> {
     pub fn new(words: &'a mut [u64]) -> Self {
         // SAFETY: a sequence buffer is a header (size + type) followed by body.
-        let bytes =
-            unsafe { std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8) };
+        let bytes = unsafe {
+            std::slice::from_raw_parts_mut(words.as_mut_ptr() as *mut u8, words.len() * 8)
+        };
         let size = bytes
             .get(0..4)
             .and_then(|head| head.try_into().ok())
@@ -158,15 +159,44 @@ impl<'a> SequenceWriter<'a> {
 
     /// Append a `time:Position` object at `time` frames into the block.
     /// Allocation-free (uses a fixed stack buffer for the object body).
-    pub fn append_position(&mut self, time: i64, position: &TimePosition, urids: &AtomUrids) -> bool {
+    pub fn append_position(
+        &mut self,
+        time: i64,
+        position: &TimePosition,
+        urids: &AtomUrids,
+    ) -> bool {
         let mut body = [0u8; 256];
         let mut len = 8usize; // object id (0) + otype
         body[4..8].copy_from_slice(&urids.time_position.to_ne_bytes());
 
-        push_property(&mut body, &mut len, urids.time_frame, urids.atom_long, &position.frame.to_ne_bytes());
-        push_property(&mut body, &mut len, urids.time_beat, urids.atom_double, &position.beat.to_ne_bytes());
-        push_property(&mut body, &mut len, urids.time_bar, urids.atom_long, &position.bar.to_ne_bytes());
-        push_property(&mut body, &mut len, urids.time_bar_beat, urids.atom_float, &position.bar_beat.to_ne_bytes());
+        push_property(
+            &mut body,
+            &mut len,
+            urids.time_frame,
+            urids.atom_long,
+            &position.frame.to_ne_bytes(),
+        );
+        push_property(
+            &mut body,
+            &mut len,
+            urids.time_beat,
+            urids.atom_double,
+            &position.beat.to_ne_bytes(),
+        );
+        push_property(
+            &mut body,
+            &mut len,
+            urids.time_bar,
+            urids.atom_long,
+            &position.bar.to_ne_bytes(),
+        );
+        push_property(
+            &mut body,
+            &mut len,
+            urids.time_bar_beat,
+            urids.atom_float,
+            &position.bar_beat.to_ne_bytes(),
+        );
         push_property(
             &mut body,
             &mut len,
@@ -181,7 +211,13 @@ impl<'a> SequenceWriter<'a> {
             urids.atom_float,
             &position.beats_per_bar.to_ne_bytes(),
         );
-        push_property(&mut body, &mut len, urids.time_speed, urids.atom_float, &position.speed.to_ne_bytes());
+        push_property(
+            &mut body,
+            &mut len,
+            urids.time_speed,
+            urids.atom_float,
+            &position.speed.to_ne_bytes(),
+        );
         push_property(
             &mut body,
             &mut len,
@@ -215,11 +251,7 @@ impl<'a> SequenceWriter<'a> {
 
 /// Appends a complete `LV2_Atom` (header + body) as an event at `time`. Used to
 /// forward UI→DSP events (already an atom) into a plugin's input sequence.
-pub fn append_atom_event(
-    writer: &mut SequenceWriter,
-    time: i64,
-    atom: &[u8],
-) -> bool {
+pub fn append_atom_event(writer: &mut SequenceWriter, time: i64, atom: &[u8]) -> bool {
     if atom.len() < 8 {
         return false;
     }
@@ -266,8 +298,7 @@ fn push_property(buf: &mut [u8], len: &mut usize, key: u32, value_type: u32, val
 /// output path).
 #[cfg(test)]
 pub fn read_events(words: &[u64]) -> Vec<(i64, u32, Vec<u8>)> {
-    let bytes =
-        unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) };
+    let bytes = unsafe { std::slice::from_raw_parts(words.as_ptr() as *const u8, words.len() * 8) };
     let mut size = u32::from_ne_bytes(bytes[0..4].try_into().unwrap()) as usize;
     let capacity = bytes.len().saturating_sub(8);
     size = size.min(capacity);
@@ -374,7 +405,8 @@ mod tests {
         while offset + 16 <= body.len() {
             let prop_key = u32::from_ne_bytes(body[offset..offset + 4].try_into().unwrap());
             let _context = u32::from_ne_bytes(body[offset + 4..offset + 8].try_into().unwrap());
-            let size = u32::from_ne_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let size =
+                u32::from_ne_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
             let _type = u32::from_ne_bytes(body[offset + 12..offset + 16].try_into().unwrap());
             if prop_key == key && size == 4 {
                 return Some(f32::from_ne_bytes(
@@ -392,7 +424,8 @@ mod tests {
         let mut offset = 8; // id + otype
         while offset + 16 <= body.len() {
             let prop_key = u32::from_ne_bytes(body[offset..offset + 4].try_into().unwrap());
-            let size = u32::from_ne_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
+            let size =
+                u32::from_ne_bytes(body[offset + 8..offset + 12].try_into().unwrap()) as usize;
             if prop_key == key && size == 4 {
                 return Some(u32::from_ne_bytes(
                     body[offset + 16..offset + 20].try_into().unwrap(),
@@ -426,8 +459,7 @@ mod tests {
         let body = &events[0].2;
         let bpm = find_float_property(body, urids().time_beats_per_minute).expect("bpm property");
         assert!((bpm - 135.0).abs() < 1e-6, "bpm={bpm}");
-        let beat_unit =
-            find_int_property(body, urids().time_beat_unit).expect("beatUnit property");
+        let beat_unit = find_int_property(body, urids().time_beat_unit).expect("beatUnit property");
         assert_eq!(beat_unit, TIME_BEAT_UNIT_QUARTER);
     }
 
@@ -453,7 +485,10 @@ mod tests {
         assert_eq!(events[0].0, 0);
         assert_eq!(events[0].1, urids().object);
         // Body starts with id + otype.
-        assert_eq!(u32::from_ne_bytes(events[0].2[4..8].try_into().unwrap()), 30);
+        assert_eq!(
+            u32::from_ne_bytes(events[0].2[4..8].try_into().unwrap()),
+            30
+        );
         assert!(events[0].2.len() > 8);
     }
 }
