@@ -68,11 +68,23 @@ impl MidiBlock {
     }
 }
 
-const CLOCK: u8 = 0xF8;
-const START: u8 = 0xFA;
-const CONTINUE: u8 = 0xFB;
-const STOP: u8 = 0xFC;
+pub(crate) const CLOCK: u8 = 0xF8;
+pub(crate) const START: u8 = 0xFA;
+pub(crate) const CONTINUE: u8 = 0xFB;
+pub(crate) const STOP: u8 = 0xFC;
 const RESET: u8 = 0xFF;
+
+/// System transport messages (start/continue/stop, song position/select),
+/// excluding the clock pulse itself.
+pub fn is_transport_status(status: u8) -> bool {
+    matches!(status, 0xF2 | 0xF3 | 0xFA | 0xFB | 0xFC)
+}
+
+/// Any MIDI sync/realtime message: transport plus clock and the remaining
+/// system realtime bytes.
+pub fn is_sync_status(status: u8) -> bool {
+    status >= 0xF8 || is_transport_status(status)
+}
 
 /// Number of inter-pulse intervals kept for the tempo-jitter/glitch estimate.
 const JITTER_WINDOW: usize = 96;
@@ -411,6 +423,22 @@ impl MasterClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn classifies_transport_and_sync_messages() {
+        for status in [0xF2, 0xF3, 0xFA, 0xFB, 0xFC] {
+            assert!(is_transport_status(status), "{status:#x}");
+            assert!(is_sync_status(status), "{status:#x}");
+        }
+        for status in [0xF8, 0xF9, 0xFE, 0xFF] {
+            assert!(!is_transport_status(status), "{status:#x}");
+            assert!(is_sync_status(status), "{status:#x}");
+        }
+        for status in [0x90, 0xB0, 0xE0] {
+            assert!(!is_transport_status(status), "{status:#x}");
+            assert!(!is_sync_status(status), "{status:#x}");
+        }
+    }
 
     #[test]
     fn master_clock_pulses_are_exact() {

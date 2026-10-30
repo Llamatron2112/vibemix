@@ -271,6 +271,10 @@ pub enum ControlMessage {
     SetClockPlaying {
         playing: bool,
     },
+    SetClockTransport {
+        send: bool,
+        receive: bool,
+    },
     SetStripMidiChannel {
         strip: u32,
         channel: u32,
@@ -862,6 +866,10 @@ impl ControlMessage {
                 addr: addr::CLOCK_PLAY.to_string(),
                 args: vec![OscType::Int(*playing as i32)],
             },
+            SetClockTransport { send, receive } => OscMessage {
+                addr: addr::CLOCK_TRANSPORT.to_string(),
+                args: vec![OscType::Int(*send as i32), OscType::Int(*receive as i32)],
+            },
             SetStripMidiChannel { strip, channel } => OscMessage {
                 addr: addr::STRIP_MIDI_CHANNEL.to_string(),
                 args: vec![OscType::Int(*strip as i32), OscType::Int(*channel as i32)],
@@ -1311,6 +1319,10 @@ impl ControlMessage {
             }),
             addr::CLOCK_PLAY => Some(ControlMessage::SetClockPlaying {
                 playing: int(args, 0)? != 0,
+            }),
+            addr::CLOCK_TRANSPORT => Some(ControlMessage::SetClockTransport {
+                send: int(args, 0)? != 0,
+                receive: int(args, 1)? != 0,
             }),
             addr::STRIP_MIDI_CHANNEL => Some(ControlMessage::SetStripMidiChannel {
                 strip: int(args, 0)? as u32,
@@ -1968,6 +1980,10 @@ mod tests {
         roundtrip(ControlMessage::SetClockMaster { on: true });
         roundtrip(ControlMessage::SetClockBpm { bpm: 123.456 });
         roundtrip(ControlMessage::SetClockPlaying { playing: true });
+        roundtrip(ControlMessage::SetClockTransport {
+            send: false,
+            receive: true,
+        });
     }
 
     #[test]

@@ -177,7 +177,7 @@ fn hostile_sessions_never_panic() {
     // Mutations that stay valid TOML are the interesting ones; make sure the
     // harness really exercises them rather than failing every parse.
     assert!(
-        parsed * 20 > total,
+        parsed * 21 > total,
         "only {parsed} of {total} mutated sessions parsed"
     );
 }

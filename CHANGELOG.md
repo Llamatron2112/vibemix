@@ -144,17 +144,15 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
-- **MIDI clock master/slave.** `Options → MIDI clock` switches between
-  following `midi_in` and generating a 24 PPQN clock internally. As master, the
-  BPM readout sets the tempo (0.01 BPM resolution) and the transport button
-  starts/stops the clock; the output goes to a new JACK `midi_out` port. Pulse
-  timing is generated in the audio callback from an integer phase accumulator,
-  so it is sample-accurate and does not drift, with `START`/`STOP` and a
-  reset-to-zero stop.
-- **MIDI routing** (`Options → MIDI routing…`): connect external MIDI outputs
-  to `midi_in` and `midi_out` to external MIDI inputs. Both patches are saved
-  with the session and mark it modified, so the unsaved-changes prompt covers
-  them.
+- **MIDI sync page** (`Options → MIDI sync…`): one window for the clock source
+  (*MIDI in (slave)* or *Internal (master)*), master tempo, sending and
+  receiving start/stop, plugin transport following, and input/output routing.
+  The transport toggles are always available: as master, send emits START/STOP
+  on `midi_out` and receive lets incoming START/STOP remote-control the
+  internal transport; as slave, receive follows incoming START/STOP and send
+  forwards them to `midi_out`. Clock timing is sample-accurate and drift-free,
+  with a reset-to-zero stop. Both MIDI patches are saved with the session and
+  mark it modified.
 - The top-bar menu can hide the **DSP usage readout** independently of the
   other transport readouts; the choice is saved in the session.
 - **Load the last used session on startup** from the File menu. The preference

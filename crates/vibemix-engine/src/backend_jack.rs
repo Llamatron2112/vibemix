@@ -17,7 +17,9 @@ use crate::plugin::PluginNode;
 use crate::recorder::{bar_boundary_offset, LoopPlayback, RecordedTake, Recorder, MAX_LOOPS};
 
 use crate::dsp;
-use crate::midi::{Clock, MasterClock, MidiBlock};
+use crate::midi::{
+    is_sync_status, is_transport_status, Clock, MasterClock, MidiBlock, CONTINUE, START, STOP,
+};
 use crate::midi_map::SharedMidi;
 use crate::params::{
     SharedClock, SharedMeters, SharedParams, SharedRecorder, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
@@ -1352,13 +1354,27 @@ impl ProcessHandler for MixerGraph {
 
         if master_mode {
             // The internal clock owns the transport; incoming clock/transport
-            // is ignored so it cannot double-clock the graph.
+            // is ignored so it cannot double-clock the graph. Transport can
+            // still remote-control the internal start/stop.
+            let receive_transport = self.params.clock_receive_transport();
             for raw in self.midi_in.iter(scope) {
                 let event = MidiEvent::new(raw.time as i64, raw.bytes);
                 let status = event.as_slice().first().copied().unwrap_or(0);
-                if !(status >= 0xF8 || status == 0xF2 || status == 0xF3) {
-                    self.midi.push(event);
+                if is_transport_status(status) {
+                    if receive_transport {
+                        match status {
+                            START => self.params.set_clock_playing(true),
+                            CONTINUE => self.params.set_clock_playing(true),
+                            STOP => self.params.set_clock_playing(false),
+                            _ => {}
+                        }
+                    }
+                    continue;
                 }
+                if is_sync_status(status) {
+                    continue;
+                }
+                self.midi.push(event);
             }
             if !self.master_active {
                 self.master.reset();
@@ -1393,9 +1409,15 @@ impl ProcessHandler for MixerGraph {
             );
 
             // Clock/transport goes to the MIDI output in master mode only.
+            // `send_transport` can suppress start/stop while keeping clock.
+            let send_transport = self.params.clock_send_transport();
             let mut writer = self.midi_out.writer(scope);
             for index in 0..self.master_midi.len() {
                 let event = self.master_midi.get(index);
+                let status = event.as_slice().first().copied().unwrap_or(0);
+                if !send_transport && is_transport_status(status) {
+                    continue;
+                }
                 let _ = writer.write(&RawMidi {
                     time: event.time.max(0) as Frames,
                     bytes: event.as_slice(),
@@ -1407,12 +1429,25 @@ impl ProcessHandler for MixerGraph {
                 self.master_active = false;
                 self.clock = Clock::new(self.sample_rate, beats_per_bar);
             }
+            let receive_transport = self.params.clock_receive_transport();
+            let send_transport = self.params.clock_send_transport();
             for raw in self.midi_in.iter(scope) {
                 let event = MidiEvent::new(raw.time as i64, raw.bytes);
-                self.midi.push(event);
                 let status = event.as_slice().first().copied().unwrap_or(0);
-                if status >= 0xF8 || status == 0xF2 || status == 0xF3 {
-                    self.transport_midi.push(event);
+                if is_transport_status(status) {
+                    // Keep a raw copy for optional forwarding.
+                    if send_transport {
+                        self.master_midi.push(event);
+                    }
+                    if receive_transport {
+                        self.midi.push(event);
+                        self.transport_midi.push(event);
+                    }
+                } else {
+                    self.midi.push(event);
+                    if status >= 0xF8 {
+                        self.transport_midi.push(event);
+                    }
                 }
             }
 
@@ -1424,6 +1459,18 @@ impl ProcessHandler for MixerGraph {
             playing = self.clock.playing;
             self.position = self.clock.position();
             self.shared_clock.publish(&self.clock);
+
+            // Optional MIDI-transport thru (no clock) in slave mode.
+            if send_transport {
+                let mut writer = self.midi_out.writer(scope);
+                for index in 0..self.master_midi.len() {
+                    let event = self.master_midi.get(index);
+                    let _ = writer.write(&RawMidi {
+                        time: event.time.max(0) as Frames,
+                        bytes: event.as_slice(),
+                    });
+                }
+            }
         }
 
         // When MIDI sync is off, drop system realtime/transport messages so
@@ -1433,7 +1480,7 @@ impl ProcessHandler for MixerGraph {
             for index in 0..self.midi.len() {
                 let event = self.midi.get(index);
                 let status = event.as_slice().first().copied().unwrap_or(0);
-                let transport = status >= 0xF8 || status == 0xF2 || status == 0xF3;
+                let transport = is_sync_status(status);
                 if !transport {
                     self.midi.set(kept, event);
                     kept += 1;

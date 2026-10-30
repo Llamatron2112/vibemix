@@ -54,6 +54,7 @@ pub const CLOCK: &str = "/vibemix/clock";
 pub const CLOCK_MASTER: &str = "/vibemix/clock/master";
 pub const CLOCK_BPM: &str = "/vibemix/clock/bpm";
 pub const CLOCK_PLAY: &str = "/vibemix/clock/play";
+pub const CLOCK_TRANSPORT: &str = "/vibemix/clock/transport";
 pub const CLOCK_BEATS_PER_BAR: &str = "/vibemix/clock/beats_per_bar";
 pub const TRANSPORT_UI: &str = "/vibemix/transport/ui";
 pub const RECORDER_SOURCES: &str = "/vibemix/recorder/sources";

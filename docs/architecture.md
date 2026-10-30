@@ -211,8 +211,8 @@ The GUI **patchbay** (`Options → Patchbay…`) edits the same connections live
 queries the JACK port graph (`/vibemix/ports`) and issues
 `/vibemix/connect` / `/vibemix/disconnect` for one source (output) and sink
 (input). The matrix only enables connections involving vibemix's own ports, so
-everything it changes is covered by the saved-connection model above. A separate
-`Options → MIDI routing…` window patches `midi_in` from external MIDI outputs
+everything it changes is covered by the saved-connection model above. The
+`Options → MIDI sync…` page also patches `midi_in` from external MIDI outputs
 and `midi_out` to external MIDI inputs. The port graph is refreshed on open and
 periodically while a window is visible, since clients come and go.
 
@@ -702,8 +702,9 @@ The mixer can be a MIDI **clock slave** or **clock master**. As slave it follows
 an incoming 24 PPQN MIDI clock to derive tempo and transport. As master it
 generates the clock internally, sends it on a JACK `MidiOut` port, and ignores
 incoming clock/transport so the two cannot double-clock the graph. A single
-`MidiIn` port carries clock, transport, notes and CC; `MidiOut` carries the
-generated clock/transport in master mode (silent in slave mode).
+`MidiIn` port carries clock, transport, notes and CC. `MidiOut` carries the
+generated clock in master mode, plus start/stop when `send_transport` is on; in
+slave mode it is silent for clock but can forward start/stop.
 
 - **Host tempo:** each block a `time:Position` atom (`frame`, `beat`, `bar`,
   `barBeat`, `beatsPerMinute`, `beatsPerBar`, `beatUnit`, `speed`) is forged into
@@ -719,7 +720,11 @@ generated clock/transport in master mode (silent in slave mode).
   (resume), `0xFC` Stop (hold position), optional `0xF2` Song Position; a
   "locked" state with a timeout when clock stops. Inter-pulse intervals are kept
   in a short window to publish tempo jitter (std-dev of the instantaneous BPM)
-  and a glitch count (missed or extra pulses).
+  and a glitch count (missed or extra pulses). `receive_transport` gates whether
+  these change the slave transport. In master mode the same messages can
+  remote-control the internal transport (`receive_transport`) and
+  `send_transport` gates START/STOP on `MidiOut`; in slave mode
+  `send_transport` forwards incoming START/STOP to `MidiOut`.
 - **Master clock:** a fixed-point phase accumulator advances 24 PPQN one sample
   at a time (`phase += millibpm`, overflow = pulse), so pulse spacing is exact
   and drift-free. The phase is reset on stop; play always emits `START`, stop
@@ -741,8 +746,10 @@ generated clock/transport in master mode (silent in slave mode).
   menu, which also toggles the beats:bars and minutes:seconds counters and
   opens a small loop-settings popup (unit beats/bars, value, beats-per-bar).
   In master mode the BPM readout opens a tempo dialog and the transport button
-  starts/stops the internal clock. In beats mode the loop indicator groups its
-  cells by bar with a wider gap between bars. The engine publishes
+  starts/stops the internal clock. `Options → MIDI sync…` is a non-modal page
+  with the clock source, master tempo, transport send/receive, plugin transport
+  following, and MIDI input/output routing. In beats mode the loop indicator
+  groups its cells by bar with a wider gap between bars. The engine publishes
   `{ locked, playing, bpm, beats_since_start, seconds_since_start, jitter_bpm,
   glitches }` at meter rate; counter/loop settings live in the session.
 - **Channels:** each strip and bus owns an optional MIDI channel ("any", or

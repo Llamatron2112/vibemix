@@ -293,7 +293,7 @@ pub struct MixerModel {
     pub midi_out_connections: Option<Vec<String>>,
 }
 
-/// MIDI clock source and master tempo, saved with the session.
+/// MIDI clock source and transport options, saved with the session.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClockSettings {
     /// Generate the clock internally instead of following `midi_in`.
@@ -302,6 +302,13 @@ pub struct ClockSettings {
     /// Internal tempo in BPM, used when `master` is set.
     #[serde(default = "default_master_bpm")]
     pub bpm: f32,
+    /// Emit/forward start/stop on `midi_out`.
+    #[serde(default = "default_true")]
+    pub send_transport: bool,
+    /// Follow incoming start/stop: controls the master transport when `master`
+    /// is set, and the slave transport otherwise.
+    #[serde(default = "default_true")]
+    pub receive_transport: bool,
 }
 
 fn default_master_bpm() -> f32 {
@@ -313,6 +320,8 @@ impl Default for ClockSettings {
         Self {
             master: false,
             bpm: default_master_bpm(),
+            send_transport: true,
+            receive_transport: true,
         }
     }
 }

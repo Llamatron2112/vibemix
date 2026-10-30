@@ -1381,28 +1381,9 @@ ApplicationWindow {
         Menu {
             title: "Options"
             MenuItem {
-                text: "MIDI sync"
-                checkable: true
-                checked: mix.midi_sync === true
+                text: "MIDI sync…"
                 enabled: backend.connected
-                onTriggered: backend.setMidiSync(!(mix.midi_sync === true))
-            }
-            Menu {
-                title: "MIDI clock"
-                MenuItem {
-                    text: "MIDI in (slave)"
-                    checkable: true
-                    checked: !root.clockMaster()
-                    enabled: backend.connected
-                    onTriggered: backend.setClockMaster(false)
-                }
-                MenuItem {
-                    text: "Internal (master)"
-                    checkable: true
-                    checked: root.clockMaster()
-                    enabled: backend.connected
-                    onTriggered: backend.setClockMaster(true)
-                }
+                onTriggered: midiWindow.show()
             }
             MenuSeparator { }
             MenuItem {
@@ -1426,10 +1407,6 @@ ApplicationWindow {
             MenuItem {
                 text: "Patchbay…"
                 onTriggered: patchWindow.show()
-            }
-            MenuItem {
-                text: "MIDI routing…"
-                onTriggered: midiWindow.show()
             }
             MenuSeparator { }
             MenuItem {
@@ -4717,13 +4694,15 @@ ApplicationWindow {
 
     Window {
         id: midiWindow
-        title: "MIDI routing"
-        modality: Qt.ApplicationModal
-        flags: Qt.Dialog
+        title: "MIDI sync"
+        modality: Qt.NonModal
+        flags: Qt.Window
         transientParent: root
         visible: false
-        width: 500
-        height: 560
+        width: 560
+        height: 720
+        minimumWidth: 480
+        minimumHeight: 540
         color: palette.window
 
         onVisibleChanged: if (visible) backend.queryPorts()
@@ -4732,6 +4711,98 @@ ApplicationWindow {
             anchors.fill: parent
             anchors.margins: 8
             spacing: 6
+
+            GridLayout {
+                Layout.fillWidth: true
+                columns: 2
+                columnSpacing: 8
+                rowSpacing: 4
+
+                Label {
+                    text: "clock"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                ComboBox {
+                    Layout.preferredWidth: 190
+                    font.pixelSize: 11
+                    model: ["MIDI in (slave)", "Internal (master)"]
+                    currentIndex: root.clockMaster() ? 1 : 0
+                    onActivated: backend.setClockMaster(index === 1)
+                }
+
+                Label {
+                    text: "master tempo"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                RowLayout {
+                    spacing: 6
+                    Label {
+                        text: root.clockSettings().bpm.toFixed(2) + " BPM"
+                        color: root.clockMaster() ? root.textColor : root.mutedText
+                        font.pixelSize: 11
+                        font.family: "monospace"
+                    }
+                    FlatButton {
+                        text: "change…"
+                        enabled: root.clockMaster()
+                        onClicked: tempoDialog.open()
+                    }
+                    Item { Layout.fillWidth: true }
+                }
+            }
+
+            CheckBox {
+                text: "Send start/stop"
+                checked: root.clockSettings().send_transport !== false
+                onToggled: backend.setClockTransport(
+                    checked, root.clockSettings().receive_transport !== false)
+                ToolTip.visible: hovered
+                ToolTip.delay: 400
+                ToolTip.text: "Master: send START/STOP on midi_out. Slave: forward incoming START/STOP."
+            }
+            CheckBox {
+                text: "Receive start/stop"
+                checked: root.clockSettings().receive_transport !== false
+                onToggled: backend.setClockTransport(
+                    root.clockSettings().send_transport !== false, checked)
+                ToolTip.visible: hovered
+                ToolTip.delay: 400
+                ToolTip.text: "Master: let incoming START/STOP control the internal transport. Slave: follow incoming START/STOP."
+            }
+            CheckBox {
+                text: "Plugins follow transport"
+                checked: mix.midi_sync === true
+                onToggled: backend.setMidiSync(checked)
+                ToolTip.visible: hovered
+                ToolTip.delay: 400
+                ToolTip.text: "Forward clock, position and START/STOP to plugin hosts."
+            }
+
+            Label {
+                Layout.fillWidth: true
+                color: root.mutedText
+                font.pixelSize: 10
+                elide: Text.ElideRight
+                text: {
+                    var c = root.clockInfo()
+                    var mode = root.clockMaster()
+                        ? "internal clock"
+                        : (c.locked ? "MIDI clock locked" : "waiting for MIDI clock")
+                    var state = c.playing ? "playing" : "stopped"
+                    var jitter = root.clockMaster()
+                        ? ""
+                        : " · jitter " + (c.jitter_bpm || 0).toFixed(2) + " BPM"
+                    return mode + " · " + (c.bpm || 0).toFixed(2) + " BPM · " + state + jitter
+                }
+            }
+
+            Rectangle {
+                Layout.fillWidth: true
+                implicitHeight: 1
+                color: root.borderColor
+            }
 
             Label {
                 Layout.fillWidth: true

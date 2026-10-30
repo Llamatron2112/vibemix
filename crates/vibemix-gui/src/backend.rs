@@ -1127,6 +1127,10 @@ pub mod qobject {
         fn set_clock_playing(&self, playing: bool);
 
         #[qinvokable]
+        #[cxx_name = "setClockTransport"]
+        fn set_clock_transport(&self, send: bool, receive: bool);
+
+        #[qinvokable]
         #[cxx_name = "setLoadLastSessionOnStartup"]
         fn set_load_last_session_on_startup(self: Pin<&mut Self>, on: bool);
 
@@ -1944,6 +1948,14 @@ impl qobject::Backend {
     pub fn set_clock_playing(&self, playing: bool) {
         note_action("clock transport");
         send(ControlMessage::SetClockPlaying { playing });
+    }
+
+    pub fn set_clock_transport(&self, send_transport: bool, receive_transport: bool) {
+        note_action("clock transport options");
+        send(ControlMessage::SetClockTransport {
+            send: send_transport,
+            receive: receive_transport,
+        });
     }
 
     pub fn set_load_last_session_on_startup(mut self: Pin<&mut Self>, on: bool) {

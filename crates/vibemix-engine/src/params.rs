@@ -61,6 +61,8 @@ pub struct SharedParams {
     clock_master: AtomicBool,
     clock_playing: AtomicBool,
     clock_bpm_milli: AtomicU32,
+    clock_send_transport: AtomicBool,
+    clock_receive_transport: AtomicBool,
 }
 
 impl SharedParams {
@@ -129,6 +131,8 @@ impl SharedParams {
             clock_master: AtomicBool::new(false),
             clock_playing: AtomicBool::new(false),
             clock_bpm_milli: AtomicU32::new(120_000),
+            clock_send_transport: AtomicBool::new(true),
+            clock_receive_transport: AtomicBool::new(true),
         }
     }
 
@@ -165,6 +169,22 @@ impl SharedParams {
         let value = value.clamp(20_000, 400_000);
         let rounded = ((value + 5) / 10) * 10;
         self.clock_bpm_milli.store(rounded, Ordering::Relaxed);
+    }
+
+    pub fn clock_send_transport(&self) -> bool {
+        self.clock_send_transport.load(Ordering::Relaxed)
+    }
+
+    pub fn set_clock_send_transport(&self, value: bool) {
+        self.clock_send_transport.store(value, Ordering::Relaxed);
+    }
+
+    pub fn clock_receive_transport(&self) -> bool {
+        self.clock_receive_transport.load(Ordering::Relaxed)
+    }
+
+    pub fn set_clock_receive_transport(&self, value: bool) {
+        self.clock_receive_transport.store(value, Ordering::Relaxed);
     }
 
     pub fn beats_per_bar(&self) -> f32 {

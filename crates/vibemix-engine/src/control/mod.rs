@@ -1734,6 +1734,16 @@ impl Controller {
                 }
                 Actions::default()
             }
+            ControlMessage::SetClockTransport { send, receive } => {
+                self.params.set_clock_send_transport(send);
+                self.params.set_clock_receive_transport(receive);
+                self.model.clock.send_transport = send;
+                self.model.clock.receive_transport = receive;
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
             ControlMessage::SetStripMidiChannel { strip, channel } => {
                 if let Some(entry) = self.model.strip_mut(StripId(strip)) {
                     entry.midi_channel = midi_channel_value(channel);

@@ -168,6 +168,8 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
     params.set_beats_per_bar(model.beats_per_bar);
     params.set_midi_sync(model.midi_sync);
     params.set_clock_master(model.clock.master);
+    params.set_clock_send_transport(model.clock.send_transport);
+    params.set_clock_receive_transport(model.clock.receive_transport);
     let clock_bpm = if model.clock.bpm.is_finite() {
         model.clock.bpm.clamp(20.0, 400.0)
     } else {
