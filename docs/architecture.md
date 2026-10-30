@@ -628,18 +628,23 @@ through a separate launcher window.
   Buffers are retired through a garbage queue, so no allocation or free happens
   on the audio thread.
 - WAV files are written by the control thread at 16-bit, 24-bit or 32-bit
-  float, into the folder chosen in the GUI (default
-  `VIBEMIX_CONFIG_DIR/loops/`) with a timestamped name. The session stores loop
+  float to the path chosen in the GUI's save dialog (default
+  `VIBEMIX_CONFIG_DIR/loops/`). The chosen directory is remembered in the
+  session, and the export can be normalized to -1 dBFS. The session stores loop
   metadata and paths.
-- The editor requests a 4096-bucket envelope for the visible window on demand;
-  the launcher cards keep the smaller 512-bucket envelope. The view is free
-  pan/zoom (horizontal drag pans, vertical drag zooms). Alt-drag sends throttled
-  window requests with a temporary nudge override (audio is unchanged until
-  release), so the zoomed view keeps its resolution while being dragged.
+- The editor requests an envelope for the visible window on demand; the
+  launcher cards keep a smaller whole-loop envelope. The view is free pan/zoom
+  (horizontal drag pans, vertical drag zooms). Navigation updates the view
+  continuously but requests a new resolution only after the gesture settles
+  (120 ms), stretching the previous peaks in the meantime; Alt-drag sends
+  throttled window requests with a temporary nudge override (audio is unchanged
+  until release), so the zoomed view keeps its resolution while being dragged.
 - The controller caches multiple raw transient onsets per loop, detected with
   spectral flux (short-time FFT, log-magnitude positive differences weighted
   toward high bins, local adaptive peak picking). This works on compressed or
-  saturated material where an amplitude envelope is flat. They are sent with
+  saturated material where an amplitude envelope is flat. A per-loop
+  sensitivity adjusts the adaptive threshold and floor and re-runs the detector
+  when changed. They are sent with
   each window request; the GUI maps them through the current nudge and draws
   markers. Ctrl+click on a marker sets the total nudge to that raw frame,
   making it the loop start. A seam snap searches ±5 ms for the lowest

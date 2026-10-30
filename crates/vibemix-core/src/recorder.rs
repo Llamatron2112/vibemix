@@ -58,6 +58,9 @@ pub struct RecorderSettings {
     /// Refine the offset with transient detection.
     #[serde(default = "default_true")]
     pub transient: bool,
+    /// Default transient-detector sensitivity for new takes, 0..1.
+    #[serde(default = "default_sensitivity")]
+    pub transient_sensitivity: f32,
     /// Manual nudge in samples on top of the automatic offsets.
     #[serde(default)]
     pub nudge_samples: i64,
@@ -74,6 +77,10 @@ fn default_true() -> bool {
     true
 }
 
+pub fn default_sensitivity() -> f32 {
+    0.5
+}
+
 impl Default for RecorderSettings {
     fn default() -> Self {
         Self {
@@ -82,6 +89,7 @@ impl Default for RecorderSettings {
             save_dir: String::new(),
             auto_latency: true,
             transient: true,
+            transient_sensitivity: default_sensitivity(),
             nudge_samples: 0,
             crossfade_ms: 0.0,
         }
@@ -115,6 +123,12 @@ pub struct LoopSlot {
     /// User part of `nudge_samples`.
     #[serde(default)]
     pub manual_nudge: i64,
+    /// Transient-detector sensitivity used for this loop, 0..1.
+    #[serde(default = "default_sensitivity")]
+    pub transient_sensitivity: f32,
+    /// Normalize this loop to -1 dBFS when it is exported.
+    #[serde(default)]
+    pub normalize: bool,
     /// Mono absolute peaks for the editor waveform.
     #[serde(default)]
     pub peaks: Vec<f32>,
@@ -205,6 +219,14 @@ pub enum RecorderAction {
         path: Option<String>,
         #[serde(default = "default_bit_depth")]
         bit_depth: u8,
+        /// Normalize the exported WAV to -1 dBFS.
+        #[serde(default)]
+        normalize: bool,
+    },
+    /// Change the transient-detector sensitivity and re-analyse the loop.
+    SetSensitivity {
+        slot: u32,
+        sensitivity: f32,
     },
     LoopRename {
         slot: u32,
@@ -380,10 +402,30 @@ pub fn detect_transient(
 /// log-magnitude changes, weighted towards the higher bins, then picks local
 /// maxima against a local adaptive threshold. The result is not capped at a
 /// small marker count, so the whole loop is scanned.
+///
+/// `sensitivity` is 0..1: higher values lower both the adaptive threshold and
+/// the absolute floor, so quieter attacks produce markers too.
 pub fn detect_transients(src: &[f32], frames: usize, sample_rate: u32) -> Vec<Transient> {
+    detect_transients_with_sensitivity(src, frames, sample_rate, default_sensitivity())
+}
+
+pub fn detect_transients_with_sensitivity(
+    src: &[f32],
+    frames: usize,
+    sample_rate: u32,
+    sensitivity: f32,
+) -> Vec<Transient> {
     if frames < 256 || sample_rate == 0 {
         return Vec::new();
     }
+    let sensitivity = if sensitivity.is_finite() {
+        sensitivity.clamp(0.0, 1.0)
+    } else {
+        default_sensitivity()
+    };
+    // 2.5σ at 0, 0.5σ at 1; floor 0.05 down to 0.005.
+    let threshold_multiplier = 2.5 - 2.0 * sensitivity;
+    let threshold_floor = 0.05 - 0.045 * sensitivity;
     let fft_size = if frames >= 2048 {
         1024
     } else {
@@ -460,7 +502,7 @@ pub fn detect_transients(src: &[f32], frames: usize, sample_rate: u32) -> Vec<Tr
         let sum_sq = prefix_sq[to] - prefix_sq[from];
         let mean = sum / count;
         let variance = (sum_sq / count - mean * mean).max(0.0);
-        (mean + 1.5 * variance.sqrt()) as f32
+        (mean + threshold_multiplier as f64 * variance.sqrt()) as f32
     };
 
     let min_gap = (sample_rate as usize * 30 / 1000).max(hop);
@@ -468,7 +510,7 @@ pub fn detect_transients(src: &[f32], frames: usize, sample_rate: u32) -> Vec<Tr
     let mut last = usize::MAX;
     for i in 0..normalized.len() {
         let value = normalized[i];
-        if value < 0.02 || value < threshold_at(i) {
+        if value < threshold_floor || value < threshold_at(i) {
             continue;
         }
         let from = i.saturating_sub(2);
@@ -586,6 +628,29 @@ mod tests {
                 found.iter().map(|t| t.frame).collect::<Vec<_>>()
             );
         }
+    }
+
+    #[test]
+    fn sensitivity_lowers_the_threshold() {
+        let sample_rate = 48_000u32;
+        let frames = sample_rate as usize;
+        let mut src = vec![0.0f32; frames * 2];
+        // One loud onset and one quiet one.
+        for (onset, level) in [(9_600usize, 0.8f32), (28_800, 0.03)] {
+            for i in onset..onset + 48 {
+                src[i * 2] = level;
+                src[i * 2 + 1] = level;
+            }
+        }
+        let low = detect_transients_with_sensitivity(&src, frames, sample_rate, 0.0);
+        let high = detect_transients_with_sensitivity(&src, frames, sample_rate, 1.0);
+        assert!(
+            high.len() >= low.len(),
+            "high={} low={}",
+            high.len(),
+            low.len()
+        );
+        assert!(high.iter().any(|t| t.frame.abs_diff(28_800) < 512));
     }
 
     #[test]

@@ -31,14 +31,16 @@ small OSC control protocol.
 - Metering with selectable taps (strip IN/GAIN/OUT; bus IN/SEND/RET/OUT).
 - **Loop recorder** with bar-aligned capture from the MIDI clock, multi-source
   strip/bus taps, automatic latency and transient alignment, circular nudge,
-  a loop launcher, a chosen save folder with timestamped WAV names, and
-  16/24-bit or 32-bit float export. The editor is a free pan/zoom waveform:
+  a loop launcher, a native save dialog that remembers the last folder, optional
+  -1 dBFS normalization, and 16/24-bit or 32-bit float export. The editor is a
+  free pan/zoom waveform:
   drag horizontally to pan and vertically to zoom (or use the wheel and the
   `−`/`+`/`samples` buttons), Alt-drag to nudge (Shift = one sample/pixel), and
   Ctrl+click a transient marker to make it the loop start. Spectral-flux onset detection and a high-frequency energy strip expose
   transients even on compressed/saturated material; when zoomed in far enough
-  the editor draws the actual samples. A musical ruler and a "zero seam" snap
-  help with alignment and clicks.
+  the editor draws the actual samples. A per-loop sensitivity slider tunes the
+  detector, and a musical ruler and a "zero seam" snap help with alignment and
+  clicks.
 
 ## Using the UI
 
@@ -60,17 +62,19 @@ small OSC control protocol.
   tap for each strip), arms the recorder, and starts on the next bar 1 from the
   MIDI clock. The editor opens the take with auto-latency and transient
   offsets, fine/coarse circular nudge, and a WAV save at 16/24-bit or 32-bit
-  float. `Options → Loops…` is the launcher: play/stop (quantized to the next
-  bar), gain, mute and edit. Loops are saved to the folder chosen in the
-  recorder/editor (default `VIBEMIX_CONFIG_DIR/loops/`) with a timestamped
-  filename. The editor's waveform zooms to the whole loop, its start, or its
-  end. Drag horizontally to pan and vertically to zoom, Alt-drag to nudge
-  (Shift = one sample per pixel), or type an exact manual value. Transient
-  markers can be clicked with Ctrl to make that hit the loop start; "snap
-  first" and "zero seam" are shortcuts. The HF strip shows high-frequency
-  energy; close zoom (or the `samples` button) draws raw samples, which is where
-  high-frequency detail becomes visible. The window is refreshed while nudging
-  and panning. A MIDI clock is required to record.
+  float. Saving opens a normal file dialog (the last folder is remembered in the
+  session) and can normalize the export to -1 dBFS. `Options → Loops…` is the
+  launcher: play/stop (quantized to the next bar), gain, mute and edit. The
+  editor's waveform zooms to the whole loop, its start, or its end. Drag
+  horizontally to pan and vertically to zoom, Alt-drag to nudge (Shift = one
+  sample per pixel), or type an exact manual value. Transient markers can be
+  clicked with Ctrl to make that hit the loop start; "snap first" and "zero
+  seam" are shortcuts, and the sensitivity slider re-runs the detector on that
+  loop. The HF strip shows high-frequency energy; close zoom (or the `samples`
+  button) draws raw samples, which is where high-frequency detail becomes
+  visible. Panning and zooming settle for 120 ms before requesting a new
+  resolution, so the waveform moves smoothly. A MIDI clock is required to
+  record.
 - **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
   matrix; pick the device on each axis. Tick a cell to connect. Only
   connections involving vibemix ports are editable.

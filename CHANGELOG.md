@@ -141,17 +141,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   automatic JACK/plugin latency compensation, optional transient alignment and
   a circular manual nudge, and can be saved as 16-bit, 24-bit or 32-bit float
   WAV. `Options → Loops…` is a separate launcher window with quantized
-  play/stop, gain, mute and an editor. The save folder is chosen in the GUI and
-  remembered; filenames include a timestamp. The editor requests a
+  play/stop, gain, mute and an editor. Saving uses a native file dialog and
+  remembers the last folder in the session; exports can be normalized to
+  -1 dBFS. The editor requests a
   high-resolution window for the visible range and uses a free pan/zoom view:
   drag horizontally to pan and vertically to zoom, Alt-drag to nudge (Shift =
   one sample per pixel), or type an exact value. Multiple transient markers are
   shown; Ctrl+click one to make it the loop start, or use "snap first"/"zero
   seam". Onsets now come from spectral flux (FFT) rather than amplitude, with a
   high-frequency energy strip and raw-sample drawing at close zoom. Wheel
-  zoom, ± buttons, and a "samples" button make the raw view easy to reach. The visible
-  window is re-requested at the preview nudge while dragging, so it stays
-  sharp. Loops are stored in the session and
+  zoom, ± buttons, and a "samples" button make the raw view easy to reach. Each
+  loop has a sensitivity slider for the detector, and pan/zoom waits 120 ms for
+  the gesture to settle before requesting a new resolution, so the waveform
+  moves smoothly. Loops are stored in the session and
   under `VIBEMIX_CONFIG_DIR/loops/` by default.
 
 ## [1.0.2] - 2026-10-22

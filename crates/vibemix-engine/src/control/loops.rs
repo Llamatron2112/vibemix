@@ -43,6 +43,9 @@ pub(super) fn sanitize_file_name(name: &str) -> String {
 }
 
 /// Write an interleaved stereo loop, applying the circular nudge first.
+///
+/// When `normalize` is set, the rotated buffer is scaled so its peak sits at
+/// -1 dBFS (0.891251). Silent buffers are left alone.
 pub(super) fn write_loop_wav(
     path: &Path,
     raw: &[f32],
@@ -50,6 +53,7 @@ pub(super) fn write_loop_wav(
     sample_rate: u32,
     bit_depth: u8,
     nudge: i64,
+    normalize: bool,
 ) -> anyhow::Result<()> {
     // Same rule as sessions: never replace an existing file that is not a WAV.
     if let Ok(mut existing) = fs::File::open(path) {
@@ -77,7 +81,21 @@ pub(super) fn write_loop_wav(
         },
     };
     let mut writer = hound::WavWriter::create(path, spec)?;
-    let rotated = rotate_interleaved(raw, frames, nudge);
+    let mut rotated = rotate_interleaved(raw, frames, nudge);
+    if normalize {
+        let peak = rotated
+            .iter()
+            .copied()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        // About -60 dBFS: treating near-silence as normalizable would just
+        // amplify noise.
+        if peak > 1.0e-3 {
+            let gain = 0.891_250_9 / peak;
+            for sample in &mut rotated {
+                *sample *= gain;
+            }
+        }
+    }
     for sample in rotated {
         match depth {
             16 => writer.write_sample((sample.clamp(-1.0, 1.0) * i16::MAX as f32).round() as i16)?,
@@ -326,7 +344,12 @@ impl Controller {
         } else {
             0
         };
-        let transients = detect_transients(&raw, frames, sample_rate);
+        let transients = detect_transients_with_sensitivity(
+            &raw,
+            frames,
+            sample_rate,
+            self.model.recorder.transient_sensitivity,
+        );
         let transient = if self.model.recorder.transient {
             let window = sample_rate as i64 / 10;
             transients
@@ -368,6 +391,8 @@ impl Controller {
             base_nudge: base,
             transient_nudge: transient,
             manual_nudge: manual,
+            transient_sensitivity: self.model.recorder.transient_sensitivity,
+            normalize: false,
             peaks: loop_peaks,
             gain: 1.0,
             mute: false,
@@ -460,7 +485,11 @@ impl Controller {
         }
     }
 
-    pub(super) fn handle_recorder_action(&mut self, action: RecorderAction) {
+    pub(super) fn handle_recorder_action(&mut self, action: RecorderAction) -> bool {
+        let snapshot = matches!(
+            action,
+            RecorderAction::LoopSave { .. } | RecorderAction::SetSensitivity { .. }
+        );
         match action {
             RecorderAction::Arm => self.arm_recorder(),
             RecorderAction::Cancel | RecorderAction::Stop => {
@@ -540,12 +569,39 @@ impl Controller {
                 self.snap_transient(slot, frame);
             }
             RecorderAction::SnapSeam { slot } => self.snap_loop_seam(slot),
+            RecorderAction::SetSensitivity { slot, sensitivity } => {
+                self.set_loop_sensitivity(slot, sensitivity)
+            }
             RecorderAction::LoopSave {
                 slot,
                 path,
                 bit_depth,
-            } => self.save_loop(slot, path, bit_depth),
+                normalize,
+            } => self.save_loop(slot, path, bit_depth, normalize),
         }
+        snapshot
+    }
+
+    /// Change a loop's transient sensitivity and re-run the detector.
+    pub(super) fn set_loop_sensitivity(&mut self, slot: u32, sensitivity: f32) {
+        let sensitivity = if sensitivity.is_finite() {
+            sensitivity.clamp(0.0, 1.0)
+        } else {
+            vibemix_core::recorder::default_sensitivity()
+        };
+        let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) else {
+            return;
+        };
+        let frames = runtime.slot.frames as usize;
+        let sample_rate = runtime.slot.sample_rate;
+        runtime.slot.transient_sensitivity = sensitivity;
+        runtime.transients =
+            detect_transients_with_sensitivity(&runtime.raw, frames, sample_rate, sensitivity);
+        // New takes start from the sensitivity the user last settled on.
+        self.model.recorder.transient_sensitivity = sensitivity;
+        self.rebuild_model_loops();
+        self.loops_dirty = true;
+        self.recorder_dirty = true;
     }
 
     pub(super) fn set_loop_nudge(&mut self, slot: u32, manual: i64) {
@@ -612,7 +668,13 @@ impl Controller {
         self.recorder_dirty = true;
     }
 
-    pub(super) fn save_loop(&mut self, slot: u32, path: Option<String>, bit_depth: u8) {
+    pub(super) fn save_loop(
+        &mut self,
+        slot: u32,
+        path: Option<String>,
+        bit_depth: u8,
+        normalize: bool,
+    ) {
         let save_dir = self.model.recorder.save_dir.clone();
         let Some(runtime) = self.loops.get(slot as usize).and_then(Option::as_ref) else {
             return;
@@ -645,11 +707,19 @@ impl Controller {
             sample_rate,
             bit_depth,
             runtime.slot.nudge_samples,
+            normalize,
         ) {
             Ok(()) => {
+                let saved_dir = path
+                    .parent()
+                    .map(|parent| parent.to_string_lossy().into_owned());
                 if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
                     runtime.slot.path = Some(path.to_string_lossy().into_owned());
                     runtime.slot.saved = true;
+                    runtime.slot.normalize = normalize;
+                }
+                if let Some(dir) = saved_dir {
+                    self.model.recorder.save_dir = dir;
                 }
                 self.model.recorder.bit_depth = bit_depth;
                 self.rebuild_model_loops();
@@ -713,7 +783,12 @@ impl Controller {
                         .set_loop(index, raw.clone().into_boxed_slice(), frames)
                         .is_ok()
                     {
-                        let transients = detect_transients(&raw, frames, sample_rate);
+                        let transients = detect_transients_with_sensitivity(
+                            &raw,
+                            frames,
+                            sample_rate,
+                            slot.transient_sensitivity,
+                        );
                         self.loops[index] = Some(LoopRuntime {
                             slot,
                             raw,
@@ -742,7 +817,7 @@ mod wav_tests {
         let raw = vec![0.0, 0.5, -0.25, 0.125, 0.75, -0.75, 0.0, 0.0];
         for depth in [16u8, 24, 32] {
             let path = dir.join(format!("loop-{depth}.wav"));
-            write_loop_wav(&path, &raw, 4, 48_000, depth, 0).unwrap();
+            write_loop_wav(&path, &raw, 4, 48_000, depth, 0, false).unwrap();
             let (read, frames) = read_loop_wav(&path, 48_000).unwrap();
             assert_eq!(frames, 4);
             assert_eq!(read.len(), raw.len());
@@ -751,6 +826,21 @@ mod wav_tests {
                 assert!((a - b).abs() <= tolerance, "{depth}: {a} vs {b}");
             }
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn normalize_reaches_minus_one_dbfs() {
+        let dir = std::env::temp_dir().join(format!("vibemix-wav-norm-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let raw = vec![0.0, 0.1, 0.2, -0.05, 0.0, 0.0, 0.0, 0.0];
+        let path = dir.join("norm.wav");
+        write_loop_wav(&path, &raw, 4, 48_000, 32, 0, true).unwrap();
+        let (read, _) = read_loop_wav(&path, 48_000).unwrap();
+        let peak = read
+            .iter()
+            .fold(0.0f32, |peak, sample| peak.max(sample.abs()));
+        assert!((peak - 0.891_250_9).abs() < 1.0e-4, "peak={peak}");
         fs::remove_dir_all(&dir).unwrap();
     }
 }

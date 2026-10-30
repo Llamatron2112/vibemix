@@ -832,6 +832,7 @@ ApplicationWindow {
             save_dir: r.save_dir || "",
             auto_latency: r.auto_latency !== false,
             transient: r.transient !== false,
+            transient_sensitivity: (r.transient_sensitivity !== undefined) ? r.transient_sensitivity : 0.5,
             nudge_samples: r.nudge_samples || 0,
             crossfade_ms: r.crossfade_ms || 0
         }
@@ -851,7 +852,7 @@ ApplicationWindow {
     }
     function loopFolderUrl() {
         var folder = root.loopFolder()
-        return folder.length > 0 ? "file://" + folder : "file:///"
+        return folder.length > 0 ? "file://" + encodeURI(folder) : "file:///"
     }
     function openRecorder() {
         var selected = root.recorderSettings().sources
@@ -926,8 +927,28 @@ ApplicationWindow {
     function toggleLoopMute(slot) {
         root.sendRecorderAction({ action: "set_loop_mute", slot: slot.id, mute: !slot.mute })
     }
-    function saveLoop(slot, bitDepth) {
-        root.sendRecorderAction({ action: "loop_save", slot: slot.id, path: null, bit_depth: bitDepth })
+    function saveLoop(slot, bitDepth, normalize) {
+        if (!slot) return
+        loopEditor.saveDepth = bitDepth
+        loopEditor.saveNormalize = normalize
+        var folder = root.loopFolder()
+        var base = String(slot.name || "loop").replace(/[^A-Za-z0-9_-]+/g, "-")
+        if (base.length === 0) base = "loop"
+        var prefix = folder.length > 0 ? "file://" + encodeURI(folder.replace(/\/$/, "")) : "file://"
+        loopSaveDialog.currentFile = prefix + "/" + base + ".wav"
+        loopSaveDialog.open()
+    }
+    function commitLoopSave(url) {
+        var slot = loopEditor.currentSlot()
+        if (!slot) return
+        var path = root.localPath(url)
+        root.sendRecorderAction({
+            action: "loop_save",
+            slot: slot.id,
+            path: path,
+            bit_depth: loopEditor.saveDepth,
+            normalize: loopEditor.saveNormalize
+        })
     }
     function renameLoop(slot, name) {
         root.sendRecorderAction({ action: "loop_rename", slot: slot.id, name: name })
@@ -1634,11 +1655,14 @@ ApplicationWindow {
         }
     }
 
-    FolderDialog {
-        id: loopFolderDialog
-        title: "Loop folder"
+    FileDialog {
+        id: loopSaveDialog
+        title: "Save loop"
+        fileMode: FileDialog.SaveFile
+        defaultSuffix: "wav"
+        nameFilters: ["WAV (*.wav)", "All files (*)"]
         currentFolder: root.loopFolderUrl()
-        onAccepted: root.updateRecorderSetting("save_dir", root.localPath(selectedFolder))
+        onAccepted: root.commitLoopSave(selectedFile)
     }
 
     Dialog {
@@ -5632,25 +5656,6 @@ ApplicationWindow {
                 }
             }
 
-            RowLayout {
-                Label {
-                    text: "folder"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                Label {
-                    Layout.fillWidth: true
-                    text: root.loopFolder().length > 0 ? root.loopFolder() : "default"
-                    color: root.mutedText
-                    font.pixelSize: 10
-                    elide: Text.ElideMiddle
-                }
-                FlatButton {
-                    text: "browse…"
-                    onClicked: loopFolderDialog.open()
-                }
-            }
-
             ProgressBar {
                 Layout.fillWidth: true
                 from: 0
@@ -5843,6 +5848,10 @@ ApplicationWindow {
         property bool applying: false
         property int waveSeq: 0
         property int acceptedSeq: 0
+        property int saveDepth: 24
+        property bool saveNormalize: false
+        property real sensitivity: 0.5
+        property bool sensitivityDirty: false
 
         function currentSlot() { return root.loopById(slotId) }
         function currentManual() {
@@ -5933,14 +5942,35 @@ ApplicationWindow {
             requestWaveform(null, true)
             ruler.requestPaint()
         }
-        function zoomBy(factor, anchorFrac) {
+        function setSpanLive(span, anchorFrame) {
+            var slot = currentSlot()
+            if (!slot) return
+            var frames = Math.max(1, slot.frames)
+            var minSpan = Math.min(frames, 16)
+            var next = Math.max(minSpan, Math.min(frames, Math.round(span)))
+            var anchor = Math.max(0, Math.min(frames, anchorFrame))
+            var start = Math.max(0, Math.min(frames - next, anchor - next * 0.5))
+            var view = clampView(start, start + next)
+            viewStart = view.start
+            viewEnd = view.end
+            // Keep the previous peaks stretched over the new window until the
+            // settle timer asks for the matching resolution.
+            waveStart = view.start
+            waveEnd = view.end
+            waveSamples = []
+            waveHf = []
+            settleTimer.restart()
+            ruler.requestPaint()
+        }
+        function zoomBy(factor, anchorFrac, defer) {
             var slot = currentSlot()
             if (!slot) return
             var frames = Math.max(1, slot.frames)
             var span = Math.max(1, viewEnd - viewStart)
             var anchor = viewStart + anchorFrac * span
             var next = span * factor
-            setSpan(next, anchor)
+            if (defer) setSpanLive(next, anchor)
+            else setSpan(next, anchor)
         }
         function zoomToSamples() {
             var slot = currentSlot()
@@ -6005,6 +6035,16 @@ ApplicationWindow {
             applying = true
             root.sendRecorderAction({ action: "snap_seam", slot: slot.id })
         }
+        function commitSensitivity() {
+            var slot = currentSlot()
+            if (!slot || !sensitivityDirty) return
+            sensitivityDirty = false
+            root.sendRecorderAction({
+                action: "set_sensitivity",
+                slot: slot.id,
+                sensitivity: sensitivity
+            })
+        }
         function openFor(id) {
             slotId = id
             editorPeaks = []
@@ -6023,6 +6063,12 @@ ApplicationWindow {
             applying = false
             waveSeq = 0
             acceptedSeq = 0
+            var opened = root.loopById(id)
+            sensitivity = opened && opened.transient_sensitivity !== undefined
+                ? opened.transient_sensitivity : 0.5
+            sensitivityDirty = false
+            saveDepth = root.recorderSettings().bit_depth
+            saveNormalize = opened ? opened.normalize === true : false
             requestBase()
             requestWaveform(null, true)
             visible = true
@@ -6303,10 +6349,30 @@ ApplicationWindow {
                         if (!loopEditor.visible) return
                         if (loopEditor.dragging) {
                             loopEditor.requestWaveform(loopEditor.displayTotal(), false)
-                        } else if (loopEditor.navigating) {
-                            loopEditor.requestWaveform(null, true)
                         }
                     }
+                }
+
+                // Navigation updates the view continuously but only asks for a
+                // new resolution once the gesture settles; the previous peaks
+                // are stretched in the meantime so the image moves smoothly.
+                Timer {
+                    id: settleTimer
+                    interval: 120
+                    repeat: false
+                    running: false
+                    onTriggered: {
+                        if (!loopEditor.visible || loopEditor.dragging) return
+                        loopEditor.requestWaveform(null, false)
+                    }
+                }
+
+                Timer {
+                    id: sensitivityTimer
+                    interval: 220
+                    repeat: false
+                    running: false
+                    onTriggered: loopEditor.commitSensitivity()
                 }
 
                 MouseArea {
@@ -6342,6 +6408,7 @@ ApplicationWindow {
                         } else {
                             loopEditor.navigating = true
                             loopEditor.dragging = false
+                            settleTimer.stop()
                             pressViewStart = loopEditor.viewStart
                             pressViewEnd = loopEditor.viewEnd
                         }
@@ -6374,12 +6441,17 @@ ApplicationWindow {
                                 var frac = mouse.x / Math.max(1, width)
                                 var anchor = pressViewStart + frac * span0 + pan
                                 var newStart = Math.max(0, Math.min(frames - newSpan, anchor - frac * newSpan))
-                                loopEditor.viewStart = newStart
-                                loopEditor.viewEnd = newStart + newSpan
-                                loopEditor.waveStart = loopEditor.viewStart
-                                loopEditor.waveEnd = loopEditor.viewEnd
-                                loopEditor.editorPeaks = []
-                                requestTimer.start()
+                                var view = loopEditor.clampView(newStart, newStart + newSpan)
+                                loopEditor.viewStart = view.start
+                                loopEditor.viewEnd = view.end
+                                loopEditor.waveStart = view.start
+                                loopEditor.waveEnd = view.end
+                                // Keep the last peaks and stretch them over the
+                                // new window; the resolution request follows
+                                // once the gesture settles.
+                                loopEditor.waveSamples = []
+                                loopEditor.waveHf = []
+                                settleTimer.restart()
                                 ruler.requestPaint()
                             }
                         }
@@ -6402,6 +6474,7 @@ ApplicationWindow {
                             }
                             loopEditor.requestWaveform(null, false)
                         } else if (loopEditor.navigating) {
+                            settleTimer.stop()
                             loopEditor.navigating = false
                             if (!moved && (mouse.modifiers & Qt.ControlModifier)) {
                                 var total = loopEditor.displayTotal()
@@ -6422,7 +6495,7 @@ ApplicationWindow {
                                 }
                                 if (best >= 0) loopEditor.snapTransient(best)
                             } else if (moved) {
-                                loopEditor.requestWaveform(null, true)
+                                loopEditor.requestWaveform(null, false)
                             }
                         }
                         editorWave.requestPaint()
@@ -6430,6 +6503,7 @@ ApplicationWindow {
                     }
                     onCanceled: {
                         requestTimer.stop()
+                        settleTimer.stop()
                         loopEditor.dragging = false
                         loopEditor.navigating = false
                         loopEditor.applying = false
@@ -6443,7 +6517,7 @@ ApplicationWindow {
                         var delta = wheel.angleDelta.y
                         if (delta === 0) return
                         var factor = Math.pow(1.25, -delta / 120)
-                        loopEditor.zoomBy(factor, mouse.x / Math.max(1, width))
+                        loopEditor.zoomBy(factor, mouse.x / Math.max(1, width), true)
                         wheel.accepted = true
                     }
                 }
@@ -6513,6 +6587,38 @@ ApplicationWindow {
                     color: root.mutedText
                     font.pixelSize: 10
                     elide: Text.ElideRight
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 4
+                Label {
+                    text: "sensitivity"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                Slider {
+                    Layout.fillWidth: true
+                    from: 0
+                    to: 1
+                    value: loopEditor.sensitivity
+                    onMoved: {
+                        loopEditor.sensitivity = value
+                        loopEditor.sensitivityDirty = true
+                        sensitivityTimer.restart()
+                    }
+                    onPressedChanged: {
+                        if (!pressed) {
+                            sensitivityTimer.stop()
+                            loopEditor.commitSensitivity()
+                        }
+                    }
+                }
+                Label {
+                    text: Math.round(loopEditor.sensitivity * 100) + "%"
+                    color: root.mutedText
+                    font.pixelSize: 10
                 }
             }
 
@@ -6653,26 +6759,6 @@ ApplicationWindow {
             RowLayout {
                 Layout.fillWidth: true
                 Label {
-                    text: "folder"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                Label {
-                    Layout.fillWidth: true
-                    text: root.loopFolder().length > 0 ? root.loopFolder() : "default"
-                    color: root.mutedText
-                    font.pixelSize: 10
-                    elide: Text.ElideMiddle
-                }
-                FlatButton {
-                    text: "browse…"
-                    onClicked: loopFolderDialog.open()
-                }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                Label {
                     text: "bit depth"
                     color: root.textColor
                     font.pixelSize: 11
@@ -6682,19 +6768,23 @@ ApplicationWindow {
                     Layout.preferredWidth: 120
                     font.pixelSize: 11
                     model: ["16-bit", "24-bit", "32-bit float"]
-                    currentIndex: {
-                        var slot = root.loopById(loopEditor.slotId)
-                        var depth = slot ? (slot.bit_depth || root.recorderSettings().bit_depth) : 24
-                        return depth === 16 ? 0 : (depth === 32 ? 2 : 1)
+                    currentIndex: loopEditor.saveDepth === 16 ? 0 : (loopEditor.saveDepth === 32 ? 2 : 1)
+                    onActivated: {
+                        var depths = [16, 24, 32]
+                        loopEditor.saveDepth = depths[index]
                     }
                 }
+                CheckBox {
+                    text: "normalize −1 dBFS"
+                    checked: loopEditor.saveNormalize
+                    onToggled: loopEditor.saveNormalize = checked
+                }
                 FlatButton {
-                    text: "save"
+                    text: "save…"
                     onClicked: {
                         var slot = root.loopById(loopEditor.slotId)
                         if (!slot) return
-                        var depths = [16, 24, 32]
-                        root.saveLoop(slot, depths[editorDepth.currentIndex])
+                        root.saveLoop(slot, loopEditor.saveDepth, loopEditor.saveNormalize)
                     }
                 }
                 Label {

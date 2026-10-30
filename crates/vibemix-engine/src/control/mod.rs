@@ -19,8 +19,9 @@ use vibemix_core::model::{
 };
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_core::recorder::{
-    detect_transient, detect_transients, peaks, rotate_interleaved, snap_seam, LoopSlot,
-    LoopWaveform, RecorderAction, RecorderSettings, RecorderSource, RecorderStatus, Transient,
+    detect_transient, detect_transients_with_sensitivity, peaks, rotate_interleaved, snap_seam,
+    LoopSlot, LoopWaveform, RecorderAction, RecorderSettings, RecorderSource, RecorderStatus,
+    Transient,
 };
 use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 
@@ -1615,10 +1616,14 @@ impl Controller {
                 }
             }
             ControlMessage::RecorderAction { json } => {
+                let mut snapshot = false;
                 if let Ok(action) = serde_json::from_str::<RecorderAction>(&json) {
-                    self.handle_recorder_action(action);
+                    snapshot = self.handle_recorder_action(action);
                 }
-                Actions::default()
+                Actions {
+                    snapshot,
+                    catalog: false,
+                }
             }
             ControlMessage::RecorderStatus { .. }
             | ControlMessage::LoopList { .. }
