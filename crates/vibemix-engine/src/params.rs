@@ -161,8 +161,10 @@ impl SharedParams {
     }
 
     pub fn set_clock_bpm_milli(&self, value: u32) {
-        self.clock_bpm_milli
-            .store(value.clamp(20_000, 400_000), Ordering::Relaxed);
+        // Master tempo has 0.01 BPM resolution.
+        let value = value.clamp(20_000, 400_000);
+        let rounded = ((value + 5) / 10) * 10;
+        self.clock_bpm_milli.store(rounded, Ordering::Relaxed);
     }
 
     pub fn beats_per_bar(&self) -> f32 {

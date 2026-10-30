@@ -1467,7 +1467,7 @@ ApplicationWindow {
                         id: bpmReadout
                         visible: root.transportUi().bpm
                         text: root.clockMaster()
-                            ? root.clockSettings().bpm.toFixed(3) + " BPM"
+                            ? root.clockSettings().bpm.toFixed(2) + " BPM"
                             : root.clockInfo().bpm.toFixed(1) + " BPM"
                         color: root.clockMaster()
                             ? root.accentColor
@@ -1764,7 +1764,7 @@ ApplicationWindow {
         anchors.centerIn: parent
         width: 300
         standardButtons: Dialog.Ok | Dialog.Cancel
-        onAboutToShow: tempoValue.value = Math.round(root.clockSettings().bpm * 1000)
+        onAboutToShow: tempoValue.value = Math.round(root.clockSettings().bpm * 100) * 10
         onAccepted: backend.setClockBpm(tempoValue.value / 1000)
         contentItem: ColumnLayout {
             width: tempoDialog.availableWidth
@@ -1780,17 +1780,17 @@ ApplicationWindow {
                 Layout.fillWidth: true
                 from: 20000
                 to: 400000
-                stepSize: 1
+                stepSize: 10
                 editable: true
-                textFromValue: function(value) { return (value / 1000).toFixed(3) }
+                textFromValue: function(value) { return (value / 1000).toFixed(2) }
                 valueFromText: function(text) {
                     var value = Number(text)
-                    return isNaN(value) ? tempoValue.value : Math.round(value * 1000)
+                    return isNaN(value) ? tempoValue.value : Math.round(value * 100) * 10
                 }
             }
             Label {
                 Layout.fillWidth: true
-                text: "20.000 – 400.000 BPM, saved with the session"
+                text: "20.00 – 400.00 BPM, saved with the session"
                 color: root.mutedText
                 font.pixelSize: 10
             }

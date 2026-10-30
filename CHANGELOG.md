@@ -146,10 +146,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **MIDI clock master/slave.** `Options → MIDI clock` switches between
   following `midi_in` and generating a 24 PPQN clock internally. As master, the
-  BPM readout sets the tempo and the transport button starts/stops the clock;
-  the output goes to a new JACK `midi_out` port. Pulse timing is generated in
-  the audio callback from an integer phase accumulator, so it is sample-accurate
-  and does not drift, with `START`/`STOP` and a reset-to-zero stop.
+  BPM readout sets the tempo (0.01 BPM resolution) and the transport button
+  starts/stops the clock; the output goes to a new JACK `midi_out` port. Pulse
+  timing is generated in the audio callback from an integer phase accumulator,
+  so it is sample-accurate and does not drift, with `START`/`STOP` and a
+  reset-to-zero stop.
 - **MIDI routing** (`Options → MIDI routing…`): connect external MIDI outputs
   to `midi_in` and `midi_out` to external MIDI inputs; the output patch is
   saved with the session.

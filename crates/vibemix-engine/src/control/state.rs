@@ -171,7 +171,8 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
     } else {
         120.0
     };
-    params.set_clock_bpm_milli((clock_bpm * 1000.0).round() as u32);
+    let clock_milli = (clock_bpm * 100.0).round() as u32 * 10;
+    params.set_clock_bpm_milli(clock_milli);
     for index in 0..params.strip_count() {
         params.set_strip_active(index, false);
     }
@@ -362,7 +363,7 @@ pub(super) fn load_session(path: &str) -> Result<MixerModel, String> {
     if !model.clock.bpm.is_finite() {
         model.clock.bpm = 120.0;
     }
-    model.clock.bpm = model.clock.bpm.clamp(20.0, 400.0);
+    model.clock.bpm = (model.clock.bpm.clamp(20.0, 400.0) * 100.0).round() / 100.0;
     // Sessions saved before the master bus was capitalised still say "master".
     if let Some(master) = model.buses.iter_mut().find(|bus| bus.id.0 == 0) {
         if master.name == "master" {

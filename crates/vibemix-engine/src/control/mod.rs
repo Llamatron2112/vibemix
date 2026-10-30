@@ -1706,7 +1706,7 @@ impl Controller {
                 } else {
                     120.0
                 };
-                let milli = (bpm * 1000.0).round() as u32;
+                let milli = (bpm * 100.0).round() as u32 * 10;
                 self.params.set_clock_bpm_milli(milli);
                 self.model.clock.bpm = milli as f32 / 1000.0;
                 Actions {
