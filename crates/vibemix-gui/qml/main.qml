@@ -744,12 +744,12 @@ ApplicationWindow {
 
     function transportUi() {
         var t = mix.transport_ui
-        return t ? t : ({ beats: true, bpm: true, stability: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8, autosize: false })
+        return t ? t : ({ beats: true, bpm: true, stability: true, dsp: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8, autosize: false })
     }
     function setTransportUi(patch) {
         var t = root.transportUi()
         var next = {
-            beats: t.beats, bpm: t.bpm, stability: t.stability, time: t.time,
+            beats: t.beats, bpm: t.bpm, stability: t.stability, dsp: t.dsp !== false, time: t.time,
             loop_indicator: t.loop_indicator,
             loop_bars: t.loop_bars, loop_length: t.loop_length,
             autosize: t.autosize
@@ -1531,7 +1531,7 @@ ApplicationWindow {
                         id: dspLabel
                         // Audio-callback load: average, with the recent peak in the tooltip.
                         text: "DSP " + Math.round(backend.dsp_load / 10) + "%"
-                        visible: backend.connected
+                        visible: backend.connected && root.transportUi().dsp !== false
                         color: backend.dsp_peak >= 900 ? "#e53935"
                              : backend.dsp_load >= 600 ? "#fb8c00"
                              : root.mutedText
@@ -1575,6 +1575,12 @@ ApplicationWindow {
                         checkable: true
                         checked: root.transportUi().stability
                         onTriggered: root.setTransportUi({ stability: !root.transportUi().stability })
+                    }
+                    MenuItem {
+                        text: "DSP usage readout"
+                        checkable: true
+                        checked: root.transportUi().dsp !== false
+                        onTriggered: root.setTransportUi({ dsp: root.transportUi().dsp === false })
                     }
                     MenuItem {
                         text: "Beats:bars counter"

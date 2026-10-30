@@ -311,6 +311,9 @@ pub struct TransportUi {
     /// MIDI clock stability (tempo jitter + glitches) readout.
     #[serde(default = "default_true")]
     pub stability: bool,
+    /// Audio-callback (DSP) load readout.
+    #[serde(default = "default_true")]
+    pub dsp: bool,
     #[serde(default)]
     pub time: bool,
     #[serde(default)]
@@ -339,6 +342,7 @@ impl Default for TransportUi {
             beats: true,
             bpm: true,
             stability: true,
+            dsp: true,
             time: false,
             loop_indicator: false,
             loop_bars: false,
