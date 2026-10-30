@@ -6,6 +6,134 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Fixed
+
+- **Mute/fader smoothing** was applied once per audio block, so mute took
+  seconds to fully silence and steps were audible at large buffer sizes. Gains,
+  pan and send delays now use time-based smoothing with per-sample ramps, so
+  behaviour no longer depends on the period; mute reaches exact silence.
+- **The control socket is now a Unix socket in a private directory** instead of
+  a localhost UDP port that every local process could use. The engine listens on
+  `$XDG_RUNTIME_DIR/vibemix/engine.sock` (directory `0700`, socket `0600`, both
+  checked at startup), the GUI binds its own socket beside it, and the
+  filesystem permissions decide who may talk to the engine. `--osc-port` and
+  `VIBEMIX_OSC_PORT` are replaced by `--socket` and `VIBEMIX_SOCKET`. A second
+  engine on the same socket now exits with status 75 and the launcher reuses the
+  running one; a socket left by a crashed engine is replaced. Sends never block,
+  so a stalled GUI cannot stall the engine. Measured latency and throughput match
+  loopback UDP.
+- **A single malformed `/vibemix/meters` message could crash the receiver**
+  (`capacity overflow`, or an attempt to allocate gigabytes, from a length field
+  taken straight from the message). Found by the new fuzz tests; every length is
+  now validated against the arguments that arrived.
+- New fuzz tests for everything that parses outside data (control protocol and
+  chunk reassembly, editor-host IPC and framing, LV2 atoms, saved plugin state,
+  session files, plugin-sweep output). They run briefly in `cargo test`;
+  `just fuzz` runs them for millions of iterations.
+- New `just asan`: the plugin-host shims and editor host are built with
+  AddressSanitizer and UBSan, and the test suites, the engine under load with a
+  hostile message stream, every installed plugin's smoke test (471) and plugin
+  editors opening and closing all run clean. (The sanitizer runtime is
+  preloaded: linked last, it silently leaves heap checking off.)
+- **Closing the mixer with plugin editors open left the editor windows behind,
+  white and unresponsive.** Since the engine started shutting down cleanly, its
+  teardown freed the plugin instances before closing their editors and hung. It
+  now closes the editors first, and a 5 s watchdog ends the process if any
+  plugin teardown still hangs.
+- **Auto-fit flashed another window geometry** (briefly taller or shorter) when
+  a strip was added or removed. The window size now follows the content only
+  once it has settled, and the column count comes from the cards that exist, so
+  the window resizes once, straight to the final size.
+- **The GUI no longer freezes when the session changes.** Adding or removing a
+  strip, bus or plugin used to re-create every strip and bus card; with 64
+  strips and 32 buses one edit tied the GUI up for 40 to 180 s (about 1 s at 16
+  strips). The cards are now driven by id-only models that are updated
+  incrementally, so only the cards that changed are created or destroyed: the
+  same edits take about 2 s at the maximum size and 0.5 s at 16 strips. The
+  rendering is unchanged (checked pixel for pixel, including after live edits).
+- New `just gui-shot` recipe: a headless visual regression check for the GUI
+  (`--snapshot-to=<png>` saves the window; the script builds a fixed session,
+  captures it, and compares against a baseline with unstable pixels masked).
+- The engine no longer re-sends the whole plugin catalog (about 220 KB) every
+  second in answer to the GUI's state poll; it sends it to a new GUI and then
+  only every 30 s (which still repairs lost chunks).
+- New `just gui-load` recipe: starts the engine, a tone and the GUI on Qt's
+  offscreen platform (nothing audible) and reports GUI CPU per thread at 1, 16
+  and 64 strips, plus how long a structural edit ties the GUI up.
+- **Crash recovery.** The engine autosaves the session every 60 s (when it has
+  changed) and restores it on the next start if it did not shut down cleanly;
+  the launcher restarts a crashed engine (up to 3 times a minute) while the GUI
+  keeps running, and the GUI's connection indicator now turns red when the
+  engine goes quiet instead of staying green. A bug in one control-message
+  handler can no longer take the engine down (each message is panic-isolated).
+- **DSP load readout** in the status bar (callback time over the period, with
+  the recent peak in the tooltip), next to the xrun counter.
+- Delay lines are no longer zeroed (and all their pages faulted in) on the
+  audio thread the first time a send gets a delay; enabling 224 delays at once
+  used to spike the callback to 95% and could xrun.
+- **CLAP plugins allocated on the audio thread** (about two million `malloc`
+  calls in 15 s with one plugin loaded): the host shim rebuilt its event lists
+  every block, re-sent every parameter every block under a mutex, and resized
+  sidechain buffers on demand. It now uses only storage reserved at open, never
+  blocks, and sends parameters only when they change. Non-main CLAP buses also
+  get real silence/scratch buffers instead of null channel pointers. The new
+  `just rt-count` recipe measures audio-thread allocations including C/C++ code.
+- `write_sidechain` for VST3/CLAP clamps the frame count to the slices and the
+  shim buffers instead of trusting the caller.
+- Removing a strip or bus and then adding a plugin to the recycled slot could
+  allocate on the audio thread. Cleared chains now keep their capacity; `just
+  rt-guard` exercises this path (now for LV2, VST3 and CLAP plugins, with
+  auto-connect off).
+- Faders, mutes and plugin parameters changed by MIDI CC or keyboard bindings
+  were missing from saved sessions and undo snapshots.
+- Opening a session no longer trusts the `bundle` path stored in it for
+  VST3/CLAP plugins (it could have loaded an arbitrary library); the path now
+  always comes from plugin discovery.
+- Plugin state capture no longer passes audio through dry (bypassing limiters)
+  while saving, and bus chains are now paused too.
+- Sessions and config files are written atomically, so a crash or full disk
+  cannot truncate them.
+- The engine handles SIGINT/SIGTERM by shutting down cleanly (the launcher's stop
+  signal used to skip all cleanup and could leave a plugin sweep running in the
+  background), and a plugin sweep no longer loses its last results if its
+  process exits before the output is read.
+- LV2 plugins with a worker now get the `end_run` callback the worker spec
+  requires.
+- Loop launcher: gain, mute and stop now ramp instead of switching hard (a stop
+  fades out over a few ms), and a muted loop keeps running silently so it is
+  still on the bar when unmuted.
+- The MIDI clock tempo no longer takes a while to recover (or reads wildly off)
+  after the clock drops out and resumes; the recorder no longer logs from the
+  audio thread when it discards a take.
+- Toggling a plugin's bypass now crossfades between the dry and processed signal
+  (about 10 ms) instead of switching hard, so it no longer clicks.
+- The engine refuses to overwrite an existing file that is not a vibemix session
+  (or, for loop exports, a WAV), since the local control socket is unauthenticated.
+- The engine exits when the JACK/PipeWire server goes away instead of idling.
+- NaN/Inf from a plugin is replaced by silence; the chunk reassembler and UI
+  host framing reject absurd sizes.
+- Adding or pasting a plugin no longer freezes the control loop (meters,
+  faders) for up to 3 s while its crash-safety smoke test runs; the test runs in
+  the background and the plugin appears when it passes. VST3/CLAP plugins are
+  also no longer instantiated in the engine before that test.
+- Send alignment delays: a send with zero delay is now a plain copy (no ring
+  buffer work or memory touched), and a send that was off or at zero delay no
+  longer replays stale audio from its delay line when it is turned back on.
+- The control socket asks for a 4 MiB receive buffer on both ends so chunked
+  catalog/state bursts are not dropped; the out-of-process UI socket no longer
+  lives directly in `/tmp` when `XDG_RUNTIME_DIR` is unset.
+- The GUI is sent meters at a steady rate and coalesced state snapshots, which
+  cuts control-thread work during fader drags.
+
+### Changed
+
+- CI now checks `cargo fmt`; the tree was reformatted.
+- Engine internals: `control.rs` (5.7k lines) is split into `control/` modules
+  (`catalog`, `smoke`, `ui`, `loops`, `state`, `plugins`); behaviour is unchanged.
+- Engine internals: strip and bus insert chains share one `run_chain` path, and the
+  per-slot control-thread bookkeeping (state proxy, editor handle, output and UI
+  mailboxes) lives in a single `SlotMeta` instead of four parallel vectors.
+
 ### Added
 
 - **Loop recorder** (`Options → Recorder…`): capture a bar-aligned loop from

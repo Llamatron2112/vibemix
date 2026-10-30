@@ -4,7 +4,7 @@
 support, split into an audio engine and a Qt Quick (QML) control surface.
 
 ```
-┌─────────────────────────┐         OSC (localhost UDP)        ┌──────────────────────────┐
+┌─────────────────────────┐         OSC (Unix socket)          ┌──────────────────────────┐
 │  vibemix-engine (Rust)  │  params/config ────────────────▶    │   vibemix-gui (Rust +    │
 │  - JACK client (RT)     │  ◀──────────── meters/state        │   cxx-qt / Qt Quick QML) │
 │  - mixer graph          │                                    │   - QML surface          │
@@ -29,7 +29,7 @@ cannot cause audio dropouts.
 | `vibemix-lv2` | LV2 hosting: `urid:map`/`urid:unmap` host feature, plugin discovery, instances (audio, control in/out, atom sequences), run |
 | `vibemix-vst3` | VST3 hosting: vendored-SDK subset shim, discovery, `IComponent`/`IEditController`/`IPlugView` |
 | `vibemix-clap` | CLAP hosting: header-only shim, discovery, `clap_plugin` audio/params/gui |
-| `vibemix-engine` | JACK client, RT mixer graph, plugin hosts, control server |
+| `vibemix-engine` | JACK client, RT mixer graph, plugin hosts, control server (`control/`: message dispatch in `mod.rs`, plus `catalog`, `smoke`, `ui`, `loops`, `state` incl. undo/session, `plugins`) |
 | `vibemix-gui` | cxx-qt QML application and OSC client |
 
 ## Audio backend
@@ -51,22 +51,70 @@ PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
   never resized; a longer period is truncated (bus outputs are zeroed).
 - Parameter changes arrive through an SPSC ring (`rtrb`) and are applied at block
   start. Scalar parameters (gain, mute, pan, send gain/delay) use atomics with
-  one-pole smoothing, so live changes don't click.
+  one-pole smoothing, so live changes don't click. Smoothing is time-based
+  (10 ms for gains/pan/mute, 40 ms for send delays) and independent of the
+  period: each block advances the smoother by `1 - exp(-frames / (tau * rate))`
+  and ramps the gain linearly per sample across the block (the delay tap is
+  ramped the same way), snapping to the target when close so a mute reaches
+  exact silence.
 - Structural changes (add/remove strip, plugin, chain swap) are built on the
   control thread and swapped in at a block boundary; retired plugin instances
   and delay lines are handed back over garbage rings and dropped off the RT
   thread (queues are sized so a full command queue's worth can never overflow;
   on the pathological full case the object is leaked rather than freed).
+  Clearing a chain retires its plugins one by one and keeps the chain's
+  allocation, so a later add never reallocates on the audio thread.
 - Sample-rate changes are detected by a JACK notification handler and rebuild
   delay-line buffers + plugin instances on the control thread (`SetSampleRate`).
 - FTZ/DAZ are enabled on the process thread so plugin tails don't fall into
   denormals. JACK xruns are counted and surfaced in the GUI.
+- Plugin output is sanitised after each insert chain (NaN/Inf become silence) so
+  one misbehaving plugin cannot poison the buses and hardware outputs.
+- While plugin state is captured (session save, sample-rate rebuild) the chains
+  are not run; a chain with active plugins is silenced for that short window
+  rather than passed through dry (which would bypass limiters/compressors).
+- The callback times itself; the smoothed load (time used over the period) and a
+  decaying peak are published with the state snapshot and shown in the GUI.
+- The engine autosaves the session (`autosave.toml`, with the owning pid in
+  `autosave.pid`) every 60 s when it changed and removes it on a clean exit. On
+  start without `--session`, a leftover autosave whose owner is gone is
+  restored (and kept as `autosave.recovered.toml`). `packaging/vibemix`
+  supervises the engine and restarts it after a crash; control messages are
+  handled under `catch_unwind` so a handler bug cannot end the process.
+- `just gui-load` measures the GUI headless (see `scripts/gui-load.py`). Known
+  result: the data pipeline is cheap, but every structural snapshot re-creates
+  all strip/bus cards (one edit ties the GUI up for about 1 s at 16 strips and
+  minutes at 64 strips x 32 buses), and each meter carries ~45 items and its own
+  timer. See the backlog.
+- On shutdown the controller closes every open plugin editor *before* the
+  engine and its plugin instances are dropped (editors hold raw pointers into
+  them), and a watchdog exits the process after 5 s if a plugin's teardown hangs.
+  `just gui-desktop` checks this, and that auto-fit resizes the window only once
+  per change, on a private headless compositor.
+- Everything that parses outside data is fuzzed (`just fuzz`: the control
+  protocol, editor-host IPC, LV2 atoms, saved plugin state, session files, sweep
+  output) with deterministic mutation tests that also run briefly in
+  `cargo test`, and `just asan` runs the shims, the engine under load and every
+  installed plugin's smoke test under AddressSanitizer and UBSan.
+- A JACK/PipeWire server shutdown is flagged from the notification handler and
+  the control thread exits the engine, instead of idling on a dead client.
 - LV2 worker communication uses a dedicated non-RT worker thread.
 - MIDI CC bindings are matched on the audio thread against a fixed, lock-free
   table; keyboard button bindings are resolved on the control thread and only
   toggle the same atomic state (no audio-thread work).
+- The CLAP host shim keeps all audio-thread state preallocated at open (event
+  slots, event lists, buffer descriptors, scratch for non-main buses), never
+  blocks on a mutex there (contended hand-offs are retried next block), and only
+  queues a parameter change when its value changed. `just rt-count` verifies
+  this by counting `malloc`/`free` on the audio thread (with an LV2, VST3 and
+  CLAP plugin loaded and a 120 BPM MIDI clock plus notes playing in), which also
+  covers C++ code the Rust allocation guard cannot see. Sidechain routing and
+  open plugin editors are not covered yet.
 - Set `VIBEMIX_RT_GUARD=1` to abort (debug) if any heap operation happens on the
-  audio thread — used when testing/auditing.
+  audio thread — used when testing/auditing. `just rt-guard` runs the engine
+  under it (with `--auto-connect false`, so it never touches live audio) while
+  `scripts/rt-guard-drive.py` adds/removes strips, buses and LV2/VST3/CLAP
+  plugins and toggles bypass over OSC.
 
 ## Mixer model
 
@@ -138,6 +186,15 @@ with whitespace and `:` replaced by `_` (capped at 48 chars). Duplicate names ge
 an `_{id}` suffix so port names stay unique. Renaming a strip or bus renames its
 ports live (the number of ports registered is unchanged, and existing connections
 survive the rename).
+
+Session files are untrusted input: the `bundle` path of VST3/CLAP plugins is
+never loaded from a session. On load (and at startup, and after a rescan) it is
+replaced by the path from the discovered plugin catalog, and a plugin that is not
+installed stays bypassed ("missing"). Sessions and the catalog/health/recent
+files are written atomically (temp file, fsync, rename). Values changed by MIDI
+CCs or keyboard bindings only touch the live atomics, so the engine copies them
+back into the model before every save and undo snapshot
+(`sync_model_from_params`).
 
 Sessions remember external JACK connections: on save the engine records the ports
 feeding each strip input, fed by each bus output, and feeding each bus return
@@ -220,8 +277,8 @@ fader/mute:
   port connections). Instead, changes are sent to the RT thread over `rtrb`
   SPSC queues and applied at a block boundary; retired plugin instances are
   sent back to the control thread to be dropped off the RT thread.
-- Each insert can be bypassed at runtime; the RT thread skips processing for it
-  and lets the signal pass through.
+- Each insert can be bypassed at runtime; the RT thread crossfades to the dry
+  signal over ~10 ms and then skips processing for it.
 
 Host features provided: `urid:map`/`urid:unmap` (intern table, leaked with a
 stable address), `buf-size:boundedBlockLength`, and `options:options` carrying
@@ -377,7 +434,10 @@ ports.
 Safety: arbitrary third-party plugins can crash the process, so before a plugin
 is added the engine re-execs itself with `--smoke <uri>`, which instantiates it
 offline and runs a few blocks; if the child crashes or times out the add is
-refused. Discovery also refuses port shapes we cannot fully connect.
+refused. The test runs on a worker thread and the insert completes when it
+passes (add/paste only; duplicating a strip or bus still waits), so a slow or
+hanging plugin never stalls meters and faders. The plugin is only instantiated
+in the engine itself, to read VST3/CLAP parameter metadata, after it has passed. Discovery also refuses port shapes we cannot fully connect.
 `cargo run -p vibemix-lv2 --example probe` smoke-tests discovery/instantiate;
 `--example scan_silence` checks every hostable plugin passes audio with its
 defaults; `--example run_plugin <uri>` runs one plugin offline.
@@ -429,7 +489,25 @@ stderr; smoke children always run with core dumps disabled.
 
 ## Control protocol
 
-OSC over localhost UDP. See `vibemix-proto::address`:
+The engine listens on a Unix datagram socket, `engine.sock`, in
+`$XDG_RUNTIME_DIR/vibemix/` (override with `--socket` or `VIBEMIX_SOCKET`). Access
+control is the filesystem: the directory must be owned by the current user and
+closed to everyone else (mode `0700`; the engine tightens an open one it owns
+and refuses one it does not), and the socket itself is `0600`, so no other user
+can send a command, read the state, or make the engine write a file. (This
+replaced a localhost UDP port that every local process could reach.) A second
+engine on the same path exits with status 75 and the launcher reuses the first;
+a stale socket from a crashed engine is replaced.
+
+A datagram socket needs both ends bound to receive replies, so the GUI binds
+`gui-<pid>-<n>.sock` next to the engine's and the engine answers whoever sent
+last. Sends never block: a full receiver queue drops the datagram (as UDP did)
+and a vanished peer is forgotten, so a stalled GUI cannot stall the control
+loop. Latency and throughput are the same as loopback UDP (measured: about 13 µs
+round trip, several GB/s).
+
+OSC over a Unix datagram socket (see below). Addresses are in
+`vibemix-proto::address`:
 
 | Address | Args |
 |---|---|
@@ -496,12 +574,14 @@ OSC over localhost UDP. See `vibemix-proto::address`:
 | `/vibemix/midi/key_trigger` | `string key` (GUI to engine: a bound key/combo was pressed) |
 | `/vibemix/chunk` | `int transfer, int index, int total, blob data` (one part of an oversized message; see below) |
 
-Messages whose encoded form exceeds one UDP datagram (the plugin catalog with
+Messages whose encoded form exceeds one datagram (the plugin catalog with
 many plugins installed) are split into ordered `/vibemix/chunk` datagrams and
 reassembled by the receiver.
 
-Meters and state snapshots are sent to the last address that sent a control
-message. State snapshots also carry `window`, `sample_rate` and the `xruns`
+Meters (and the clock) are sent on a steady 50 Hz timer, and full state
+snapshots are coalesced to at most one per ~33 ms (the latest state is always
+sent), so a fader drag does not serialise the whole model per message. Both go
+to the last address that sent a control message. State snapshots also carry `window`, `sample_rate` and the `xruns`
 count. Sessions are TOML-serialized `MixerModel` files, including plugin URIs
 and parameter values and the last window size/maximized (`window`). Reordering
 strips/buses (`*/move`) permutes the model's display order only: engine slots,

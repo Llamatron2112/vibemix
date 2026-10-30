@@ -40,6 +40,22 @@ Deferred ideas and follow-ups that are not part of the current roadmap
 
 ## UI
 
+- **GUI scalability (measured with `just gui-load`, release build, offscreen).**
+  GUI main-thread CPU with meters running: 1 strip ~1%, 16 strips ~5%, 64 strips
+  x 32 buses ~29%; during a fader drag ~9% at 16 strips and ~82% at 64 strips.
+  A structural edit used to tie the GUI up for ~1 s at 16 strips and 40 to 180 s
+  at 64 strips x 32 buses because `mix = JSON.parse(...)` re-created every card.
+  **Fixed**: the strip/bus repeaters now use id-only `ListModel`s synced
+  incrementally and cards look their data up by id (about 0.5 s at 16 strips and
+  2 s at 64 x 32), verified pixel-identical with `just gui-shot`. Still open at
+  64 x 32 (all fine at 16 strips): meters cost ~30% of a core (each
+  `StereoMeter` has its own 60 ms timer and ~45 items), and a fader drag ~80%
+  because every value update re-evaluates the bindings of all ~2000 send
+  sliders. The JSON data path itself is cheap (about 1 ms per meter update).
+  Directions: one shared meter timer and fewer items per meter (draw the scale
+  once or in a Canvas), and per-entity value objects so an update only touches
+  the bindings of what changed.
+
 - Smooth meters (interpolate between meter frames) and expose/tune the UI poll
   interval.
 - Fuller transport/loop editor.

@@ -103,7 +103,9 @@ an icon.
 
 Environment variables:
 
-- `VIBEMIX_OSC_PORT` — control port for the engine and GUI (default `9000`).
+- `VIBEMIX_SOCKET` — path of the engine's control socket, used by the engine and
+  the GUI (default `$XDG_RUNTIME_DIR/vibemix/engine.sock`). Its directory must
+  be owned by you and closed to others; the engine refuses anything else.
 - `VIBEMIX_CONFIG_DIR` — config directory (default `$XDG_CONFIG_HOME/vibemix`,
   i.e. `~/.config/vibemix`); holds `recent.json`, `catalog.json`,
   `plugin_health.json`, `sessions/` and `loops/`.
