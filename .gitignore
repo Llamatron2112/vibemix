@@ -25,3 +25,4 @@ packaging/arch/**/*.pkg.tar.*
 # repository on purpose.
 spikes/0d-vst3-host/
 /dist
+__pycache__/

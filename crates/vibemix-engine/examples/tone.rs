@@ -25,8 +25,8 @@ impl ProcessHandler for Tone {
 }
 
 fn main() {
-    let (client, _status) = Client::new("vibemix-tone", ClientOptions::NO_START_SERVER)
-        .expect("create client");
+    let (client, _status) =
+        Client::new("vibemix-tone", ClientOptions::NO_START_SERVER).expect("create client");
     let out_l = client
         .register_port("out_l", AudioOut::default())
         .expect("register port");
@@ -47,14 +47,19 @@ fn main() {
         )
         .expect("activate");
 
+    // The engine's JACK client name (default "vibemix"). Test harnesses pass a
+    // private name so the tone can never be linked into a real session.
+    let target = std::env::args()
+        .nth(1)
+        .unwrap_or_else(|| "vibemix".to_string());
     let _ = active
         .as_client()
-        .connect_ports_by_name("vibemix-tone:out_l", "vibemix:ch_1_in_l");
+        .connect_ports_by_name("vibemix-tone:out_l", &format!("{target}:ch_1_in_l"));
     let _ = active
         .as_client()
-        .connect_ports_by_name("vibemix-tone:out_r", "vibemix:ch_1_in_r");
+        .connect_ports_by_name("vibemix-tone:out_r", &format!("{target}:ch_1_in_r"));
 
-    println!("440 Hz tone -> vibemix:ch_1 (strip 0); running until killed");
+    println!("440 Hz tone -> {target}:ch_1 (strip 0); running until killed");
     loop {
         std::thread::sleep(std::time::Duration::from_secs(3600));
     }
