@@ -1,12 +1,51 @@
 #!/usr/bin/env bash
-# Launch vibemix: start the engine for this session (or reuse a running one)
-# and open the GUI. The engine we started is stopped when the GUI exits.
-set -euo pipefail
+# Launch vibemix: start an engine for this session (or reuse one that is
+# already running) and open the GUI. An engine we started is restarted if it
+# crashes (it restores its autosaved session when it comes back) and is stopped
+# when the GUI exits.
+#
+# The engine and the GUI find each other through a Unix socket in a private
+# directory ($XDG_RUNTIME_DIR/vibemix/engine.sock); set VIBEMIX_SOCKET to use
+# another path (for example to run two mixers side by side).
+set -uo pipefail
 
-PORT="${VIBEMIX_OSC_PORT:-9000}"
+MAX_RESTARTS=3      # give up after this many crashes...
+RESTART_WINDOW=60   # ...within this many seconds
 
-vibemix-engine --osc-port "${PORT}" &
-ENGINE_PID=$!
-trap 'kill "${ENGINE_PID}" 2>/dev/null || true' EXIT
+supervise() {
+  local engine=0 restarts=0 window_start status now
+  window_start=$(date +%s)
+  trap '[ "$engine" -ne 0 ] && kill -TERM "$engine" 2>/dev/null; exit 0' TERM INT
+  while true; do
+    vibemix-engine &
+    engine=$!
+    wait "$engine"
+    status=$?
+    engine=0
+    # A clean exit (the signal handler returns 0) means we asked it to stop.
+    [ "$status" -eq 0 ] && return 0
+    # 75: another engine already owns the socket; use it and leave it alone.
+    if [ "$status" -eq 75 ]; then
+      echo "vibemix: an engine is already running; using it" >&2
+      return 0
+    fi
+    now=$(date +%s)
+    if [ $((now - window_start)) -gt "$RESTART_WINDOW" ]; then
+      restarts=0
+      window_start=$now
+    fi
+    restarts=$((restarts + 1))
+    if [ "$restarts" -gt "$MAX_RESTARTS" ]; then
+      echo "vibemix: the engine keeps failing (exit $status); giving up" >&2
+      return 1
+    fi
+    echo "vibemix: the engine exited with status $status; restarting" >&2
+    sleep 1
+  done
+}
+
+supervise &
+SUPERVISOR=$!
+trap 'kill -TERM "${SUPERVISOR}" 2>/dev/null; wait "${SUPERVISOR}" 2>/dev/null' EXIT
 
 vibemix-gui

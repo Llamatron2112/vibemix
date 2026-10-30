@@ -1,7 +1,7 @@
 #![allow(clippy::too_many_arguments)]
 
 use std::fs;
-use std::net::{SocketAddr, UdpSocket};
+use std::os::unix::net::UnixDatagram;
 use std::path::PathBuf;
 use std::pin::Pin;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
@@ -11,8 +11,8 @@ use std::time::Duration;
 use cxx_qt_lib::QString;
 use vibemix_proto::{message::ChunkAssembler, ControlMessage};
 
-static SOCKET: OnceLock<UdpSocket> = OnceLock::new();
-static ENGINE_ADDR: OnceLock<SocketAddr> = OnceLock::new();
+static SOCKET: OnceLock<UnixDatagram> = OnceLock::new();
+static ENGINE_PATH: OnceLock<PathBuf> = OnceLock::new();
 static VIEW: OnceLock<Mutex<View>> = OnceLock::new();
 static PENDING_REPORT: Mutex<Option<String>> = Mutex::new(None);
 static PENDING_SESSION: Mutex<Option<(bool, String, String)>> = Mutex::new(None);
@@ -27,7 +27,15 @@ static WINDOW_NONCE: AtomicU64 = AtomicU64::new(0);
 static LAST_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
 static PENDING_WINDOW: Mutex<Option<(i32, i32, bool)>> = Mutex::new(None);
 static SAMPLE_RATE: AtomicU32 = AtomicU32::new(48000);
+/// Milliseconds since `START` at which the last datagram arrived from the
+/// engine; the engine sends meters at 50 Hz, so silence means it is gone.
+static LAST_RX_MS: AtomicU64 = AtomicU64::new(0);
+static START: OnceLock<std::time::Instant> = OnceLock::new();
+const ENGINE_SILENCE_MS: u64 = 5000;
 static XRUNS: AtomicU32 = AtomicU32::new(0);
+/// Audio-callback load in tenths of a percent (average, peak).
+static DSP_LOAD: AtomicU32 = AtomicU32::new(0);
+static DSP_PEAK: AtomicU32 = AtomicU32::new(0);
 static CLIPBOARD: Mutex<(bool, u32, String)> = Mutex::new((false, 0, String::new()));
 static EDIT_STATE: Mutex<(u32, u32, String, String)> =
     Mutex::new((0, 0, String::new(), String::new()));
@@ -150,7 +158,7 @@ fn save_recent() {
     if let Ok(text) = serde_json::to_string_pretty(&list) {
         let dir = config_dir();
         let _ = fs::create_dir_all(&dir);
-        let _ = fs::write(dir.join("recent.json"), text);
+        let _ = vibemix_core::config::write_atomic(&dir.join("recent.json"), text);
     }
 }
 
@@ -166,18 +174,24 @@ fn note_recent(path: &str) {
     save_recent();
 }
 
-pub fn init(engine_port: u16) -> Result<(), String> {
-    let socket = UdpSocket::bind("127.0.0.1:0")
-        .map_err(|error| format!("could not open the control socket: {error}"))?;
+pub fn init(engine_socket: PathBuf) -> Result<(), String> {
+    // Our own socket lives next to the engine's, in the same private directory.
+    let directory = engine_socket
+        .parent()
+        .map(PathBuf::from)
+        .unwrap_or_else(vibemix_proto::socket::runtime_dir);
+    let (socket, own_path) =
+        vibemix_proto::socket::bind_client(&directory, "gui").map_err(|error| {
+            format!(
+                "could not open the control socket in {}: {error}",
+                directory.display()
+            )
+        })?;
+    vibemix_proto::socket::remove_at_exit(own_path);
     socket
         .set_read_timeout(Some(Duration::from_millis(100)))
         .map_err(|error| format!("could not set the socket timeout: {error}"))?;
-
-    let address = format!("127.0.0.1:{engine_port}");
-    let engine_address: SocketAddr = address
-        .parse()
-        .map_err(|error| format!("invalid engine address {address}: {error}"))?;
-    let _ = ENGINE_ADDR.set(engine_address);
+    let _ = ENGINE_PATH.set(engine_socket);
 
     let receiver = socket
         .try_clone()
@@ -197,18 +211,20 @@ pub fn init(engine_port: u16) -> Result<(), String> {
 }
 
 fn send(message: ControlMessage) {
-    if let (Some(socket), Some(address)) = (SOCKET.get(), ENGINE_ADDR.get()) {
+    if let (Some(socket), Some(path)) = (SOCKET.get(), ENGINE_PATH.get()) {
         if let Ok(bytes) = message.encode() {
-            let _ = socket.send_to(&bytes, address);
+            // Never blocks; a missing engine or a full queue just drops it.
+            let _ = vibemix_proto::socket::send_nonblocking(socket, &bytes, path);
         }
     }
 }
 
-fn receive_loop(socket: UdpSocket) {
+fn receive_loop(socket: UnixDatagram) {
     let mut buffer = [0u8; 65536];
     let mut assembler = ChunkAssembler::new();
     loop {
         if let Ok((length, _)) = socket.recv_from(&mut buffer) {
+            LAST_RX_MS.store(now_ms(), Ordering::Relaxed);
             // Reassemble chunked messages (e.g. a large plugin catalog) before
             // dispatching; non-chunk messages pass straight through.
             let assembled = ControlMessage::decode(&buffer[..length])
@@ -265,6 +281,10 @@ fn receive_loop(socket: UdpSocket) {
                     }
                     if let Some(xruns) = xruns_from_state(&value) {
                         XRUNS.store(xruns, Ordering::SeqCst);
+                    }
+                    if let Some((load, peak)) = dsp_from_state(&value) {
+                        DSP_LOAD.store(load, Ordering::SeqCst);
+                        DSP_PEAK.store(peak, Ordering::SeqCst);
                     }
                 }
                 Some(ControlMessage::SessionResult { ok, path, error }) => {
@@ -474,8 +494,18 @@ fn build_meters_json() -> String {
     serde_json::json!({ "strips": strips, "buses": buses }).to_string()
 }
 
+fn now_ms() -> u64 {
+    START
+        .get_or_init(std::time::Instant::now)
+        .elapsed()
+        .as_millis() as u64
+        + 1
+}
+
+/// Connected means the engine has spoken and has not gone quiet since.
 fn is_connected() -> bool {
-    view_lock().connected
+    let heard = LAST_RX_MS.load(Ordering::Relaxed);
+    view_lock().connected && heard != 0 && now_ms().saturating_sub(heard) < ENGINE_SILENCE_MS
 }
 
 fn extract_ids(value: &serde_json::Value) -> (Vec<u32>, Vec<u32>) {
@@ -519,6 +549,15 @@ fn sample_rate_from_state(value: &serde_json::Value) -> Option<u32> {
         return None;
     }
     Some(rate as u32)
+}
+
+/// DSP load `(average, peak)` in tenths of a percent from a state snapshot.
+fn dsp_from_state(value: &serde_json::Value) -> Option<(u32, u32)> {
+    let tenths = |key: &str| -> Option<u32> {
+        let fraction = value.get(key)?.as_f64()?;
+        Some((fraction.clamp(0.0, 10.0) * 1000.0).round() as u32)
+    };
+    Some((tenths("dsp_load")?, tenths("dsp_peak")?))
 }
 
 fn xruns_from_state(value: &serde_json::Value) -> Option<u32> {
@@ -771,6 +810,8 @@ pub mod qobject {
         #[qproperty(QString, window_geometry)]
         #[qproperty(i32, sample_rate)]
         #[qproperty(i32, xruns)]
+        #[qproperty(i32, dsp_load)]
+        #[qproperty(i32, dsp_peak)]
         #[qproperty(bool, has_clipboard)]
         #[qproperty(i32, clipboard_location)]
         #[qproperty(QString, clipboard_name)]
@@ -1132,6 +1173,8 @@ pub struct BackendRust {
     window_geometry: QString,
     sample_rate: i32,
     xruns: i32,
+    dsp_load: i32,
+    dsp_peak: i32,
     has_clipboard: bool,
     clipboard_location: i32,
     clipboard_name: QString,
@@ -1174,6 +1217,8 @@ impl Default for BackendRust {
             window_geometry: QString::from(""),
             sample_rate: 48000,
             xruns: 0,
+            dsp_load: 0,
+            dsp_peak: 0,
             has_clipboard: false,
             clipboard_location: 0,
             clipboard_name: QString::from(""),
@@ -1250,7 +1295,10 @@ impl qobject::Backend {
         let waveform_rev = WAVEFORM_REV.load(Ordering::Acquire);
         if waveform_rev != LAST_WAVEFORM_REV.load(Ordering::Relaxed) {
             LAST_WAVEFORM_REV.store(waveform_rev, Ordering::Relaxed);
-            let json = WAVEFORM.lock().map(|guard| guard.clone()).unwrap_or_default();
+            let json = WAVEFORM
+                .lock()
+                .map(|guard| guard.clone())
+                .unwrap_or_default();
             self.as_mut().set_waveform(QString::from(json.as_str()));
         }
         if let Some(error) = PENDING_CONNECTION_ERROR
@@ -1332,6 +1380,10 @@ impl qobject::Backend {
         self.as_mut()
             .set_sample_rate(SAMPLE_RATE.load(Ordering::SeqCst) as i32);
         self.as_mut().set_xruns(XRUNS.load(Ordering::SeqCst) as i32);
+        self.as_mut()
+            .set_dsp_load(DSP_LOAD.load(Ordering::SeqCst) as i32);
+        self.as_mut()
+            .set_dsp_peak(DSP_PEAK.load(Ordering::SeqCst) as i32);
 
         if let Ok(clipboard) = CLIPBOARD.lock() {
             self.as_mut().set_has_clipboard(clipboard.0);

@@ -22,6 +22,35 @@ use vibemix_lv2::{find_ui, Host};
 use crate::backend_jack::JackEngine;
 use crate::params::{SharedMeters, SharedParams};
 
+/// Set by SIGINT/SIGTERM; the control loop notices it and returns so everything
+/// is dropped cleanly (JACK client, plugin sweep, UI host, socket files).
+pub static SHUTDOWN: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn on_signal(_signal: libc::c_int) {
+    SHUTDOWN.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Ends the process if shutdown has not finished after a few seconds (a hosted
+/// plugin can hang while being torn down). Exits with status 0: the engine was
+/// asked to stop, so the launcher must not treat this as a crash.
+pub fn start_shutdown_watchdog() {
+    std::thread::spawn(|| {
+        std::thread::sleep(std::time::Duration::from_secs(5));
+        eprintln!("vibemix-engine: shutdown is taking too long; exiting");
+        // SAFETY: `_exit` ends the process immediately without running
+        // destructors, which is the point: they are what is stuck.
+        unsafe { libc::_exit(0) };
+    });
+}
+
+fn install_signal_handlers() {
+    // SAFETY: the handler only stores to an atomic, which is async-signal-safe.
+    unsafe {
+        libc::signal(libc::SIGINT, on_signal as *const () as libc::sighandler_t);
+        libc::signal(libc::SIGTERM, on_signal as *const () as libc::sighandler_t);
+    }
+}
+
 #[global_allocator]
 static GLOBAL_ALLOCATOR: rt_guard::GuardAllocator = rt_guard::GuardAllocator;
 
@@ -31,8 +60,10 @@ struct Args {
     #[arg(long, default_value = "vibemix")]
     client_name: String,
 
-    #[arg(long, default_value_t = 9000)]
-    osc_port: u16,
+    /// Control socket path (default: `$VIBEMIX_SOCKET`, else `engine.sock` in
+    /// `$XDG_RUNTIME_DIR/vibemix`). Its directory must be private to you.
+    #[arg(long, value_name = "PATH")]
+    socket: Option<std::path::PathBuf>,
 
     #[arg(long, default_value_t = 64)]
     strips: usize,
@@ -145,7 +176,11 @@ fn main() -> Result<()> {
         smoke::scan_plugins(only);
     }
 
-    let default_level = if smoke::debug_enabled() { "debug" } else { "info" };
+    let default_level = if smoke::debug_enabled() {
+        "debug"
+    } else {
+        "info"
+    };
     let filter = tracing_subscriber::EnvFilter::try_from_default_env()
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_level));
     tracing_subscriber::fmt().with_env_filter(filter).init();
@@ -153,6 +188,25 @@ fn main() -> Result<()> {
     if args.strips == 0 || args.buses == 0 {
         bail!("strip and bus capacity must be at least 1");
     }
+
+    // Bind the control socket first: a second engine must fail before it
+    // touches the autosave or registers JACK ports.
+    let socket_path = args
+        .socket
+        .clone()
+        .unwrap_or_else(vibemix_proto::socket::default_engine_socket);
+    let socket = match vibemix_proto::socket::bind_engine(&socket_path) {
+        Ok(socket) => socket,
+        Err(error) if error.kind() == std::io::ErrorKind::AddrInUse => {
+            eprintln!("vibemix-engine: {error}");
+            // EX_TEMPFAIL: the launcher treats this as "an engine is already up".
+            std::process::exit(75);
+        }
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("bind control socket {}", socket_path.display()));
+        }
+    };
 
     let mut model = load_or_default(&args)?;
     control::clamp_to_capacity(&mut model, args.strips, args.buses);
@@ -163,7 +217,7 @@ fn main() -> Result<()> {
 
     tracing::info!(
         client_name = %args.client_name,
-        osc_port = args.osc_port,
+        socket = %socket_path.display(),
         strips = args.strips,
         buses = args.buses,
         "vibemix-engine starting"
@@ -172,6 +226,8 @@ fn main() -> Result<()> {
     let host = Host::new();
     let vst3 = vibemix_vst3::Host::new();
     let clap = vibemix_clap::Host::new();
+    let plugins = control::discover_or_load_catalog(&host, &vst3, &clap);
+    control::trust_catalog_bundles(&mut model, &plugins);
     let engine = JackEngine::start(
         &args.client_name,
         Arc::clone(&params),
@@ -190,16 +246,20 @@ fn main() -> Result<()> {
         "engine running"
     );
 
-    let mut controller =
-        control::Controller::new(args.osc_port, params, meters, model, engine, host, vst3, clap)
-            .with_context(|| format!("bind OSC port {}", args.osc_port))?;
+    let mut controller = control::Controller::new(
+        socket, params, meters, model, engine, host, vst3, clap, plugins,
+    )
+    .context("start the controller")?;
 
     tracing::info!(
         session = %args.session.as_deref().unwrap_or("default"),
         "control ready; press Ctrl-C to quit"
     );
 
+    install_signal_handlers();
     controller.run();
+    let _ = std::fs::remove_file(&socket_path);
+    tracing::info!("shutting down");
     Ok(())
 }
 
@@ -458,6 +518,38 @@ fn load_or_default(args: &Args) -> Result<MixerModel> {
             let model = toml::from_str(&text).with_context(|| format!("parse session {path}"))?;
             Ok(model)
         }
-        None => Ok(MixerModel::default_minimal()),
+        None => Ok(recover_autosave().unwrap_or_else(MixerModel::default_minimal)),
+    }
+}
+
+/// Restores the autosave left behind by an engine that did not shut down
+/// cleanly. The file is renamed first, so a session that crashes the engine
+/// while loading is not retried forever.
+fn recover_autosave() -> Option<MixerModel> {
+    let path = control::autosave_path();
+    let owner = std::fs::read_to_string(control::autosave_owner_path())
+        .ok()
+        .and_then(|pid| pid.trim().parse::<u32>().ok());
+    if owner.is_some_and(|pid| {
+        pid != std::process::id() && std::path::Path::new(&format!("/proc/{pid}")).exists()
+    }) {
+        // Another running engine owns it.
+        return None;
+    }
+    let text = std::fs::read_to_string(&path).ok()?;
+    let kept = path.with_file_name("autosave.recovered.toml");
+    let _ = std::fs::rename(&path, &kept);
+    match toml::from_str::<MixerModel>(&text) {
+        Ok(model) => {
+            eprintln!(
+                "vibemix-engine: restoring the session autosaved before the last crash (kept as {})",
+                kept.display()
+            );
+            Some(model)
+        }
+        Err(error) => {
+            eprintln!("vibemix-engine: ignoring unreadable autosave: {error}");
+            None
+        }
     }
 }

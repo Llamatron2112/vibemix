@@ -14,7 +14,7 @@ fn main() {
             }
             "-h" | "--help" => {
                 println!(
-                    "vibemix-gui {}\n\nUsage: vibemix-gui\n\nEnv: VIBEMIX_OSC_PORT (default 9000)",
+                    "vibemix-gui {}\n\nUsage: vibemix-gui\n\nEnv: VIBEMIX_SOCKET (the engine's control socket; default engine.sock in $XDG_RUNTIME_DIR/vibemix)",
                     env!("CARGO_PKG_VERSION")
                 );
                 return;
@@ -27,11 +27,7 @@ fn main() {
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
-    let port: u16 = std::env::var("VIBEMIX_OSC_PORT")
-        .ok()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(9000);
-    if let Err(error) = backend::init(port) {
+    if let Err(error) = backend::init(vibemix_proto::socket::default_engine_socket()) {
         eprintln!("vibemix-gui: {error}");
         std::process::exit(1);
     }
