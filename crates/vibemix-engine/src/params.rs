@@ -58,6 +58,9 @@ pub struct SharedParams {
     state_ack: AtomicBool,
     beats_per_bar: AtomicU32,
     midi_sync: AtomicBool,
+    clock_master: AtomicBool,
+    clock_playing: AtomicBool,
+    clock_bpm_milli: AtomicU32,
 }
 
 impl SharedParams {
@@ -123,6 +126,9 @@ impl SharedParams {
             state_ack: AtomicBool::new(false),
             beats_per_bar: AtomicU32::new(4.0f32.to_bits()),
             midi_sync: AtomicBool::new(true),
+            clock_master: AtomicBool::new(false),
+            clock_playing: AtomicBool::new(false),
+            clock_bpm_milli: AtomicU32::new(120_000),
         }
     }
 
@@ -132,6 +138,31 @@ impl SharedParams {
 
     pub fn set_midi_sync(&self, value: bool) {
         self.midi_sync.store(value, Ordering::Relaxed);
+    }
+
+    pub fn clock_master(&self) -> bool {
+        self.clock_master.load(Ordering::Relaxed)
+    }
+
+    pub fn set_clock_master(&self, value: bool) {
+        self.clock_master.store(value, Ordering::Relaxed);
+    }
+
+    pub fn clock_playing(&self) -> bool {
+        self.clock_playing.load(Ordering::Relaxed)
+    }
+
+    pub fn set_clock_playing(&self, value: bool) {
+        self.clock_playing.store(value, Ordering::Relaxed);
+    }
+
+    pub fn clock_bpm_milli(&self) -> u32 {
+        self.clock_bpm_milli.load(Ordering::Relaxed)
+    }
+
+    pub fn set_clock_bpm_milli(&self, value: u32) {
+        self.clock_bpm_milli
+            .store(value.clamp(20_000, 400_000), Ordering::Relaxed);
     }
 
     pub fn beats_per_bar(&self) -> f32 {
@@ -998,15 +1029,37 @@ impl SharedClock {
     }
 
     pub fn publish(&self, clock: &crate::midi::Clock) {
-        self.locked.store(clock.locked, Ordering::Relaxed);
-        self.playing.store(clock.playing, Ordering::Relaxed);
-        self.bpm.store(clock.bpm.to_bits(), Ordering::Relaxed);
-        self.beats.store(clock.beats.to_bits(), Ordering::Relaxed);
-        self.frames
-            .store(clock.frames_since_start, Ordering::Relaxed);
+        self.publish_state(
+            clock.locked,
+            clock.playing,
+            clock.bpm,
+            clock.beats,
+            clock.frames_since_start,
+            clock.jitter_bpm,
+            clock.glitches,
+        );
+    }
+
+    /// Publish explicit values, used by the internal master clock.
+    #[allow(clippy::too_many_arguments)]
+    pub fn publish_state(
+        &self,
+        locked: bool,
+        playing: bool,
+        bpm: f32,
+        beats: f64,
+        frames: u64,
+        jitter_bpm: f32,
+        glitches: u32,
+    ) {
+        self.locked.store(locked, Ordering::Relaxed);
+        self.playing.store(playing, Ordering::Relaxed);
+        self.bpm.store(bpm.to_bits(), Ordering::Relaxed);
+        self.beats.store(beats.to_bits(), Ordering::Relaxed);
+        self.frames.store(frames, Ordering::Relaxed);
         self.jitter_bpm
-            .store(clock.jitter_bpm.to_bits(), Ordering::Relaxed);
-        self.glitches.store(clock.glitches, Ordering::Relaxed);
+            .store(jitter_bpm.to_bits(), Ordering::Relaxed);
+        self.glitches.store(glitches, Ordering::Relaxed);
     }
 
     pub fn snapshot(&self, sample_rate: f32) -> ClockSnapshot {

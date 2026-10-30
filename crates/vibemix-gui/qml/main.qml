@@ -384,6 +384,7 @@ ApplicationWindow {
     function portShortLabel(port) {
         if (!port || !port.role) return port ? port.short : ""
         if (port.role.kind === "midi_in") return "MIDI in"
+        if (port.role.kind === "midi_out") return "MIDI out"
         var channel = port.role.channel === "l" ? " L" : (port.role.channel === "r" ? " R" : "")
         var kind = port.role.kind === "strip_in" ? "in"
             : (port.role.kind === "bus_out" ? "out" : "ret")
@@ -461,8 +462,11 @@ ApplicationWindow {
     function midiSources() {
         var ports = root.portList()
         var out = []
+        var self = root.vibemixClient()
         for (var i = 0; i < ports.length; i++) {
-            if (ports[i].type === "midi" && ports[i].output === true) out.push(ports[i])
+            if (ports[i].type === "midi" && ports[i].output === true && ports[i].client !== self) {
+                out.push(ports[i])
+            }
         }
         out.sort(function(a, b) {
             if (a.client !== b.client) return a.client.localeCompare(b.client)
@@ -478,6 +482,38 @@ ApplicationWindow {
         var input = root.midiInputPort()
         if (!input) return
         root.setPortConnection(port, input, connect)
+        midiRefreshTimer.restart()
+    }
+    function midiOutputPort() {
+        var ports = root.portList()
+        for (var i = 0; i < ports.length; i++) {
+            if (ports[i].role && ports[i].role.kind === "midi_out") return ports[i]
+        }
+        return null
+    }
+    function midiSinks() {
+        var ports = root.portList()
+        var out = []
+        var self = root.vibemixClient()
+        for (var i = 0; i < ports.length; i++) {
+            if (ports[i].type === "midi" && ports[i].input === true && ports[i].client !== self) {
+                out.push(ports[i])
+            }
+        }
+        out.sort(function(a, b) {
+            if (a.client !== b.client) return a.client.localeCompare(b.client)
+            return a.short.localeCompare(b.short)
+        })
+        return out
+    }
+    function midiOutConnected(port) {
+        var output = root.midiOutputPort()
+        return output ? root.portConnected(output.name, port) : false
+    }
+    function toggleMidiSink(port, connect) {
+        var output = root.midiOutputPort()
+        if (!output) return
+        root.setPortConnection(output, port, connect)
         midiRefreshTimer.restart()
     }
 
@@ -746,6 +782,11 @@ ApplicationWindow {
         var t = mix.transport_ui
         return t ? t : ({ beats: true, bpm: true, stability: true, dsp: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8, autosize: false })
     }
+    function clockSettings() {
+        var c = mix.clock
+        return c ? c : ({ master: false, bpm: 120 })
+    }
+    function clockMaster() { return root.clockSettings().master === true }
     function setTransportUi(patch) {
         var t = root.transportUi()
         var next = {
@@ -1346,6 +1387,23 @@ ApplicationWindow {
                 enabled: backend.connected
                 onTriggered: backend.setMidiSync(!(mix.midi_sync === true))
             }
+            Menu {
+                title: "MIDI clock"
+                MenuItem {
+                    text: "MIDI in (slave)"
+                    checkable: true
+                    checked: !root.clockMaster()
+                    enabled: backend.connected
+                    onTriggered: backend.setClockMaster(false)
+                }
+                MenuItem {
+                    text: "Internal (master)"
+                    checkable: true
+                    checked: root.clockMaster()
+                    enabled: backend.connected
+                    onTriggered: backend.setClockMaster(true)
+                }
+            }
             MenuSeparator { }
             MenuItem {
                 text: "MIDI bindings…"
@@ -1370,7 +1428,7 @@ ApplicationWindow {
                 onTriggered: patchWindow.show()
             }
             MenuItem {
-                text: "MIDI input…"
+                text: "MIDI routing…"
                 onTriggered: midiWindow.show()
             }
             MenuSeparator { }
@@ -1408,14 +1466,27 @@ ApplicationWindow {
                     Label {
                         id: bpmReadout
                         visible: root.transportUi().bpm
-                        text: root.clockInfo().bpm.toFixed(1) + " BPM"
-                        color: root.clockInfo().locked ? root.textColor : root.mutedText
+                        text: root.clockMaster()
+                            ? root.clockSettings().bpm.toFixed(3) + " BPM"
+                            : root.clockInfo().bpm.toFixed(1) + " BPM"
+                        color: root.clockMaster()
+                            ? root.accentColor
+                            : (root.clockInfo().locked ? root.textColor : root.mutedText)
                         font.pixelSize: 11
                         font.family: "monospace"
 
+                        MouseArea {
+                            anchors.fill: parent
+                            enabled: root.clockMaster() && backend.connected
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: tempoDialog.open()
+                        }
+
                         HoverHandler { id: bpmHover }
                         ToolTip.visible: bpmHover.hovered
-                        ToolTip.text: root.clockInfo().locked ? "host tempo (MIDI clock)" : "no MIDI clock"
+                        ToolTip.text: root.clockMaster()
+                            ? "internal clock (master) — click to set the tempo"
+                            : (root.clockInfo().locked ? "host tempo (MIDI clock)" : "no MIDI clock")
                         ToolTip.delay: 300
                     }
 
@@ -1449,8 +1520,16 @@ ApplicationWindow {
                         font.family: "monospace"
                     }
 
+                    FlatButton {
+                        visible: root.clockMaster()
+                        text: root.clockInfo().playing ? "\u25A0" : "\u25B6"
+                        implicitWidth: 24
+                        enabled: backend.connected
+                        onClicked: backend.setClockPlaying(!root.clockInfo().playing)
+                    }
+
                     Label {
-                        visible: backend.clock.length > 0 && root.clockInfo().playing
+                        visible: !root.clockMaster() && backend.clock.length > 0 && root.clockInfo().playing
                         text: "\u25B6"
                         color: root.accentColor
                         font.pixelSize: 10
@@ -1676,6 +1755,46 @@ ApplicationWindow {
         nameFilters: ["WAV (*.wav)", "All files (*)"]
         currentFolder: root.loopFolderUrl()
         onAccepted: root.commitLoopSave(selectedFile)
+    }
+
+    Dialog {
+        id: tempoDialog
+        title: "Master tempo"
+        modal: true
+        anchors.centerIn: parent
+        width: 300
+        standardButtons: Dialog.Ok | Dialog.Cancel
+        onAboutToShow: tempoValue.value = Math.round(root.clockSettings().bpm * 1000)
+        onAccepted: backend.setClockBpm(tempoValue.value / 1000)
+        contentItem: ColumnLayout {
+            width: tempoDialog.availableWidth
+            spacing: 6
+            Label {
+                Layout.fillWidth: true
+                text: "Internal clock tempo"
+                color: root.textColor
+                font.pixelSize: 11
+            }
+            SpinBox {
+                id: tempoValue
+                Layout.fillWidth: true
+                from: 20000
+                to: 400000
+                stepSize: 1
+                editable: true
+                textFromValue: function(value) { return (value / 1000).toFixed(3) }
+                valueFromText: function(text) {
+                    var value = Number(text)
+                    return isNaN(value) ? tempoValue.value : Math.round(value * 1000)
+                }
+            }
+            Label {
+                Layout.fillWidth: true
+                text: "20.000 – 400.000 BPM, saved with the session"
+                color: root.mutedText
+                font.pixelSize: 10
+            }
+        }
     }
 
     Dialog {
@@ -4598,13 +4717,13 @@ ApplicationWindow {
 
     Window {
         id: midiWindow
-        title: "MIDI input"
+        title: "MIDI routing"
         modality: Qt.ApplicationModal
         flags: Qt.Dialog
         transientParent: root
         visible: false
-        width: 480
-        height: 420
+        width: 500
+        height: 560
         color: palette.window
 
         onVisibleChanged: if (visible) backend.queryPorts()
@@ -4616,9 +4735,13 @@ ApplicationWindow {
 
             Label {
                 Layout.fillWidth: true
-                text: root.midiInputPort()
-                    ? "Ports connected to " + root.midiInputPort().name
-                    : "No MIDI input port (is the engine connected?)"
+                text: (root.midiInputPort()
+                        ? "Input: " + root.midiInputPort().name
+                        : "No MIDI input port")
+                    + "  ·  "
+                    + (root.midiOutputPort()
+                        ? "Output: " + root.midiOutputPort().name
+                        : "No MIDI output port")
                 color: root.mutedText
                 font.pixelSize: 10
                 wrapMode: Text.WordWrap
@@ -4637,6 +4760,14 @@ ApplicationWindow {
                     width: midiWindow.width - 24
                     spacing: 2
 
+                    Label {
+                        width: midiList.width
+                        text: "Input — external MIDI outputs feed the mixer"
+                        color: root.textColor
+                        font.pixelSize: 11
+                        font.bold: true
+                    }
+
                     Repeater {
                         model: root.midiSources()
                         FilterCheck {
@@ -4650,6 +4781,36 @@ ApplicationWindow {
                     Label {
                         visible: root.midiSources().length === 0
                         text: "No MIDI output ports found."
+                        color: root.mutedText
+                        font.pixelSize: 11
+                    }
+
+                    Item {
+                        width: midiList.width
+                        height: 8
+                    }
+
+                    Label {
+                        width: midiList.width
+                        text: "Output — the mixer feeds external MIDI inputs"
+                        color: root.textColor
+                        font.pixelSize: 11
+                        font.bold: true
+                    }
+
+                    Repeater {
+                        model: root.midiSinks()
+                        FilterCheck {
+                            width: midiList.width
+                            text: modelData.client + ": " + modelData.short
+                            checked: root.midiOutConnected(modelData)
+                            onToggled: root.toggleMidiSink(modelData, checked)
+                        }
+                    }
+
+                    Label {
+                        visible: root.midiSinks().length === 0
+                        text: "No MIDI input ports found."
                         color: root.mutedText
                         font.pixelSize: 11
                     }

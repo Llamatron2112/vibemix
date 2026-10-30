@@ -1497,6 +1497,7 @@ impl Controller {
                     Ok(()) => {
                         self.close_all_uis();
                         self.model = model;
+                        self.params.set_clock_playing(false);
                         self.engine.sync_port_names(&self.model);
                         self.engine
                             .recorder()
@@ -1554,6 +1555,7 @@ impl Controller {
                                 .recorder()
                                 .set_sources(&self.model.recorder.sources);
                             self.load_loops_from_model();
+                            self.params.set_clock_playing(false);
                             self.rebuild_shared_bindings();
                             self.missing_report =
                                 missing_report_json(&self.engine.restore_connections(&self.model));
@@ -1688,6 +1690,35 @@ impl Controller {
                     snapshot: true,
                     catalog: false,
                 }
+            }
+            ControlMessage::SetClockMaster { on } => {
+                self.params.set_clock_master(on);
+                self.params.set_clock_playing(false);
+                self.model.clock.master = on;
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetClockBpm { bpm } => {
+                let bpm = if bpm.is_finite() {
+                    bpm.clamp(20.0, 400.0)
+                } else {
+                    120.0
+                };
+                let milli = (bpm * 1000.0).round() as u32;
+                self.params.set_clock_bpm_milli(milli);
+                self.model.clock.bpm = milli as f32 / 1000.0;
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetClockPlaying { playing } => {
+                if self.params.clock_master() {
+                    self.params.set_clock_playing(playing);
+                }
+                Actions::default()
             }
             ControlMessage::SetStripMidiChannel { strip, channel } => {
                 if let Some(entry) = self.model.strip_mut(StripId(strip)) {

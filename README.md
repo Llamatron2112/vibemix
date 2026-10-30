@@ -46,9 +46,9 @@ small OSC control protocol.
 ## Using the UI
 
 - **Menu bar**: **Add** for strips/buses, **Options** for MIDI sync, MIDI
-  bindings… and auto-fit, **File**/**Edit** for sessions and undo. Right-click
-  the top bar for the transport readouts (including the DSP usage), counters and
-  loop settings.
+  clock, MIDI routing…, MIDI bindings… and auto-fit, **File**/**Edit** for
+  sessions and undo. Right-click the top bar for the transport readouts
+  (including the DSP usage), counters and loop settings.
 - **Layout**: `Options → Layout…` sets how many strips/buses per row (or
   **Auto**). Strips and buses are separate, independently scrolling panes.
 - **Add a plugin**: right-click a strip's insert chain → **Add plugin…**. The
@@ -82,8 +82,13 @@ small OSC control protocol.
 - **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
   matrix; pick the device on each axis. Tick a cell to connect. Only
   connections involving vibemix ports are editable.
-- **MIDI input**: `Options → MIDI input…` chooses which MIDI outputs feed
-  vibemix.
+- **MIDI routing**: `Options → MIDI routing…` connects external MIDI outputs
+  to vibemix's `midi_in` and its `midi_out` to external MIDI inputs.
+- **MIDI clock**: `Options → MIDI clock` selects *MIDI in (slave)* or
+  *Internal (master)*. As master, the BPM readout opens a tempo dialog and the
+  transport button starts/stops the internal 24 PPQN clock, sent to
+  `midi_out`. Stop resets to zero, so play always sends `START`. The generated
+  clock is sample-accurate and drift-free.
 - **MIDI bindings…**: right-click a mute/solo cell → Learn (MIDI CC) or
   **Learn key** (press a key or combo; Esc cancels, Backspace clears).
 

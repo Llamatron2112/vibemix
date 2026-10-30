@@ -52,6 +52,20 @@ impl MidiBlock {
     pub fn truncate(&mut self, len: usize) {
         self.count = len.min(self.count);
     }
+
+    /// Stable insertion sort by frame offset, used when generated clock events
+    /// are merged with incoming MIDI.
+    pub fn sort_by_time(&mut self) {
+        for index in 1..self.count {
+            let event = self.events[index];
+            let mut position = index;
+            while position > 0 && self.events[position - 1].time > event.time {
+                self.events[position] = self.events[position - 1];
+                position -= 1;
+            }
+            self.events[position] = event;
+        }
+    }
 }
 
 const CLOCK: u8 = 0xF8;
@@ -265,9 +279,199 @@ impl Clock {
     }
 }
 
+/// Internal MIDI clock generator.
+///
+/// The pulse phase is integer (`1 / (2500 * sample_rate)` of a pulse) and
+/// advanced one frame at a time, so 24 PPQN spacing is exact and does not
+/// drift. Each pulse is queued with its frame offset inside the block.
+pub struct MasterClock {
+    playing: bool,
+    bpm_milli: u32,
+    pulses: u64,
+    phase: u64,
+    frames_since_start: u64,
+}
+
+impl Default for MasterClock {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl MasterClock {
+    pub fn new() -> Self {
+        Self {
+            playing: false,
+            bpm_milli: 120_000,
+            pulses: 0,
+            phase: 0,
+            frames_since_start: 0,
+        }
+    }
+
+    /// Forget the position and stop. The next play emits `START`.
+    pub fn reset(&mut self) {
+        self.playing = false;
+        self.pulses = 0;
+        self.phase = 0;
+        self.frames_since_start = 0;
+    }
+
+    pub fn is_playing(&self) -> bool {
+        self.playing
+    }
+
+    pub fn bpm(&self) -> f32 {
+        self.bpm_milli as f32 / 1000.0
+    }
+
+    fn beats_at(&self, sample_rate: u32) -> f64 {
+        if sample_rate == 0 {
+            return 0.0;
+        }
+        let den = 2500u64 * sample_rate as u64;
+        self.pulses as f64 / 24.0 + (self.phase as f64 / den as f64) / 24.0
+    }
+
+    /// Build a plugin transport position for the block that starts at `beats`.
+    pub fn position(
+        &self,
+        beats: f64,
+        frames: u64,
+        beats_per_bar: f32,
+        playing: bool,
+    ) -> TimePosition {
+        let bpb = if beats_per_bar > 0.0 {
+            beats_per_bar as f64
+        } else {
+            4.0
+        };
+        TimePosition {
+            frame: frames as i64,
+            beat: beats,
+            bar: (beats / bpb).floor() as i64,
+            bar_beat: (beats % bpb) as f32,
+            beats_per_minute: self.bpm(),
+            beats_per_bar: bpb as f32,
+            speed: if playing { 1.0 } else { 0.0 },
+        }
+    }
+
+    /// Returns the beat position and frame count at the start of the block.
+    /// A stop resets the position to zero, so the next play always sends
+    /// `START`.
+    pub fn process(
+        &mut self,
+        frames: usize,
+        sample_rate: u32,
+        playing: bool,
+        bpm_milli: u32,
+        out: &mut MidiBlock,
+    ) -> (f64, u64) {
+        self.bpm_milli = bpm_milli.clamp(20_000, 400_000);
+        if playing != self.playing {
+            if playing {
+                out.push(MidiEvent::new(0, &[START]));
+                self.pulses = 0;
+                self.phase = 0;
+                self.frames_since_start = 0;
+                self.playing = true;
+            } else {
+                out.push(MidiEvent::new(0, &[STOP]));
+                self.playing = false;
+                self.pulses = 0;
+                self.phase = 0;
+                self.frames_since_start = 0;
+                return (0.0, 0);
+            }
+        }
+        if !self.playing {
+            return (0.0, 0);
+        }
+
+        let beats_before = self.beats_at(sample_rate);
+        let frames_before = self.frames_since_start;
+        let den = 2500u64 * sample_rate as u64;
+        if den > 0 {
+            let increment = self.bpm_milli as u64;
+            for frame in 0..frames {
+                self.phase += increment;
+                if self.phase >= den {
+                    self.phase -= den;
+                    self.pulses += 1;
+                    out.push(MidiEvent::new(frame as i64, &[CLOCK]));
+                }
+            }
+        }
+        self.frames_since_start += frames as u64;
+        (beats_before, frames_before)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn master_clock_pulses_are_exact() {
+        let sample_rate = 48_000;
+        let mut master = MasterClock::new();
+        let mut out = MidiBlock::default();
+
+        // Play from zero: START at frame 0, then no pulse at frame 0.
+        let (beats, frames) = master.process(0, sample_rate, true, 120_000, &mut out);
+        assert_eq!(beats, 0.0);
+        assert_eq!(frames, 0);
+        assert_eq!(out.as_slice()[0].as_slice(), &[START]);
+
+        // One second at 120 BPM is 2 beats = 48 pulses, one every 1000 frames.
+        out.clear();
+        let (beats, frames) = master.process(48_000, sample_rate, true, 120_000, &mut out);
+        assert_eq!(beats, 0.0);
+        assert_eq!(frames, 0);
+        assert_eq!(out.len(), 48);
+        assert_eq!(out.get(0).time, 999);
+        assert_eq!(out.get(47).time, 47_999);
+        assert!((master.beats_at(sample_rate) - 2.0).abs() < 1.0e-9);
+
+        // Stop resets the position and emits STOP.
+        out.clear();
+        let (beats, frames) = master.process(0, sample_rate, false, 120_000, &mut out);
+        assert_eq!(beats, 0.0);
+        assert_eq!(frames, 0);
+        assert_eq!(out.as_slice()[0].as_slice(), &[STOP]);
+        assert_eq!(master.beats_at(sample_rate), 0.0);
+        assert!(!master.is_playing());
+
+        // Play again always starts from zero.
+        out.clear();
+        master.process(0, sample_rate, true, 120_000, &mut out);
+        assert_eq!(out.as_slice()[0].as_slice(), &[START]);
+    }
+
+    #[test]
+    fn master_clock_tracks_tempo_changes_without_drift() {
+        let sample_rate = 48_000;
+        let mut master = MasterClock::new();
+        let mut out = MidiBlock::default();
+        master.process(0, sample_rate, true, 120_000, &mut out);
+
+        // 10 s at 120 BPM = 480 pulses.
+        let mut pulses = 0;
+        for _ in 0..10 {
+            out.clear();
+            master.process(48_000, sample_rate, true, 120_000, &mut out);
+            pulses += out.len();
+        }
+        assert_eq!(pulses, 480);
+        assert!((master.beats_at(sample_rate) - 20.0).abs() < 1.0e-9);
+
+        // Half a second at 60 BPM adds 12 pulses (0.5 beat).
+        out.clear();
+        master.process(24_000, sample_rate, true, 60_000, &mut out);
+        assert_eq!(out.len(), 12);
+        assert!((master.beats_at(sample_rate) - 20.5).abs() < 1.0e-9);
+    }
 
     fn clock_at(bpm: f64, sample_rate: f32) -> Clock {
         let mut clock = Clock::new(sample_rate, 4.0);

@@ -154,6 +154,7 @@ pub(super) fn build_state_json(
         "transport_ui": model.transport_ui,
         "layout": model.layout,
         "midi_sync": model.midi_sync,
+        "clock": model.clock,
         "recorder": model.recorder,
         "strip_capacity": params.strip_count(),
         "bus_capacity": params.bus_count(),
@@ -164,6 +165,13 @@ pub(super) fn build_state_json(
 pub fn apply_model(params: &SharedParams, model: &MixerModel) {
     params.set_beats_per_bar(model.beats_per_bar);
     params.set_midi_sync(model.midi_sync);
+    params.set_clock_master(model.clock.master);
+    let clock_bpm = if model.clock.bpm.is_finite() {
+        model.clock.bpm.clamp(20.0, 400.0)
+    } else {
+        120.0
+    };
+    params.set_clock_bpm_milli((clock_bpm * 1000.0).round() as u32);
     for index in 0..params.strip_count() {
         params.set_strip_active(index, false);
     }
@@ -351,6 +359,10 @@ pub(super) fn load_session(path: &str) -> Result<MixerModel, String> {
         tracing::warn!(%error, %path, "session parse failed");
         error.to_string()
     })?;
+    if !model.clock.bpm.is_finite() {
+        model.clock.bpm = 120.0;
+    }
+    model.clock.bpm = model.clock.bpm.clamp(20.0, 400.0);
     // Sessions saved before the master bus was capitalised still say "master".
     if let Some(master) = model.buses.iter_mut().find(|bus| bus.id.0 == 0) {
         if master.name == "master" {

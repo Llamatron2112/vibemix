@@ -262,6 +262,15 @@ pub enum ControlMessage {
     SetMidiSync {
         on: bool,
     },
+    SetClockMaster {
+        on: bool,
+    },
+    SetClockBpm {
+        bpm: f32,
+    },
+    SetClockPlaying {
+        playing: bool,
+    },
     SetStripMidiChannel {
         strip: u32,
         channel: u32,
@@ -841,6 +850,18 @@ impl ControlMessage {
                 addr: addr::MIDI_SYNC.to_string(),
                 args: vec![OscType::Int(*on as i32)],
             },
+            SetClockMaster { on } => OscMessage {
+                addr: addr::CLOCK_MASTER.to_string(),
+                args: vec![OscType::Int(*on as i32)],
+            },
+            SetClockBpm { bpm } => OscMessage {
+                addr: addr::CLOCK_BPM.to_string(),
+                args: vec![OscType::Float(*bpm)],
+            },
+            SetClockPlaying { playing } => OscMessage {
+                addr: addr::CLOCK_PLAY.to_string(),
+                args: vec![OscType::Int(*playing as i32)],
+            },
             SetStripMidiChannel { strip, channel } => OscMessage {
                 addr: addr::STRIP_MIDI_CHANNEL.to_string(),
                 args: vec![OscType::Int(*strip as i32), OscType::Int(*channel as i32)],
@@ -1281,6 +1302,15 @@ impl ControlMessage {
             addr::MIDI_BINDINGS_CLEAR => Some(ControlMessage::MidiBindingsClear),
             addr::MIDI_SYNC => Some(ControlMessage::SetMidiSync {
                 on: int(args, 0)? != 0,
+            }),
+            addr::CLOCK_MASTER => Some(ControlMessage::SetClockMaster {
+                on: int(args, 0)? != 0,
+            }),
+            addr::CLOCK_BPM => Some(ControlMessage::SetClockBpm {
+                bpm: float(args, 0)?,
+            }),
+            addr::CLOCK_PLAY => Some(ControlMessage::SetClockPlaying {
+                playing: int(args, 0)? != 0,
             }),
             addr::STRIP_MIDI_CHANNEL => Some(ControlMessage::SetStripMidiChannel {
                 strip: int(args, 0)? as u32,
@@ -1931,6 +1961,13 @@ mod tests {
             jitter_bpm: 0.37,
             glitches: 2,
         });
+    }
+
+    #[test]
+    fn roundtrip_master_clock() {
+        roundtrip(ControlMessage::SetClockMaster { on: true });
+        roundtrip(ControlMessage::SetClockBpm { bpm: 123.456 });
+        roundtrip(ControlMessage::SetClockPlaying { playing: true });
     }
 
     #[test]

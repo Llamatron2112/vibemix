@@ -781,6 +781,7 @@ fn split_state(value: &serde_json::Value) -> (String, String) {
         "beats_per_bar": value.get("beats_per_bar").cloned().unwrap_or(serde_json::json!(4.0)),
         "midi_bindings": value.get("midi_bindings").cloned().unwrap_or(serde_json::json!([])),
         "transport_ui": value.get("transport_ui").cloned().unwrap_or(serde_json::json!({})),
+        "clock": value.get("clock").cloned().unwrap_or(serde_json::json!({})),
         "recorder": value.get("recorder").cloned().unwrap_or(serde_json::json!({})),
         "layout": value
             .get("layout")
@@ -1110,6 +1111,18 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setMidiSync"]
         fn set_midi_sync(&self, on: bool);
+
+        #[qinvokable]
+        #[cxx_name = "setClockMaster"]
+        fn set_clock_master(&self, on: bool);
+
+        #[qinvokable]
+        #[cxx_name = "setClockBpm"]
+        fn set_clock_bpm(&self, bpm: f32);
+
+        #[qinvokable]
+        #[cxx_name = "setClockPlaying"]
+        fn set_clock_playing(&self, playing: bool);
 
         #[qinvokable]
         #[cxx_name = "setLoadLastSessionOnStartup"]
@@ -1914,6 +1927,21 @@ impl qobject::Backend {
     pub fn set_midi_sync(&self, on: bool) {
         note_action("midi sync");
         send(ControlMessage::SetMidiSync { on });
+    }
+
+    pub fn set_clock_master(&self, on: bool) {
+        note_action("clock master");
+        send(ControlMessage::SetClockMaster { on });
+    }
+
+    pub fn set_clock_bpm(&self, bpm: f32) {
+        note_action("clock bpm");
+        send(ControlMessage::SetClockBpm { bpm });
+    }
+
+    pub fn set_clock_playing(&self, playing: bool) {
+        note_action("clock transport");
+        send(ControlMessage::SetClockPlaying { playing });
     }
 
     pub fn set_load_last_session_on_startup(mut self: Pin<&mut Self>, on: bool) {

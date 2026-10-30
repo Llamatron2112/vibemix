@@ -277,6 +277,9 @@ pub struct MixerModel {
     /// Loop recorder sources and save settings.
     #[serde(default)]
     pub recorder: crate::recorder::RecorderSettings,
+    /// MIDI clock mode and master tempo.
+    #[serde(default)]
+    pub clock: ClockSettings,
     /// Loop slots (metadata; the audio lives in the WAV files).
     #[serde(default)]
     pub loops: Vec<crate::recorder::LoopSlot>,
@@ -284,6 +287,34 @@ pub struct MixerModel {
     /// patch information was saved (connections are left alone).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub midi_connections: Option<Vec<String>>,
+    /// External JACK ports fed by the engine's MIDI output. `None` means no
+    /// patch information was saved.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub midi_out_connections: Option<Vec<String>>,
+}
+
+/// MIDI clock source and master tempo, saved with the session.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct ClockSettings {
+    /// Generate the clock internally instead of following `midi_in`.
+    #[serde(default)]
+    pub master: bool,
+    /// Internal tempo in BPM, used when `master` is set.
+    #[serde(default = "default_master_bpm")]
+    pub bpm: f32,
+}
+
+fn default_master_bpm() -> f32 {
+    120.0
+}
+
+impl Default for ClockSettings {
+    fn default() -> Self {
+        Self {
+            master: false,
+            bpm: default_master_bpm(),
+        }
+    }
 }
 
 fn default_beats_per_bar() -> f32 {
@@ -414,8 +445,10 @@ impl MixerModel {
             layout: LayoutSettings::default(),
             midi_sync: true,
             recorder: crate::recorder::RecorderSettings::default(),
+            clock: ClockSettings::default(),
             loops: Vec::new(),
             midi_connections: None,
+            midi_out_connections: None,
         }
     }
 

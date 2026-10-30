@@ -3,8 +3,8 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use jack::{
-    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, MidiIn, NotificationHandler, Port,
-    ProcessHandler, ProcessScope, Unowned,
+    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, MidiIn, MidiOut,
+    NotificationHandler, Port, ProcessHandler, ProcessScope, RawMidi, Unowned,
 };
 use rtrb::{Consumer, Producer};
 use vibemix_core::model::{BusConnections, MixerModel, PluginFormat, PluginSlot, StripConnections};
@@ -17,7 +17,7 @@ use crate::plugin::PluginNode;
 use crate::recorder::{bar_boundary_offset, LoopPlayback, RecordedTake, Recorder, MAX_LOOPS};
 
 use crate::dsp;
-use crate::midi::{Clock, MidiBlock};
+use crate::midi::{Clock, MasterClock, MidiBlock};
 use crate::midi_map::SharedMidi;
 use crate::params::{
     SharedClock, SharedMeters, SharedParams, SharedRecorder, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
@@ -204,7 +204,7 @@ pub struct PortInfo {
 
 #[derive(Debug, Clone, serde::Serialize)]
 pub struct PortRole {
-    /// `"strip_in"`, `"bus_out"`, `"bus_ret"` or `"midi_in"`.
+    /// `"strip_in"`, `"bus_out"`, `"bus_ret"`, `"midi_in"` or `"midi_out"`.
     pub kind: &'static str,
     pub id: u32,
     /// `"l"`, `"r"`, or empty for MIDI.
@@ -437,7 +437,12 @@ struct MixerGraph {
     bus_accum: Vec<[Vec<f32>; 2]>,
     capacity: usize,
     midi_in: Port<MidiIn>,
+    midi_out: Port<MidiOut>,
     midi: MidiBlock,
+    /// Generated clock/transport events for the current block.
+    master_midi: MidiBlock,
+    master: MasterClock,
+    master_active: bool,
     clock: Clock,
     shared_clock: Arc<SharedClock>,
     position: vibemix_lv2::TimePosition,
@@ -1337,25 +1342,89 @@ impl ProcessHandler for MixerGraph {
         // MIDI: collect the block's events and advance clock/transport state.
         // `raw.time` is the frame offset within the block.
         self.midi.clear();
+        self.master_midi.clear();
         self.transport_midi.clear();
-        for raw in self.midi_in.iter(scope) {
-            let event = MidiEvent::new(raw.time as i64, raw.bytes);
-            self.midi.push(event);
-            let status = event.as_slice().first().copied().unwrap_or(0);
-            if status >= 0xF8 || status == 0xF2 || status == 0xF3 {
-                self.transport_midi.push(event);
-            }
-        }
 
-        // Clock/transport always tracks the input so the GUI can show position.
-        let beats_before = self.clock.beats;
+        let master_mode = self.params.clock_master();
         let beats_per_bar = self.params.beats_per_bar();
-        self.clock.set_beats_per_bar(beats_per_bar);
-        self.clock.set_sample_rate(self.sample_rate);
-        self.clock.process_block(self.midi.as_slice(), frames);
-        let playing = self.clock.playing;
-        self.position = self.clock.position();
-        self.shared_clock.publish(&self.clock);
+        let beats_before;
+        let playing;
+
+        if master_mode {
+            // The internal clock owns the transport; incoming clock/transport
+            // is ignored so it cannot double-clock the graph.
+            for raw in self.midi_in.iter(scope) {
+                let event = MidiEvent::new(raw.time as i64, raw.bytes);
+                let status = event.as_slice().first().copied().unwrap_or(0);
+                if !(status >= 0xF8 || status == 0xF2 || status == 0xF3) {
+                    self.midi.push(event);
+                }
+            }
+            if !self.master_active {
+                self.master.reset();
+                self.master_active = true;
+            }
+            let (beats, frames_at_start) = self.master.process(
+                frames,
+                self.sample_rate as u32,
+                self.params.clock_playing(),
+                self.params.clock_bpm_milli(),
+                &mut self.master_midi,
+            );
+            beats_before = beats;
+            playing = self.master.is_playing();
+            for index in 0..self.master_midi.len() {
+                let event = self.master_midi.get(index);
+                self.transport_midi.push(event);
+                self.midi.push(event);
+            }
+            self.midi.sort_by_time();
+            self.position =
+                self.master
+                    .position(beats_before, frames_at_start, beats_per_bar, playing);
+            self.shared_clock.publish_state(
+                true,
+                playing,
+                self.master.bpm(),
+                beats_before,
+                frames_at_start,
+                0.0,
+                0,
+            );
+
+            // Clock/transport goes to the MIDI output in master mode only.
+            let mut writer = self.midi_out.writer(scope);
+            for index in 0..self.master_midi.len() {
+                let event = self.master_midi.get(index);
+                let _ = writer.write(&RawMidi {
+                    time: event.time.max(0) as Frames,
+                    bytes: event.as_slice(),
+                });
+            }
+        } else {
+            if self.master_active {
+                self.master.reset();
+                self.master_active = false;
+                self.clock = Clock::new(self.sample_rate, beats_per_bar);
+            }
+            for raw in self.midi_in.iter(scope) {
+                let event = MidiEvent::new(raw.time as i64, raw.bytes);
+                self.midi.push(event);
+                let status = event.as_slice().first().copied().unwrap_or(0);
+                if status >= 0xF8 || status == 0xF2 || status == 0xF3 {
+                    self.transport_midi.push(event);
+                }
+            }
+
+            // Clock/transport always tracks the input so the GUI can show position.
+            beats_before = self.clock.beats;
+            self.clock.set_beats_per_bar(beats_per_bar);
+            self.clock.set_sample_rate(self.sample_rate);
+            self.clock.process_block(self.midi.as_slice(), frames);
+            playing = self.clock.playing;
+            self.position = self.clock.position();
+            self.shared_clock.publish(&self.clock);
+        }
 
         // When MIDI sync is off, drop system realtime/transport messages so
         // plugins don't receive clock (notes/CC are still forwarded).
@@ -1479,6 +1548,7 @@ pub struct JackEngine {
     clock: Arc<SharedClock>,
     midi_map: Arc<SharedMidi>,
     midi_port: Port<Unowned>,
+    midi_out_port: Port<Unowned>,
     /// The sample rate the graph (delay lines, plugins) was actually built
     /// with. JACK/PipeWire may report a different rate at client creation than
     /// the graph settles on, so track this separately from the live rate.
@@ -1578,6 +1648,10 @@ impl JackEngine {
             .register_port("midi_in", MidiIn::default())
             .context("register midi input port")?;
         let midi_port = midi_in.clone_unowned();
+        let midi_out: Port<MidiOut> = client
+            .register_port("midi_out", MidiOut::default())
+            .context("register midi output port")?;
+        let midi_out_port = midi_out.clone_unowned();
         let shared_clock = Arc::new(SharedClock::new());
         let midi_map = Arc::new(SharedMidi::new());
 
@@ -1675,7 +1749,11 @@ impl JackEngine {
             capacity,
             buffer_size,
             midi_in,
+            midi_out,
             midi: MidiBlock::default(),
+            master_midi: MidiBlock::default(),
+            master: MasterClock::new(),
+            master_active: false,
             transport_midi: MidiBlock::default(),
             clock: Clock::new(sample_rate as f32, 4.0),
             shared_clock: Arc::clone(&shared_clock),
@@ -1724,6 +1802,7 @@ impl JackEngine {
             clock: shared_clock,
             midi_map,
             midi_port,
+            midi_out_port,
             graph_sample_rate: sample_rate as u32,
             strip_meta,
             bus_meta,
@@ -2332,6 +2411,7 @@ impl JackEngine {
     /// each bus output into the model, so a session save can restore them.
     pub fn capture_connections(&self, model: &mut MixerModel) {
         model.midi_connections = Some(self.midi_port.get_connections());
+        model.midi_out_connections = Some(self.midi_out_port.get_connections());
 
         for strip in &mut model.strips {
             let index = strip.id.0 as usize;
@@ -2383,6 +2463,16 @@ impl JackEngine {
                 "midi_in",
                 "midi in",
                 sources,
+                &mut missing,
+            );
+        }
+        if let Some(sinks) = &model.midi_out_connections {
+            restore_output(
+                client,
+                &self.midi_out_port,
+                "midi_out",
+                "midi out",
+                sinks,
                 &mut missing,
             );
         }
@@ -2566,6 +2656,15 @@ impl JackEngine {
                 &self.midi_port,
                 PortRole {
                     kind: "midi_in",
+                    id: 0,
+                    channel: "",
+                    label: "MIDI".to_string(),
+                },
+            );
+            add(
+                &self.midi_out_port,
+                PortRole {
+                    kind: "midi_out",
                     id: 0,
                     channel: "",
                     label: "MIDI".to_string(),

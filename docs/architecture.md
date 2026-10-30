@@ -212,9 +212,9 @@ queries the JACK port graph (`/vibemix/ports`) and issues
 `/vibemix/connect` / `/vibemix/disconnect` for one source (output) and sink
 (input). The matrix only enables connections involving vibemix's own ports, so
 everything it changes is covered by the saved-connection model above. A separate
-`Options → MIDI input…` window patches the single `midi_in` port. The port graph
-is refreshed on open and periodically while a window is visible, since clients
-come and go.
+`Options → MIDI routing…` window patches `midi_in` from external MIDI outputs
+and `midi_out` to external MIDI inputs. The port graph is refreshed on open and
+periodically while a window is visible, since clients come and go.
 
 ## Plugin hosting
 
@@ -698,10 +698,12 @@ through a separate launcher window.
 
 ### Phase 6 - MIDI
 
-The mixer is a MIDI **clock slave** (computers make poor clock masters): it
-follows an incoming 24 PPQN MIDI clock to derive tempo and transport, and never
-generates clock. A single JACK `MidiIn` port carries clock, transport, notes and
-CC; a matching `MidiOut` (feedback) is deferred.
+The mixer can be a MIDI **clock slave** or **clock master**. As slave it follows
+an incoming 24 PPQN MIDI clock to derive tempo and transport. As master it
+generates the clock internally, sends it on a JACK `MidiOut` port, and ignores
+incoming clock/transport so the two cannot double-clock the graph. A single
+`MidiIn` port carries clock, transport, notes and CC; `MidiOut` carries the
+generated clock/transport in master mode (silent in slave mode).
 
 - **Host tempo:** each block a `time:Position` atom (`frame`, `beat`, `bar`,
   `barBeat`, `beatsPerMinute`, `beatsPerBar`, `beatUnit`, `speed`) is forged into
@@ -713,11 +715,17 @@ CC; a matching `MidiOut` (feedback) is deferred.
   effects (e.g. ZamDelay) follow the clock too. Plugins with their own sync
   switch still need it enabled (LSP's flanger/phaser require **Tempo sync** plus
   **Time computing method = Tempo**).
-- **Transport:** `0xFA` Start (reset position), `0xFB` Continue (resume), `0xFC`
-  Stop (hold position), optional `0xF2` Song Position; a "locked" state with a
-  timeout when clock stops. Inter-pulse intervals are kept in a short window to
-  publish tempo jitter (std-dev of the instantaneous BPM) and a glitch count
-  (missed or extra pulses).
+- **Transport:** as slave, `0xFA` Start (reset position), `0xFB` Continue
+  (resume), `0xFC` Stop (hold position), optional `0xF2` Song Position; a
+  "locked" state with a timeout when clock stops. Inter-pulse intervals are kept
+  in a short window to publish tempo jitter (std-dev of the instantaneous BPM)
+  and a glitch count (missed or extra pulses).
+- **Master clock:** a fixed-point phase accumulator advances 24 PPQN one sample
+  at a time (`phase += millibpm`, overflow = pulse), so pulse spacing is exact
+  and drift-free. The phase is reset on stop; play always emits `START`, stop
+  emits `STOP`. Clock and transport events are merged into the block's MIDI
+  list and written to `MidiOut` at their sample offsets. The tempo is stored as
+  integer millibpm and saved in the session (`[clock] master/bpm`).
 - **Control surface:** incoming CC is matched against a per-session binding table
   (fixed, lock-free, applied on the audio thread) and drives strip fader (gain),
   pan, mute, solo, bus fader (gain), bus mute, send gain/delay, and plugin
@@ -732,10 +740,11 @@ CC; a matching `MidiOut` (feedback) is deferred.
   ±BPM plus a count of glitchy pulses); both are toggled from a right-click
   menu, which also toggles the beats:bars and minutes:seconds counters and
   opens a small loop-settings popup (unit beats/bars, value, beats-per-bar).
-  In beats mode the loop indicator groups its cells by bar with a wider gap
-  between bars. The engine publishes `{ locked, playing, bpm, beats_since_start,
-  seconds_since_start, jitter_bpm, glitches }` at meter rate; counter/loop
-  settings live in the session.
+  In master mode the BPM readout opens a tempo dialog and the transport button
+  starts/stops the internal clock. In beats mode the loop indicator groups its
+  cells by bar with a wider gap between bars. The engine publishes
+  `{ locked, playing, bpm, beats_since_start, seconds_since_start, jitter_bpm,
+  glitches }` at meter rate; counter/loop settings live in the session.
 - **Channels:** each strip and bus owns an optional MIDI channel ("any", or
   1-16) set from the bindings grid; its fader/pan/mute/solo/send bindings
   listen on that channel (several strips may share one, and mixer bindings
@@ -745,7 +754,7 @@ CC; a matching `MidiOut` (feedback) is deferred.
   from the plugin editor (right-click a parameter row for CC/Learn/Clear), and
   active bindings show as `channel:CC` beside the row.
 - **Out of scope:** instruments and MIDI-only plugins (would drift toward a DAW
-  / sequencer); clock generation; MIDI output/feedback (future).
+  / sequencer); MIDI feedback loops and MIDI routing beyond clock/transport.
 
 Designations: LV2 remains the primary format. VST3 and CLAP hosting sit behind
 the same format-agnostic `PluginNode` trait: discovery, add, DSP, parameter
