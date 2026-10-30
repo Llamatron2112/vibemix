@@ -623,10 +623,12 @@ through a separate launcher window.
   the tap), optionally refines it with transient detection, and applies the
   manual offset. All offsets are a circular rotation:
   `out[i] = in[(i + nudge) mod frames]`.
-- The launcher installs the rotated buffer through the command queue; playback
-  is mixed into the master input and starts on the next bar when quantized.
-  Buffers are retired through a garbage queue, so no allocation or free happens
-  on the audio thread.
+- The launcher installs the raw buffer through the command queue and keeps the
+  rotation as a playback offset (`(pos + offset) mod frames`); nudging sends a
+  lightweight offset update, so a playing loop keeps running. Playback is mixed
+  into the master input and starts on the next bar when quantized. Buffers are
+  retired through a garbage queue, so no allocation or free happens on the
+  audio thread.
 - WAV files are written by the control thread at 16-bit, 24-bit or 32-bit
   float to the path chosen in the GUI's save dialog (default
   `VIBEMIX_CONFIG_DIR/loops/`). The chosen directory is remembered in the
@@ -634,11 +636,12 @@ through a separate launcher window.
   metadata and paths.
 - The editor requests an envelope for the visible window on demand; the
   launcher cards keep a smaller whole-loop envelope. The view is free pan/zoom
-  (horizontal drag pans, vertical drag zooms). Navigation updates the view
-  continuously but requests a new resolution only after the gesture settles
-  (120 ms), stretching the previous peaks in the meantime; Alt-drag sends
-  throttled window requests with a temporary nudge override (audio is unchanged
-  until release), so the zoomed view keeps its resolution while being dragged.
+  (horizontal drag pans, vertical drag zooms). Navigation keeps the last
+  window's samples and envelope, remaps them into the new view, and requests a
+  new resolution only after the gesture settles (120 ms), so zooming never
+  falls back to the whole-loop envelope; Alt-drag sends throttled window
+  requests with a temporary nudge override (audio is unchanged until release),
+  so the zoomed view keeps its resolution while being dragged.
 - The controller caches multiple raw transient onsets per loop, detected with
   spectral flux (short-time FFT, log-magnitude positive differences weighted
   toward high bins, local adaptive peak picking). This works on compressed or

@@ -219,7 +219,10 @@ impl Controller {
         } else {
             (request.buckets as usize).clamp(512, 32_768)
         };
-        let peaks = if samples.is_empty() {
+        // Always return an envelope: when raw samples are sent it is the
+        // current window's resolution, so the editor can keep that detail
+        // while zooming out instead of falling back to the whole loop.
+        let peaks = {
             let mut peaks = vec![0.0f32; buckets];
             for (bucket, peak) in peaks.iter_mut().enumerate() {
                 let from = start + span * bucket / buckets;
@@ -235,8 +238,6 @@ impl Controller {
                 }
             }
             peaks
-        } else {
-            Vec::new()
         };
         // High-pass energy (first difference) for the visual HF strip. Long
         // windows are skipped; zooming in brings it back.
@@ -366,7 +367,6 @@ impl Controller {
         };
         let manual = self.model.recorder.nudge_samples;
         let total = base + transient + manual;
-        let rotated = rotate_interleaved(&raw, frames, total);
         let loop_peaks = peaks(&raw, frames, LOOP_PEAK_BUCKETS);
 
         let Some(slot_index) = self.loops.iter().position(Option::is_none) else {
@@ -399,9 +399,9 @@ impl Controller {
             playing: false,
             saved: false,
         };
-        if let Err(error) = self
-            .engine
-            .set_loop(slot_index, rotated.into_boxed_slice(), frames)
+        if let Err(error) =
+            self.engine
+                .set_loop(slot_index, raw.clone().into_boxed_slice(), frames, total)
         {
             tracing::warn!(%error, "failed to install recorded loop");
             self.recorder_status.message = error.to_string();
@@ -616,7 +616,7 @@ impl Controller {
         self.set_loop_total(slot, total);
     }
 
-    /// Set the total rotation and reinstall the playback buffer.
+    /// Set the total rotation without interrupting playback.
     pub(super) fn set_loop_total(&mut self, slot: u32, total: i64) {
         let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) else {
             return;
@@ -624,11 +624,8 @@ impl Controller {
         runtime.slot.nudge_samples = total;
         runtime.slot.manual_nudge = total - runtime.slot.base_nudge - runtime.slot.transient_nudge;
         runtime.slot.saved = false;
-        let frames = runtime.slot.frames as usize;
-        let rotated = rotate_interleaved(&runtime.raw, frames, total);
-        let _ = self
-            .engine
-            .set_loop(slot as usize, rotated.into_boxed_slice(), frames);
+        // Update the playback rotation in place; the loop keeps playing.
+        let _ = self.engine.loop_offset(slot as usize, total);
         self.rebuild_model_loops();
         self.loops_dirty = true;
     }
@@ -780,7 +777,12 @@ impl Controller {
                     slot.peaks = peaks(&raw, frames, LOOP_PEAK_BUCKETS);
                     if self
                         .engine
-                        .set_loop(index, raw.clone().into_boxed_slice(), frames)
+                        .set_loop(
+                            index,
+                            raw.clone().into_boxed_slice(),
+                            frames,
+                            slot.nudge_samples,
+                        )
                         .is_ok()
                     {
                         let transients = detect_transients_with_sensitivity(

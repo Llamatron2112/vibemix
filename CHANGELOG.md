@@ -8,6 +8,14 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Zooming the loop editor no longer drops back to the whole-loop envelope.**
+  The editor keeps the last window's samples and envelope, remaps them into the
+  new view, and only requests a new resolution after the gesture settles.
+  Envelopes are now returned alongside raw samples, so zooming out of raw mode
+  keeps the current window's detail.
+- **Nudging a playing loop no longer stops it.** The rotation moved from the
+  audio buffer to a playback offset; nudge, snap-transient and seam-snap update
+  that offset in place, keeping the position and playback state.
 - **Mute/fader smoothing** was applied once per audio block, so mute took
   seconds to fully silence and steps were audible at large buffer sizes. Gains,
   pan and send delays now use time-based smoothing with per-sample ramps, so

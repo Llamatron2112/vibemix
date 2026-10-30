@@ -5874,7 +5874,7 @@ ApplicationWindow {
             var s = Math.max(0, Math.min(frames - span, Math.round(start)))
             return { start: s, end: s + span }
         }
-        function requestWaveform(nudge, clearPeaks) {
+        function requestWaveform(nudge) {
             var slot = currentSlot()
             if (!slot || !slot.frames) return
             if (!(viewEnd > viewStart)) {
@@ -5885,13 +5885,6 @@ ApplicationWindow {
             viewStart = Math.round(view.start)
             viewEnd = Math.round(view.end)
             waveSeq += 1
-            if (clearPeaks) {
-                editorPeaks = []
-                waveSamples = []
-                waveHf = []
-                waveStart = view.start
-                waveEnd = view.end
-            }
             var full = view.start === 0 && view.end === slot.frames
             root.sendRecorderAction({
                 action: "waveform",
@@ -5926,7 +5919,7 @@ ApplicationWindow {
             if (!slot) return
             viewStart = 0
             viewEnd = slot.frames
-            requestWaveform(null, true)
+            requestWaveform(null)
         }
         function setSpan(span, anchorFrame) {
             var slot = currentSlot()
@@ -5939,7 +5932,7 @@ ApplicationWindow {
             var view = clampView(start, start + next)
             viewStart = view.start
             viewEnd = view.end
-            requestWaveform(null, true)
+            requestWaveform(null)
             ruler.requestPaint()
         }
         function setSpanLive(span, anchorFrame) {
@@ -5953,12 +5946,8 @@ ApplicationWindow {
             var view = clampView(start, start + next)
             viewStart = view.start
             viewEnd = view.end
-            // Keep the previous peaks stretched over the new window until the
-            // settle timer asks for the matching resolution.
-            waveStart = view.start
-            waveEnd = view.end
-            waveSamples = []
-            waveHf = []
+            // Keep the loaded window and let the painter stretch it into the
+            // new view; the settle timer asks for the matching resolution.
             settleTimer.restart()
             ruler.requestPaint()
         }
@@ -6070,7 +6059,7 @@ ApplicationWindow {
             saveDepth = root.recorderSettings().bit_depth
             saveNormalize = opened ? opened.normalize === true : false
             requestBase()
-            requestWaveform(null, true)
+            requestWaveform(null)
             visible = true
         }
 
@@ -6105,7 +6094,7 @@ ApplicationWindow {
             }
             function onLoopsChanged() {
                 if (loopEditor.visible && !loopEditor.dragging && !loopEditor.navigating) {
-                    loopEditor.requestWaveform(null, false)
+                    loopEditor.requestWaveform(null)
                 }
             }
         }
@@ -6195,19 +6184,27 @@ ApplicationWindow {
                         if (!slot || width <= 0) return
 
                         var frames = Math.max(1, slot.frames || 1)
-                        var viewStart = loopEditor.waveStart
-                        var viewEnd = loopEditor.waveEnd
+                        var viewStart = loopEditor.viewStart
+                        var viewEnd = loopEditor.viewEnd
                         if (!(viewEnd > viewStart)) {
                             viewStart = 0
                             viewEnd = frames
                         }
                         var span = Math.max(1, viewEnd - viewStart)
+                        // The last loaded window. It stays put while the view
+                        // moves, so the current resolution can be stretched
+                        // into the new view until the settled request returns.
+                        var dataStart = loopEditor.waveStart
+                        var dataEnd = loopEditor.waveEnd
+                        var haveWindow = dataEnd > dataStart
+                        var windowPeaks = loopEditor.editorPeaks
                         var samples = loopEditor.waveSamples
-                        var full = samples.length === 0 && loopEditor.editorPeaks.length === 0
-                        var peaks = full
-                            ? (loopEditor.basePeaks.length > 0 ? loopEditor.basePeaks : (slot.peaks || []))
-                            : loopEditor.editorPeaks
-                        if (samples.length === 0 && (!peaks || peaks.length === 0)) return
+                        var base = loopEditor.basePeaks.length > 0
+                            ? loopEditor.basePeaks : (slot.peaks || [])
+                        var haveWindowPeaks = haveWindow && windowPeaks.length > 0
+                        var haveSamples = samples.length > 1 && haveWindow
+                            && viewStart >= dataStart - 1 && viewEnd <= dataEnd + 1
+                        if (!haveWindowPeaks && base.length === 0 && !haveSamples) return
 
                         ctx.strokeStyle = root.borderColor
                         ctx.beginPath()
@@ -6217,43 +6214,66 @@ ApplicationWindow {
 
                         var total = loopEditor.displayTotal()
                         var phase = ((total % frames) + frames) % frames / frames
+                        var dataSpan = Math.max(1, dataEnd - dataStart)
 
-                        if (samples.length > 1) {
+                        function windowPeak(f0, f1) {
+                            var from = Math.max(0, Math.min(1, (f0 - dataStart) / dataSpan))
+                            var to = Math.max(0, Math.min(1, (f1 - dataStart) / dataSpan))
+                            var j0 = Math.floor(from * windowPeaks.length)
+                            var j1 = Math.max(j0 + 1, Math.ceil(to * windowPeaks.length))
+                            return loopEditor.peakMax(windowPeaks, j0,
+                                Math.min(windowPeaks.length, j1))
+                        }
+                        function basePeak(f0, f1) {
+                            if (base.length === 0) return 0
+                            var p0 = (((f0 / frames) + phase) % 1 + 1) % 1
+                            var p1 = (((f1 / frames) + phase) % 1 + 1) % 1
+                            var i0 = Math.floor(p0 * base.length)
+                            var i1 = Math.floor(p1 * base.length)
+                            if (i1 <= i0) i1 = i0 + 1
+                            if (p1 >= p0) {
+                                return loopEditor.peakMax(base, i0, Math.min(base.length, i1))
+                            }
+                            return Math.max(
+                                loopEditor.peakMax(base, i0, base.length),
+                                loopEditor.peakMax(base, 0, Math.min(base.length, i1))
+                            )
+                        }
+
+                        if (haveSamples) {
+                            // Raw samples, one per frame, at the resolution of
+                            // the last window. Map them by frame and draw only
+                            // the part that is visible.
                             ctx.strokeStyle = root.mutedText
                             ctx.beginPath()
+                            var started = false
                             for (var n = 0; n < samples.length; n++) {
-                                var sx = n / Math.max(1, samples.length - 1) * width
+                                var frame = dataStart + n
+                                if (frame < viewStart - 1 || frame > viewEnd + 1) continue
+                                var sx = (frame - viewStart) / span * width
                                 var sample = Math.max(-1.5, Math.min(1.5, samples[n]))
                                 var sy = height * 0.5 - sample * height * 0.45
-                                if (n === 0) ctx.moveTo(sx, sy)
-                                else ctx.lineTo(sx, sy)
+                                if (!started) {
+                                    ctx.moveTo(sx, sy)
+                                    started = true
+                                } else {
+                                    ctx.lineTo(sx, sy)
+                                }
                             }
                             ctx.stroke()
                         } else {
                             ctx.strokeStyle = root.mutedText
                             ctx.beginPath()
                             for (var x = 0; x < width; x++) {
+                                var f0 = viewStart + (x / Math.max(1, width)) * span
+                                var f1 = viewStart + ((x + 1) / Math.max(1, width)) * span
                                 var a = 0
-                                if (full) {
-                                    var f0 = viewStart + (x / Math.max(1, width)) * span
-                                    var f1 = viewStart + ((x + 1) / Math.max(1, width)) * span
-                                    var p0 = (((f0 / frames) + phase) % 1 + 1) % 1
-                                    var p1 = (((f1 / frames) + phase) % 1 + 1) % 1
-                                    var i0 = Math.floor(p0 * peaks.length)
-                                    var i1 = Math.floor(p1 * peaks.length)
-                                    if (i1 <= i0) i1 = i0 + 1
-                                    if (p1 >= p0) {
-                                        a = loopEditor.peakMax(peaks, i0, Math.min(peaks.length, i1))
-                                    } else {
-                                        a = Math.max(
-                                            loopEditor.peakMax(peaks, i0, peaks.length),
-                                            loopEditor.peakMax(peaks, 0, Math.min(peaks.length, i1))
-                                        )
-                                    }
+                                if (haveWindowPeaks && f1 > dataStart && f0 < dataEnd) {
+                                    // Use the loaded window where it covers the
+                                    // view; the whole loop only fills the gaps.
+                                    a = windowPeak(Math.max(f0, dataStart), Math.min(f1, dataEnd))
                                 } else {
-                                    var j0 = Math.floor((x / Math.max(1, width)) * peaks.length)
-                                    var j1 = Math.max(j0 + 1, Math.floor(((x + 1) / Math.max(1, width)) * peaks.length))
-                                    a = loopEditor.peakMax(peaks, j0, Math.min(peaks.length, j1))
+                                    a = basePeak(f0, f1)
                                 }
                                 var amp = a * height * 0.45
                                 ctx.moveTo(x, height * 0.5 - amp)
@@ -6348,7 +6368,7 @@ ApplicationWindow {
                     onTriggered: {
                         if (!loopEditor.visible) return
                         if (loopEditor.dragging) {
-                            loopEditor.requestWaveform(loopEditor.displayTotal(), false)
+                            loopEditor.requestWaveform(loopEditor.displayTotal())
                         }
                     }
                 }
@@ -6363,7 +6383,7 @@ ApplicationWindow {
                     running: false
                     onTriggered: {
                         if (!loopEditor.visible || loopEditor.dragging) return
-                        loopEditor.requestWaveform(null, false)
+                        loopEditor.requestWaveform(null)
                     }
                 }
 
@@ -6403,7 +6423,7 @@ ApplicationWindow {
                             loopEditor.dragging = true
                             loopEditor.navigating = false
                             loopEditor.applying = false
-                            loopEditor.requestWaveform(loopEditor.displayTotal(), false)
+                            loopEditor.requestWaveform(loopEditor.displayTotal())
                             requestTimer.start()
                         } else {
                             loopEditor.navigating = true
@@ -6425,7 +6445,7 @@ ApplicationWindow {
                             var dy = mouse.y - pressY
                             if (Math.abs(dx) + Math.abs(dy) > 2) moved = true
                             if (loopEditor.dragging) {
-                                var span = Math.max(1, loopEditor.waveEnd - loopEditor.waveStart)
+                                var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                                 var delta = (mouse.modifiers & Qt.ShiftModifier)
                                     ? -Math.round(dx)
                                     : -Math.round(dx * span / Math.max(1, width))
@@ -6444,13 +6464,9 @@ ApplicationWindow {
                                 var view = loopEditor.clampView(newStart, newStart + newSpan)
                                 loopEditor.viewStart = view.start
                                 loopEditor.viewEnd = view.end
-                                loopEditor.waveStart = view.start
-                                loopEditor.waveEnd = view.end
-                                // Keep the last peaks and stretch them over the
-                                // new window; the resolution request follows
-                                // once the gesture settles.
-                                loopEditor.waveSamples = []
-                                loopEditor.waveHf = []
+                                // Leave the loaded window untouched; the
+                                // painter stretches it over the new view until
+                                // the settled request returns.
                                 settleTimer.restart()
                                 ruler.requestPaint()
                             }
@@ -6472,7 +6488,7 @@ ApplicationWindow {
                             } else {
                                 loopEditor.applying = false
                             }
-                            loopEditor.requestWaveform(null, false)
+                            loopEditor.requestWaveform(null)
                         } else if (loopEditor.navigating) {
                             settleTimer.stop()
                             loopEditor.navigating = false
@@ -6495,7 +6511,7 @@ ApplicationWindow {
                                 }
                                 if (best >= 0) loopEditor.snapTransient(best)
                             } else if (moved) {
-                                loopEditor.requestWaveform(null, false)
+                                loopEditor.requestWaveform(null)
                             }
                         }
                         editorWave.requestPaint()
@@ -6507,7 +6523,7 @@ ApplicationWindow {
                         loopEditor.dragging = false
                         loopEditor.navigating = false
                         loopEditor.applying = false
-                        loopEditor.requestWaveform(null, true)
+                        loopEditor.requestWaveform(null)
                     }
                     onExited: {
                         loopEditor.cursorFrame = -1
@@ -6558,7 +6574,11 @@ ApplicationWindow {
                         if (!slot) return ""
                         var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                         var ms = slot.sample_rate > 0 ? span * 1000 / slot.sample_rate : 0
-                        var mode = loopEditor.waveSamples.length > 0 ? "raw" : "envelope"
+                        var raw = loopEditor.waveSamples.length > 1
+                            && loopEditor.waveEnd > loopEditor.waveStart
+                            && loopEditor.viewStart >= loopEditor.waveStart - 1
+                            && loopEditor.viewEnd <= loopEditor.waveEnd + 1
+                        var mode = raw ? "raw" : "envelope"
                         var cursor = loopEditor.cursorText()
                         return mode + " · " + ms.toFixed(2) + " ms · " + Math.round(span) + " smp"
                             + (cursor.length > 0 ? " · " + cursor : "")

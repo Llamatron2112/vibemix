@@ -325,6 +325,12 @@ pub enum EngineCommand {
         slot: usize,
         buffer: Box<[f32]>,
         frames: usize,
+        offset: i64,
+    },
+    /// Change the playback rotation in place, keeping the loop running.
+    LoopOffset {
+        slot: usize,
+        offset: i64,
     },
     ClearLoop {
         slot: usize,
@@ -648,14 +654,23 @@ impl MixerGraph {
                     slot,
                     buffer,
                     frames,
+                    offset,
                 } => {
                     if slot < self.loop_slots.len() {
                         if let Some(old) = self.loop_slots[slot].take() {
                             self.retire_buffer(old.buffer);
                         }
-                        self.loop_slots[slot] = Some(LoopPlayback::new(buffer, frames));
+                        let mut playback = LoopPlayback::new(buffer, frames);
+                        playback.set_offset(offset);
+                        self.loop_slots[slot] = Some(playback);
                     } else {
                         self.retire_buffer(buffer);
+                    }
+                }
+                EngineCommand::LoopOffset { slot, offset } => {
+                    if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
+                    {
+                        loop_slot.set_offset(offset);
                     }
                 }
                 EngineCommand::ClearLoop { slot } => {
@@ -1768,13 +1783,27 @@ impl JackEngine {
             .map_err(|_| anyhow!("engine command queue full"))
     }
 
-    pub fn set_loop(&mut self, slot: usize, buffer: Box<[f32]>, frames: usize) -> Result<()> {
+    pub fn set_loop(
+        &mut self,
+        slot: usize,
+        buffer: Box<[f32]>,
+        frames: usize,
+        offset: i64,
+    ) -> Result<()> {
         self.commands
             .push(EngineCommand::SetLoop {
                 slot,
                 buffer,
                 frames,
+                offset,
             })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    /// Change a loop's playback rotation without replacing its buffer.
+    pub fn loop_offset(&mut self, slot: usize, offset: i64) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopOffset { slot, offset })
             .map_err(|_| anyhow!("engine command queue full"))
     }
 

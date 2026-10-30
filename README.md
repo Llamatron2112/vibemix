@@ -72,8 +72,10 @@ small OSC control protocol.
   seam" are shortcuts, and the sensitivity slider re-runs the detector on that
   loop. The HF strip shows high-frequency energy; close zoom (or the `samples`
   button) draws raw samples, which is where high-frequency detail becomes
-  visible. Panning and zooming settle for 120 ms before requesting a new
-  resolution, so the waveform moves smoothly. A MIDI clock is required to
+  visible. Panning and zooming keep the current window's detail and request a
+  new resolution after 120 ms, so the waveform moves smoothly instead of
+  snapping back to the whole-loop envelope. Nudging a playing loop changes its
+  playback rotation in place, so it keeps playing. A MIDI clock is required to
   record.
 - **Patchbay**: `Options → Patchbay…` shows a source (rows) × sink (columns)
   matrix; pick the device on each axis. Tick a cell to connect. Only

@@ -326,6 +326,8 @@ pub struct LoopPlayback {
     pub buffer: Box<[f32]>,
     pub frames: usize,
     pub pos: usize,
+    /// Circular read offset: positive values start earlier in the raw buffer.
+    pub offset: usize,
     pub playing: bool,
     pub pending: bool,
     pub quantized: bool,
@@ -343,6 +345,7 @@ impl LoopPlayback {
             buffer,
             frames,
             pos: 0,
+            offset: 0,
             playing: false,
             pending: false,
             quantized: true,
@@ -350,6 +353,15 @@ impl LoopPlayback {
             mute: false,
             stopping: false,
             level: 1.0,
+        }
+    }
+
+    /// Change the rotation without touching the buffer or playback state.
+    pub fn set_offset(&mut self, offset: i64) {
+        if self.frames == 0 {
+            self.offset = 0;
+        } else {
+            self.offset = offset.rem_euclid(self.frames as i64) as usize;
         }
     }
 
@@ -405,7 +417,11 @@ impl LoopPlayback {
             let step = (level_end - level_start) / count.max(1) as f32;
             for (n, i) in (from..frames).enumerate() {
                 let level = level_start + step * n as f32;
-                let index = self.pos * 2;
+                let mut read = self.pos + self.offset;
+                if read >= self.frames {
+                    read -= self.frames;
+                }
+                let index = read * 2;
                 out_l[i] += self.buffer[index] * level;
                 out_r[i] += self.buffer[index + 1] * level;
                 self.pos += 1;
@@ -444,6 +460,26 @@ mod tests {
         assert_eq!(playback.pos, 6);
         playback.mix(&mut l, &mut r, 0, 6, 1.0);
         assert_eq!(playback.pos, 4);
+    }
+
+    #[test]
+    fn offset_rotates_without_stopping() {
+        let mut playback = loop_with(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        playback.set_offset(3);
+        assert!(playback.playing);
+        let (mut l, mut r) = ([0.0f32; 4], [0.0f32; 4]);
+        playback.mix(&mut l, &mut r, 0, 4, 1.0);
+        assert_eq!(l, [3.0, 4.0, 5.0, 6.0]);
+        assert!(playback.playing);
+
+        // Changing the rotation keeps the phase and the playback state.
+        playback.set_offset(5);
+        assert!(playback.playing);
+        l.fill(0.0);
+        r.fill(0.0);
+        playback.mix(&mut l, &mut r, 0, 4, 1.0);
+        assert_eq!(l, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(playback.pos, 0);
     }
 
     #[test]
