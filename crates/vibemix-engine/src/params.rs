@@ -612,6 +612,10 @@ pub struct SharedMeters {
     bus_ret_r: Vec<AtomicU32>,
     bus_l: Vec<AtomicU32>,
     bus_r: Vec<AtomicU32>,
+    /// Audio-callback time as a fraction of the period (smoothed average and a
+    /// slowly decaying peak); 1.0 means the callback used its whole budget.
+    dsp_avg: AtomicU32,
+    dsp_peak: AtomicU32,
 }
 
 /// A snapshot of every meter, grouped by tap point. Strip values are indexed by
@@ -651,7 +655,22 @@ impl SharedMeters {
             bus_ret_r: zero_vec(bus_count),
             bus_l: zero_vec(bus_count),
             bus_r: zero_vec(bus_count),
+            dsp_avg: AtomicU32::new(0.0f32.to_bits()),
+            dsp_peak: AtomicU32::new(0.0f32.to_bits()),
         }
+    }
+
+    pub fn store_dsp(&self, average: f32, peak: f32) {
+        self.dsp_avg.store(average.to_bits(), Ordering::Relaxed);
+        self.dsp_peak.store(peak.to_bits(), Ordering::Relaxed);
+    }
+
+    /// `(average, peak)` callback load as a fraction of the period.
+    pub fn dsp_load(&self) -> (f32, f32) {
+        (
+            f32::from_bits(self.dsp_avg.load(Ordering::Relaxed)),
+            f32::from_bits(self.dsp_peak.load(Ordering::Relaxed)),
+        )
     }
 
     pub fn store_strip_in(&self, strip: usize, left: f32, right: f32) {
@@ -1073,7 +1092,13 @@ pub struct SharedRecorder {
     loop_beats: AtomicU32,
     source_count: AtomicU32,
     sources: [AtomicU32; MAX_RECORD_SOURCES],
+    /// Why the audio thread last discarded a take (`DISCARD_*`), 0 = none. The
+    /// audio thread cannot log, so the control thread reports it.
+    discard: AtomicU32,
 }
+
+pub const DISCARD_LOST_CLOCK: u32 = 1;
+pub const DISCARD_OVERFLOW: u32 = 2;
 
 impl SharedRecorder {
     pub fn new() -> Self {
@@ -1085,7 +1110,17 @@ impl SharedRecorder {
             loop_beats: AtomicU32::new(4.0f32.to_bits()),
             source_count: AtomicU32::new(0),
             sources: std::array::from_fn(|_| AtomicU32::new(0)),
+            discard: AtomicU32::new(0),
         }
+    }
+
+    pub fn note_discard(&self, reason: u32) {
+        self.discard.store(reason, Ordering::Release);
+    }
+
+    /// Returns and clears the reason a take was discarded, if any.
+    pub fn take_discard(&self) -> u32 {
+        self.discard.swap(0, Ordering::AcqRel)
     }
 
     pub fn set_state(&self, state: RecorderState) {

@@ -1,9 +1,9 @@
 //! Format-agnostic plugin node, hosted by the RT graph.
 //!
-//! The engine talks to hosted plugins only through this trait, so a second
-//! format (VST3) can join the graph without touching the mixer. LV2 is the only
-//! implementation today; state capture/UI still go through the LV2-specific
-//! accessors stored alongside (see `backend_jack`).
+//! The engine talks to hosted plugins only through this trait, so every format
+//! (LV2, VST3, CLAP) joins the graph without touching the mixer. State capture
+//! and editors still go through format-specific handles stored alongside (see
+//! `backend_jack`).
 
 use std::sync::Arc;
 

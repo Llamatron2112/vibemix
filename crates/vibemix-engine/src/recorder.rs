@@ -174,7 +174,7 @@ impl Recorder {
             } else {
                 self.since_pulse += frames;
                 if self.since_pulse > sample_rate as usize {
-                    tracing::warn!("recorder lost the MIDI clock; take discarded");
+                    shared.note_discard(crate::params::DISCARD_LOST_CLOCK);
                     self.cancel(garbage, shared);
                     return;
                 }
@@ -260,11 +260,7 @@ impl Recorder {
         if to > from {
             let count = to - from;
             if self.write + count > self.capacity_frames {
-                tracing::warn!(
-                    needed = self.write + count,
-                    capacity = self.capacity_frames,
-                    "recorder buffer overflow; take discarded"
-                );
+                shared.note_discard(crate::params::DISCARD_OVERFLOW);
                 self.cancel(garbage, shared);
                 return;
             }
@@ -335,6 +331,10 @@ pub struct LoopPlayback {
     pub quantized: bool,
     pub gain: f32,
     pub mute: bool,
+    /// Fading out before it stops, so a stop does not click.
+    pub stopping: bool,
+    /// Smoothed output level (follows `gain`, `mute` and `stopping`).
+    level: f32,
 }
 
 impl LoopPlayback {
@@ -348,23 +348,75 @@ impl LoopPlayback {
             quantized: true,
             gain: 1.0,
             mute: false,
+            stopping: false,
+            level: 1.0,
         }
     }
 
-    /// Mix this loop into the master accumulator from `start` onwards.
-    pub fn mix(&mut self, out_l: &mut [f32], out_r: &mut [f32], start: usize, frames: usize) {
-        if !self.playing || self.mute || self.frames == 0 {
+    /// Starts playback from the top at full level (a quantized launch should
+    /// hit the downbeat, not fade in).
+    pub fn start(&mut self) {
+        self.pos = 0;
+        self.playing = true;
+        self.pending = false;
+        self.stopping = false;
+        self.level = self.target();
+    }
+
+    /// Asks the loop to stop; it fades out over a few ms and then goes idle.
+    pub fn stop(&mut self) {
+        self.pending = false;
+        if self.playing {
+            self.stopping = true;
+        }
+    }
+
+    fn target(&self) -> f32 {
+        if self.mute || self.stopping {
+            0.0
+        } else {
+            self.gain
+        }
+    }
+
+    /// Mix this loop into the master accumulator from `start` onwards. `coeff`
+    /// is the per-block smoothing coefficient for gain/mute/stop changes. A
+    /// muted loop keeps advancing so it stays on the bar grid.
+    pub fn mix(
+        &mut self,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+        start: usize,
+        frames: usize,
+        coeff: f32,
+    ) {
+        if !self.playing || self.frames == 0 {
             return;
         }
-        let gain = self.gain;
-        for i in start.min(frames)..frames {
-            let index = self.pos * 2;
-            out_l[i] += self.buffer[index] * gain;
-            out_r[i] += self.buffer[index + 1] * gain;
-            self.pos += 1;
-            if self.pos >= self.frames {
-                self.pos = 0;
+        let from = start.min(frames);
+        let count = frames - from;
+        let (level_start, level_end) = {
+            let target = self.target();
+            crate::dsp::smooth_step(&mut self.level, target, coeff)
+        };
+        if level_start == 0.0 && level_end == 0.0 {
+            self.pos = (self.pos + count) % self.frames;
+        } else {
+            let step = (level_end - level_start) / count.max(1) as f32;
+            for (n, i) in (from..frames).enumerate() {
+                let level = level_start + step * n as f32;
+                let index = self.pos * 2;
+                out_l[i] += self.buffer[index] * level;
+                out_r[i] += self.buffer[index + 1] * level;
+                self.pos += 1;
+                if self.pos >= self.frames {
+                    self.pos = 0;
+                }
             }
+        }
+        if self.stopping && self.level == 0.0 {
+            self.playing = false;
+            self.stopping = false;
         }
     }
 }
@@ -373,6 +425,41 @@ impl LoopPlayback {
 mod tests {
     use super::*;
     use crate::params::SharedRecorder;
+
+    fn loop_with(samples: &[f32]) -> LoopPlayback {
+        let stereo: Vec<f32> = samples.iter().flat_map(|s| [*s, *s]).collect();
+        let mut playback = LoopPlayback::new(stereo.into_boxed_slice(), samples.len());
+        playback.start();
+        playback
+    }
+
+    #[test]
+    fn muted_loop_stays_on_the_bar_grid() {
+        let mut playback = loop_with(&[1.0; 8]);
+        playback.mute = true;
+        playback.level = 0.0;
+        let (mut l, mut r) = ([0.0f32; 6], [0.0f32; 6]);
+        playback.mix(&mut l, &mut r, 0, 6, 1.0);
+        assert!(l.iter().all(|s| *s == 0.0));
+        assert_eq!(playback.pos, 6);
+        playback.mix(&mut l, &mut r, 0, 6, 1.0);
+        assert_eq!(playback.pos, 4);
+    }
+
+    #[test]
+    fn stopping_fades_out_then_goes_idle() {
+        let mut playback = loop_with(&[1.0; 64]);
+        playback.stop();
+        let (mut l, mut r) = ([0.0f32; 16], [0.0f32; 16]);
+        // Half-way smoothing per block: the tail is audible but shrinking.
+        playback.mix(&mut l, &mut r, 0, 16, 0.5);
+        assert!(l[0] > l[15] && l[15] > 0.0);
+        assert!(playback.playing);
+        for _ in 0..40 {
+            playback.mix(&mut l, &mut r, 0, 16, 0.5);
+        }
+        assert!(!playback.playing);
+    }
 
     #[test]
     fn bar_boundary_finds_start_and_clock() {

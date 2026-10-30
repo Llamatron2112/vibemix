@@ -1,4 +1,4 @@
-use std::sync::atomic::{AtomicU32, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
@@ -23,7 +23,6 @@ use crate::params::{
     SharedClock, SharedMeters, SharedParams, SharedRecorder, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
 };
 
-const SMOOTHING: f32 = 0.005;
 const COMMAND_CAPACITY: usize = 64;
 
 /// Serialized plugin state, backed by either host's cross-thread state handle.
@@ -71,22 +70,36 @@ impl SlotState {
 }
 
 type StripChains = [Vec<SlotPlugin>; PLUGIN_CHAINS];
-type StripProxies = [Vec<Option<SlotState>>; PLUGIN_CHAINS];
-type StripHandles = [Vec<Option<usize>>; PLUGIN_CHAINS];
-type StripOutputs = [Vec<Option<Arc<SharedOutputs>>>; PLUGIN_CHAINS];
-type StripUiInputs = [Vec<Option<Arc<SharedUiInputs>>>; PLUGIN_CHAINS];
+/// Control-thread bookkeeping for one plugin slot, kept in lockstep with the
+/// matching [`SlotPlugin`] on the audio thread.
+#[derive(Clone, Default)]
+struct SlotMeta {
+    /// State save/restore handle.
+    proxy: Option<SlotState>,
+    /// Raw instance handle for native editors.
+    handle: Option<usize>,
+    outputs: Option<Arc<SharedOutputs>>,
+    ui_inputs: Option<Arc<SharedUiInputs>>,
+}
+
+impl SlotMeta {
+    fn of(plugin: &SlotPlugin, proxy: Option<SlotState>, handle: Option<usize>) -> Self {
+        Self {
+            proxy,
+            handle,
+            outputs: plugin.outputs(),
+            ui_inputs: plugin.ui_inputs(),
+        }
+    }
+}
+
+type StripMeta = [Vec<SlotMeta>; PLUGIN_CHAINS];
 
 struct Built {
     strip_chains: Vec<StripChains>,
-    strip_proxies: Vec<StripProxies>,
-    strip_handles: Vec<StripHandles>,
-    strip_outputs: Vec<StripOutputs>,
+    strip_meta: Vec<StripMeta>,
     bus_chains: Vec<Vec<SlotPlugin>>,
-    bus_proxies: Vec<Vec<Option<SlotState>>>,
-    bus_handles: Vec<Vec<Option<usize>>>,
-    bus_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>>,
-    strip_ui_inputs: Vec<StripUiInputs>,
-    bus_ui_inputs: Vec<Vec<Option<Arc<SharedUiInputs>>>>,
+    bus_meta: Vec<Vec<SlotMeta>>,
 }
 
 pub enum SlotPlugin {
@@ -204,9 +217,16 @@ pub struct PortRole {
 pub struct Notifications {
     pending_rate: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
 }
 
 impl NotificationHandler for Notifications {
+    /// Runs in a signal-handler-like context: only flag the shutdown here and
+    /// let the control thread react.
+    unsafe fn shutdown(&mut self, _status: jack::ClientStatus, _reason: &str) {
+        self.shutdown.store(true, Ordering::SeqCst);
+    }
+
     fn sample_rate(&mut self, _client: &Client, srate: Frames) -> Control {
         self.pending_rate.store(srate, Ordering::SeqCst);
         Control::Continue
@@ -360,7 +380,6 @@ struct MixerGraph {
     bus_chains: Vec<Vec<SlotPlugin>>,
     commands: Consumer<EngineCommand>,
     garbage: Producer<SlotPlugin>,
-    garbage_chains: Producer<Vec<SlotPlugin>>,
     garbage_bus_chains: Producer<Vec<Vec<SlotPlugin>>>,
     garbage_nested: Producer<Vec<StripChains>>,
     garbage_delays: Producer<Vec<Vec<dsp::DelayLine>>>,
@@ -372,6 +391,19 @@ struct MixerGraph {
     send_delay_smooth: Vec<Vec<f32>>,
     send_delays: Vec<Vec<dsp::DelayLine>>,
     sample_rate: f32,
+    /// Per-block smoothing coefficients, recomputed from the period each block.
+    gain_coeff: f32,
+    delay_coeff: f32,
+    /// Plugin state is being captured; chains are not run this block.
+    paused: bool,
+    dsp_avg: f32,
+    dsp_peak: f32,
+    /// Wet fraction (1 = processed, 0 = bypassed) per insert, smoothed so a
+    /// bypass toggle crossfades instead of clicking.
+    bypass_mix_strip: Vec<[[f32; MAX_PLUGINS]; PLUGIN_CHAINS]>,
+    bypass_mix_bus: Vec<[f32; MAX_PLUGINS]>,
+    /// Copy of a chain's input while it is crossfading.
+    chain_dry: [Vec<f32>; 2],
     strip_scratch: [Vec<f32>; 2],
     /// Per-strip pre-fader tap (after the pre-fader insert chain, before the
     /// fader/pan), used by pre-fader sends and sidechains.
@@ -476,10 +508,7 @@ impl MixerGraph {
                 EngineCommand::ClearStrip { strip } => {
                     if let Some(chains) = self.plugin_chains.get_mut(strip) {
                         for chain in chains.iter_mut() {
-                            let taken = std::mem::take(chain);
-                            if let Err(chain) = self.garbage_chains.push(taken) {
-                                std::mem::forget(chain);
-                            }
+                            retire_plugins(chain, &mut self.garbage);
                         }
                     }
                 }
@@ -511,10 +540,7 @@ impl MixerGraph {
                 }
                 EngineCommand::ClearBus { bus } => {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
-                        let taken = std::mem::take(chain);
-                        if let Err(chain) = self.garbage_chains.push(taken) {
-                            std::mem::forget(chain);
-                        }
+                        retire_plugins(chain, &mut self.garbage);
                     }
                 }
                 EngineCommand::SetStripPorts { strip, in_l, in_r } => {
@@ -643,14 +669,14 @@ impl MixerGraph {
                         loop_slot.quantized = quantized;
                         loop_slot.pending = true;
                         loop_slot.playing = false;
+                        loop_slot.stopping = false;
                         loop_slot.pos = 0;
                     }
                 }
                 EngineCommand::LoopStop { slot } => {
                     if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
                     {
-                        loop_slot.playing = false;
-                        loop_slot.pending = false;
+                        loop_slot.stop();
                     }
                 }
                 EngineCommand::LoopGain { slot, gain } => {
@@ -709,15 +735,45 @@ impl MixerGraph {
         max
     }
 
-    fn run_plugins(&mut self, index: usize, chain: usize, frames: usize) {
-        if self.plugin_chains[index][chain].is_empty() {
+    /// Runs one insert chain (a strip's pre/post chain or a bus chain) over its
+    /// scratch buffer. Mono plugins run as two instances, one per channel.
+    fn run_chain(&mut self, target: ChainTarget, frames: usize) {
+        let Self {
+            plugin_chains,
+            bus_chains,
+            strip_scratch,
+            bus_scratch,
+            params,
+            midi,
+            position,
+            strip_delayed,
+            strip_pre_fader,
+            strip_post_fader,
+            strip_pre_snapshot,
+            strip_post_snapshot,
+            sidechain_mix,
+            sidechain_silence,
+            bypass_mix_strip,
+            bypass_mix_bus,
+            chain_dry,
+            gain_coeff,
+            ..
+        } = self;
+        let (plugins, scratch, wet_mix) = match target {
+            ChainTarget::Strip { index, chain } => (
+                &mut plugin_chains[index][chain],
+                strip_scratch,
+                &mut bypass_mix_strip[index][chain],
+            ),
+            ChainTarget::Bus(bus) => (&mut bus_chains[bus], bus_scratch, &mut bypass_mix_bus[bus]),
+        };
+        if plugins.is_empty() {
             return;
         }
 
         let frames = frames.min(PluginInstance::max_frames());
-        let position = self.position;
-        let midi_sync = self.params.midi_sync();
-        let plugins = &mut self.plugin_chains[index][chain];
+        let position = *position;
+        let midi_sync = params.midi_sync();
 
         for (slot, plugin) in plugins.iter_mut().enumerate() {
             match plugin {
@@ -729,173 +785,112 @@ impl MixerGraph {
                 SlotPlugin::Missing => {}
             }
 
-            if self.params.plugin_bypass(index, chain, slot) {
+            // Bypass crossfades between dry and processed over a few ms instead
+            // of switching hard; a fully bypassed plugin is not run at all.
+            let wet_target = if target.bypassed(params, slot) {
+                0.0
+            } else {
+                1.0
+            };
+            let (wet_start, wet_end) =
+                dsp::smooth_step(&mut wet_mix[slot], wet_target, *gain_coeff);
+            if wet_start == 0.0 && wet_end == 0.0 {
                 continue;
             }
+            let fading = wet_start != 1.0 || wet_end != 1.0;
+            if fading {
+                for channel in 0..2 {
+                    chain_dry[channel][..frames].copy_from_slice(&scratch[channel][..frames]);
+                }
+            }
+            let delayed = match target {
+                ChainTarget::Strip { index, chain } => strip_delayed[index][chain][slot],
+                ChainTarget::Bus(_) => false,
+            };
+
+            // Runs one plugin instance over `channels` of the scratch buffer
+            // (instance port `n` carries scratch channel `channels[n]`).
+            let mut run_node = |instance: &mut dyn PluginNode, channels: &[usize]| {
+                target.set_controls(instance, params, slot);
+                for (port, &channel) in channels.iter().enumerate() {
+                    instance.input_buffer_mut(port)[..frames]
+                        .copy_from_slice(&scratch[channel][..frames]);
+                }
+                instance.write_midi(midi.as_slice());
+                if midi_sync {
+                    instance.write_position(&position);
+                }
+                instance.write_ui_events(midi_sync);
+                let (is_bus, index, chain) = target.sidechain_key();
+                feed_sidechain(
+                    instance,
+                    is_bus,
+                    index,
+                    chain,
+                    slot,
+                    delayed,
+                    params,
+                    strip_pre_fader,
+                    strip_post_fader,
+                    strip_pre_snapshot,
+                    strip_post_snapshot,
+                    sidechain_mix,
+                    sidechain_silence,
+                    frames,
+                );
+                instance.run(frames);
+                for (port, &channel) in channels.iter().enumerate() {
+                    scratch[channel][..frames]
+                        .copy_from_slice(&instance.output_buffer(port)[..frames]);
+                }
+            };
 
             match plugin {
-                SlotPlugin::Stereo(instance) => {
-                    set_controls(&mut **instance, &self.params, index, chain, slot);
-                    instance.input_buffer_mut(0)[..frames]
-                        .copy_from_slice(&self.strip_scratch[0][..frames]);
-                    instance.input_buffer_mut(1)[..frames]
-                        .copy_from_slice(&self.strip_scratch[1][..frames]);
-                    instance.write_midi(self.midi.as_slice());
-                    if midi_sync {
-                        instance.write_position(&position);
-                    }
-                    instance.write_ui_events(midi_sync);
-                    feed_sidechain(
-                        &mut **instance,
-                        false,
-                        index,
-                        chain,
-                        slot,
-                        self.strip_delayed[index][chain][slot],
-                        &self.params,
-                        &self.strip_pre_fader,
-                        &self.strip_post_fader,
-                        &self.strip_pre_snapshot,
-                        &self.strip_post_snapshot,
-                        &mut self.sidechain_mix,
-                        &self.sidechain_silence,
-                        frames,
-                    );
-                    instance.run(frames);
-
-                    let out_l = instance.output_buffer(0);
-                    let out_r = instance.output_buffer(1);
-                    self.strip_scratch[0][..frames].copy_from_slice(&out_l[..frames]);
-                    self.strip_scratch[1][..frames].copy_from_slice(&out_r[..frames]);
-                }
+                SlotPlugin::Stereo(instance) => run_node(&mut **instance, &[0, 1]),
                 SlotPlugin::Mono(left, right) => {
-                    for (channel, instance) in [(0usize, left), (1usize, right)] {
-                        set_controls(&mut **instance, &self.params, index, chain, slot);
-                        instance.input_buffer_mut(0)[..frames]
-                            .copy_from_slice(&self.strip_scratch[channel][..frames]);
-                        instance.write_midi(self.midi.as_slice());
-                        if midi_sync {
-                            instance.write_position(&position);
-                        }
-                        instance.write_ui_events(midi_sync);
-                        feed_sidechain(
-                            &mut **instance,
-                            false,
-                            index,
-                            chain,
-                            slot,
-                            self.strip_delayed[index][chain][slot],
-                            &self.params,
-                            &self.strip_pre_fader,
-                            &self.strip_post_fader,
-                            &self.strip_pre_snapshot,
-                            &self.strip_post_snapshot,
-                            &mut self.sidechain_mix,
-                            &self.sidechain_silence,
-                            frames,
-                        );
-                        instance.run(frames);
-                        let out = instance.output_buffer(0);
-                        self.strip_scratch[channel][..frames].copy_from_slice(&out[..frames]);
-                    }
+                    run_node(&mut **left, &[0]);
+                    run_node(&mut **right, &[1]);
                 }
                 SlotPlugin::Missing => {}
             }
+
+            if fading {
+                let step = (wet_end - wet_start) / frames.max(1) as f32;
+                for channel in 0..2 {
+                    dsp::sanitize(&mut scratch[channel][..frames]);
+                    for (index, (out, dry)) in scratch[channel][..frames]
+                        .iter_mut()
+                        .zip(&chain_dry[channel][..frames])
+                        .enumerate()
+                    {
+                        let wet = wet_start + step * index as f32;
+                        *out = dry + (*out - dry) * wet;
+                    }
+                }
+            }
+        }
+        dsp::sanitize(&mut scratch[0][..frames]);
+        dsp::sanitize(&mut scratch[1][..frames]);
+    }
+
+    /// While plugin state is captured the chain cannot run. Passing the signal
+    /// through dry would bypass limiters and compressors at full level, so a
+    /// chain that is doing work is silenced for the (short) capture instead.
+    fn silence_active_chain(&mut self, index: usize, chain: usize, frames: usize) {
+        if chain_is_active(&self.plugin_chains[index][chain], |slot| {
+            self.params.plugin_bypass(index, chain, slot)
+        }) {
+            self.strip_scratch[0][..frames].fill(0.0);
+            self.strip_scratch[1][..frames].fill(0.0);
         }
     }
 
-    fn run_bus_plugins(&mut self, bus: usize, frames: usize) {
-        if self.bus_chains[bus].is_empty() {
-            return;
-        }
-
-        let frames = frames.min(PluginInstance::max_frames());
-        let position = self.position;
-        let midi_sync = self.params.midi_sync();
-        let plugins = &mut self.bus_chains[bus];
-
-        for (slot, plugin) in plugins.iter_mut().enumerate() {
-            match plugin {
-                SlotPlugin::Stereo(instance) => instance.deliver_responses(),
-                SlotPlugin::Mono(left, right) => {
-                    left.deliver_responses();
-                    right.deliver_responses();
-                }
-                SlotPlugin::Missing => {}
-            }
-
-            if self.params.bus_plugin_bypass(bus, slot) {
-                continue;
-            }
-
-            match plugin {
-                SlotPlugin::Stereo(instance) => {
-                    set_bus_controls(&mut **instance, &self.params, bus, slot);
-                    instance.input_buffer_mut(0)[..frames]
-                        .copy_from_slice(&self.bus_scratch[0][..frames]);
-                    instance.input_buffer_mut(1)[..frames]
-                        .copy_from_slice(&self.bus_scratch[1][..frames]);
-                    instance.write_midi(self.midi.as_slice());
-                    if midi_sync {
-                        instance.write_position(&position);
-                    }
-                    instance.write_ui_events(midi_sync);
-                    feed_sidechain(
-                        &mut **instance,
-                        true,
-                        bus,
-                        0,
-                        slot,
-                        false,
-                        &self.params,
-                        &self.strip_pre_fader,
-                        &self.strip_post_fader,
-                        &self.strip_pre_snapshot,
-                        &self.strip_post_snapshot,
-                        &mut self.sidechain_mix,
-                        &self.sidechain_silence,
-                        frames,
-                    );
-                    instance.run(frames);
-
-                    let out_l = instance.output_buffer(0);
-                    let out_r = instance.output_buffer(1);
-                    self.bus_scratch[0][..frames].copy_from_slice(&out_l[..frames]);
-                    self.bus_scratch[1][..frames].copy_from_slice(&out_r[..frames]);
-                }
-                SlotPlugin::Mono(left, right) => {
-                    for (channel, instance) in [(0usize, left), (1usize, right)] {
-                        set_bus_controls(&mut **instance, &self.params, bus, slot);
-                        instance.input_buffer_mut(0)[..frames]
-                            .copy_from_slice(&self.bus_scratch[channel][..frames]);
-                        instance.write_midi(self.midi.as_slice());
-                        if midi_sync {
-                            instance.write_position(&position);
-                        }
-                        instance.write_ui_events(midi_sync);
-                        feed_sidechain(
-                            &mut **instance,
-                            true,
-                            bus,
-                            0,
-                            slot,
-                            false,
-                            &self.params,
-                            &self.strip_pre_fader,
-                            &self.strip_post_fader,
-                            &self.strip_pre_snapshot,
-                            &self.strip_post_snapshot,
-                            &mut self.sidechain_mix,
-                            &self.sidechain_silence,
-                            frames,
-                        );
-                        instance.run(frames);
-                        let out = instance.output_buffer(0);
-                        self.bus_scratch[channel][..frames].copy_from_slice(&out[..frames]);
-                    }
-                }
-                SlotPlugin::Missing => {}
-            }
+    fn silence_active_bus_chain(&mut self, bus: usize, frames: usize) {
+        if chain_is_active(&self.bus_chains[bus], |slot| {
+            self.params.bus_plugin_bypass(bus, slot)
+        }) {
+            self.bus_scratch[0][..frames].fill(0.0);
+            self.bus_scratch[1][..frames].fill(0.0);
         }
     }
 
@@ -949,11 +944,21 @@ impl MixerGraph {
             self.meters.store_strip_in(index, in_peak_l, in_peak_r);
 
             let input_target = self.params.strip_input_gain(index);
-            let input_smoothed = &mut self.strip_input_smooth[index];
-            *input_smoothed += (input_target - *input_smoothed) * SMOOTHING;
-            let input_gain = *input_smoothed;
-            dsp::apply_gain(&mut self.strip_scratch[0][..frames], input_gain);
-            dsp::apply_gain(&mut self.strip_scratch[1][..frames], input_gain);
+            let (input_start, input_gain) = dsp::smooth_step(
+                &mut self.strip_input_smooth[index],
+                input_target,
+                self.gain_coeff,
+            );
+            dsp::apply_gain_ramp(
+                &mut self.strip_scratch[0][..frames],
+                input_start,
+                input_gain,
+            );
+            dsp::apply_gain_ramp(
+                &mut self.strip_scratch[1][..frames],
+                input_start,
+                input_gain,
+            );
             self.meters
                 .store_strip_gain(index, in_peak_l * input_gain, in_peak_r * input_gain);
 
@@ -961,8 +966,10 @@ impl MixerGraph {
             self.strip_input[index][0][..frames].copy_from_slice(&self.strip_scratch[0][..frames]);
             self.strip_input[index][1][..frames].copy_from_slice(&self.strip_scratch[1][..frames]);
 
-            if !paused {
-                self.run_plugins(index, 0, frames);
+            if paused {
+                self.silence_active_chain(index, 0, frames);
+            } else {
+                self.run_chain(ChainTarget::Strip { index, chain: 0 }, frames);
             }
 
             // Pre-fader tap: after the pre-fader insert chain, before fader/pan.
@@ -978,23 +985,33 @@ impl MixerGraph {
             } else {
                 self.params.strip_gain(index)
             };
-            let smoothed = &mut self.strip_gain_smooth[index];
-            *smoothed += (target - *smoothed) * SMOOTHING;
-            let gain = *smoothed;
+            let (gain_start, gain_end) =
+                dsp::smooth_step(&mut self.strip_gain_smooth[index], target, self.gain_coeff);
 
             let pan_target = self.params.strip_pan(index);
-            let pan = {
-                let smoothed = &mut self.strip_pan_smooth[index];
-                *smoothed += (pan_target - *smoothed) * SMOOTHING;
-                *smoothed
-            };
-            let (pan_l, pan_r) = dsp::pan_gains(pan);
+            let (pan_start, pan_end) = dsp::smooth_step(
+                &mut self.strip_pan_smooth[index],
+                pan_target,
+                self.gain_coeff,
+            );
+            let (pan_l0, pan_r0) = dsp::pan_gains(pan_start);
+            let (pan_l1, pan_r1) = dsp::pan_gains(pan_end);
 
-            dsp::apply_gain(&mut self.strip_scratch[0][..frames], gain * pan_l);
-            dsp::apply_gain(&mut self.strip_scratch[1][..frames], gain * pan_r);
+            dsp::apply_gain_ramp(
+                &mut self.strip_scratch[0][..frames],
+                gain_start * pan_l0,
+                gain_end * pan_l1,
+            );
+            dsp::apply_gain_ramp(
+                &mut self.strip_scratch[1][..frames],
+                gain_start * pan_r0,
+                gain_end * pan_r1,
+            );
 
-            if !paused {
-                self.run_plugins(index, 1, frames);
+            if paused {
+                self.silence_active_chain(index, 1, frames);
+            } else {
+                self.run_chain(ChainTarget::Strip { index, chain: 1 }, frames);
             }
 
             // Post-fader tap (the same point a post-fader send uses).
@@ -1010,21 +1027,22 @@ impl MixerGraph {
 
             for bus in 0..bus_count {
                 let gain_target = self.params.send_gain(index, bus);
-                let gain = {
-                    let smoothed = &mut self.send_gain_smooth[index][bus];
-                    *smoothed += (gain_target - *smoothed) * SMOOTHING;
-                    *smoothed
-                };
-                if gain <= 1.0e-6 {
+                let (send_start, send_end) = dsp::smooth_step(
+                    &mut self.send_gain_smooth[index][bus],
+                    gain_target,
+                    self.gain_coeff,
+                );
+                if send_start <= 1.0e-6 && send_end <= 1.0e-6 {
+                    self.send_delays[index][bus].invalidate();
                     continue;
                 }
 
                 let delay_target = self.params.send_delay(index, bus) * self.sample_rate / 1000.0;
-                let delay = {
-                    let smoothed = &mut self.send_delay_smooth[index][bus];
-                    *smoothed += (delay_target - *smoothed) * SMOOTHING;
-                    *smoothed
-                };
+                let (delay_start, delay_end) = dsp::smooth_step(
+                    &mut self.send_delay_smooth[index][bus],
+                    delay_target,
+                    self.delay_coeff,
+                );
 
                 let (src_l, src_r) = if self.params.send_pre_fader(index, bus) {
                     (
@@ -1036,22 +1054,25 @@ impl MixerGraph {
                 };
 
                 let [send_l, send_r] = &mut self.send_scratch;
-                self.send_delays[index][bus].process(
+                self.send_delays[index][bus].process_ramp(
                     &src_l[..frames],
                     &src_r[..frames],
                     &mut send_l[..frames],
                     &mut send_r[..frames],
-                    delay,
+                    delay_start,
+                    delay_end,
                 );
-                dsp::add_scaled(
+                dsp::add_scaled_ramp(
                     &mut self.bus_accum[bus][0][..frames],
                     &send_l[..frames],
-                    gain,
+                    send_start,
+                    send_end,
                 );
-                dsp::add_scaled(
+                dsp::add_scaled_ramp(
                     &mut self.bus_accum[bus][1][..frames],
                     &send_r[..frames],
-                    gain,
+                    send_start,
+                    send_end,
                 );
             }
         }
@@ -1099,6 +1120,7 @@ impl MixerGraph {
     /// immediately.
     fn mix_loops(&mut self, frames: usize, beats_before: f64, beats_per_bar: f32, playing: bool) {
         let bar = bar_boundary_offset(self.transport_midi.as_slice(), beats_before, beats_per_bar);
+        let gain_coeff = self.gain_coeff;
         let (slots, [master_l, master_r]) = (&mut self.loop_slots, &mut self.bus_accum[0]);
         for slot in slots.iter_mut() {
             let Some(loop_slot) = slot.as_mut() else {
@@ -1109,14 +1131,10 @@ impl MixerGraph {
                     let Some(offset) = bar else {
                         continue;
                     };
-                    loop_slot.pending = false;
-                    loop_slot.playing = true;
-                    loop_slot.pos = 0;
+                    loop_slot.start();
                     offset
                 } else {
-                    loop_slot.pending = false;
-                    loop_slot.playing = true;
-                    loop_slot.pos = 0;
+                    loop_slot.start();
                     0
                 }
             } else if loop_slot.playing {
@@ -1129,6 +1147,7 @@ impl MixerGraph {
                 &mut master_r[..frames],
                 start,
                 frames,
+                gain_coeff,
             );
         }
     }
@@ -1190,20 +1209,22 @@ impl MixerGraph {
         let in_peak_r = dsp::peak(&self.bus_scratch[1][..frames]);
         self.meters.store_bus_in(bus, in_peak_l, in_peak_r);
 
-        self.run_bus_plugins(bus, frames);
+        if self.paused {
+            self.silence_active_bus_chain(bus, frames);
+        } else {
+            self.run_chain(ChainTarget::Bus(bus), frames);
+        }
 
         // A returning bus is an external insert: the post-insert signal leaves
         // pre-fader for the device (scaled by the SEND trim), and the device's
         // output is mixed back in (dry + wet) before the fader. The master has
         // no separate send, so this only applies to non-master buses.
         let returning = bus != 0 && self.params.bus_return(bus);
-        let send_gain = if returning {
+        let (send_start, send_gain) = if returning {
             let target = self.params.bus_send_gain(bus);
-            let smoothed = &mut self.bus_send_smooth[bus];
-            *smoothed += (target - *smoothed) * SMOOTHING;
-            *smoothed
+            dsp::smooth_step(&mut self.bus_send_smooth[bus], target, self.gain_coeff)
         } else {
-            1.0
+            (1.0, 1.0)
         };
 
         let gain_peak_l = dsp::peak(&self.bus_scratch[0][..frames]);
@@ -1215,14 +1236,16 @@ impl MixerGraph {
             if let Some(ports) = self.buses[bus].as_mut() {
                 let out_l = ports.out_l.as_mut_slice(scope);
                 let out_r = ports.out_r.as_mut_slice(scope);
-                dsp::scale_into(out_l, &self.bus_scratch[0][..frames], send_gain);
-                dsp::scale_into(out_r, &self.bus_scratch[1][..frames], send_gain);
+                dsp::scale_into_ramp(out_l, &self.bus_scratch[0][..frames], send_start, send_gain);
+                dsp::scale_into_ramp(out_r, &self.bus_scratch[1][..frames], send_start, send_gain);
             }
 
             let ret_target = self.params.bus_return_gain(bus);
-            let ret_smoothed = &mut self.bus_return_smooth[bus];
-            *ret_smoothed += (ret_target - *ret_smoothed) * SMOOTHING;
-            let return_gain = *ret_smoothed;
+            let (return_start, return_gain) = dsp::smooth_step(
+                &mut self.bus_return_smooth[bus],
+                ret_target,
+                self.gain_coeff,
+            );
 
             if let Some(ports) = self.bus_returns[bus].as_ref() {
                 let in_l = ports.in_l.as_slice(scope);
@@ -1231,14 +1254,16 @@ impl MixerGraph {
                 let ret_peak_r = dsp::peak(&in_r[..frames]);
                 self.meters
                     .store_bus_ret(bus, ret_peak_l * return_gain, ret_peak_r * return_gain);
-                dsp::add_scaled(
+                dsp::add_scaled_ramp(
                     &mut self.bus_scratch[0][..frames],
                     &in_l[..frames],
+                    return_start,
                     return_gain,
                 );
-                dsp::add_scaled(
+                dsp::add_scaled_ramp(
                     &mut self.bus_scratch[1][..frames],
                     &in_r[..frames],
+                    return_start,
                     return_gain,
                 );
             } else {
@@ -1253,11 +1278,10 @@ impl MixerGraph {
         } else {
             self.params.bus_gain(bus)
         };
-        let smoothed = &mut self.bus_gain_smooth[bus];
-        *smoothed += (target - *smoothed) * SMOOTHING;
-        let gain = *smoothed;
-        dsp::apply_gain(&mut self.bus_scratch[0][..frames], gain);
-        dsp::apply_gain(&mut self.bus_scratch[1][..frames], gain);
+        let (gain_start, gain_end) =
+            dsp::smooth_step(&mut self.bus_gain_smooth[bus], target, self.gain_coeff);
+        dsp::apply_gain_ramp(&mut self.bus_scratch[0][..frames], gain_start, gain_end);
+        dsp::apply_gain_ramp(&mut self.bus_scratch[1][..frames], gain_start, gain_end);
 
         let bus_peak_l = dsp::peak(&self.bus_scratch[0][..frames]);
         let bus_peak_r = dsp::peak(&self.bus_scratch[1][..frames]);
@@ -1282,14 +1306,18 @@ impl MixerGraph {
 impl ProcessHandler for MixerGraph {
     fn process(&mut self, _client: &Client, scope: &ProcessScope) -> Control {
         let _rt_guard = crate::rt_guard::AudioScope::enter();
+        let started = std::time::Instant::now();
         dsp::flush_denormals();
         self.apply_commands();
 
         let paused = self.params.state_pause();
+        self.paused = paused;
         self.params.set_state_ack(paused);
 
         let raw_frames = scope.n_frames() as usize;
         let frames = raw_frames.min(self.capacity);
+        self.gain_coeff = dsp::smoothing_coeff(frames, self.sample_rate, dsp::GAIN_SMOOTH_MS);
+        self.delay_coeff = dsp::smoothing_coeff(frames, self.sample_rate, dsp::DELAY_SMOOTH_MS);
 
         // MIDI: collect the block's events and advance clock/transport state.
         // `raw.time` is the frame offset within the block.
@@ -1390,6 +1418,16 @@ impl ProcessHandler for MixerGraph {
             }
         }
 
+        // Callback load: time used over time available. The average smooths
+        // over ~1 s; the peak holds and decays so brief spikes stay visible.
+        if self.sample_rate > 0.0 && raw_frames > 0 {
+            let budget = raw_frames as f32 / self.sample_rate;
+            let load = started.elapsed().as_secs_f32() / budget;
+            self.dsp_avg += (load - self.dsp_avg) * budget.min(1.0);
+            self.dsp_peak = (self.dsp_peak * 0.9995).max(load);
+            self.meters.store_dsp(self.dsp_avg, self.dsp_peak);
+        }
+
         Control::Continue
     }
 
@@ -1413,7 +1451,6 @@ pub struct JackEngine {
     active: jack::AsyncClient<Notifications, MixerGraph>,
     commands: Producer<EngineCommand>,
     garbage: Consumer<SlotPlugin>,
-    garbage_chains: Consumer<Vec<SlotPlugin>>,
     garbage_bus_chains: Consumer<Vec<Vec<SlotPlugin>>>,
     garbage_nested: Consumer<Vec<StripChains>>,
     garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
@@ -1423,6 +1460,7 @@ pub struct JackEngine {
     shared_recorder: Arc<SharedRecorder>,
     pending_rate: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
+    shutdown: Arc<AtomicBool>,
     clock: Arc<SharedClock>,
     midi_map: Arc<SharedMidi>,
     midi_port: Port<Unowned>,
@@ -1430,14 +1468,8 @@ pub struct JackEngine {
     /// with. JACK/PipeWire may report a different rate at client creation than
     /// the graph settles on, so track this separately from the live rate.
     graph_sample_rate: u32,
-    state_proxies: Vec<StripProxies>,
-    plugin_handles: Vec<StripHandles>,
-    plugin_outputs: Vec<StripOutputs>,
-    plugin_ui_inputs: Vec<StripUiInputs>,
-    bus_state_proxies: Vec<Vec<Option<SlotState>>>,
-    bus_plugin_handles: Vec<Vec<Option<usize>>>,
-    bus_plugin_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>>,
-    bus_plugin_ui_inputs: Vec<Vec<Option<Arc<SharedUiInputs>>>>,
+    strip_meta: Vec<StripMeta>,
+    bus_meta: Vec<Vec<SlotMeta>>,
     strip_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
     strip_count: usize,
     bus_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
@@ -1486,15 +1518,9 @@ impl JackEngine {
         );
         let Built {
             strip_chains: plugin_chains,
-            strip_proxies: state_proxies,
-            strip_handles: plugin_handles,
-            strip_outputs: plugin_outputs,
+            strip_meta,
             bus_chains,
-            bus_proxies: bus_state_proxies,
-            bus_handles: bus_plugin_handles,
-            bus_outputs: bus_plugin_outputs,
-            strip_ui_inputs: plugin_ui_inputs,
-            bus_ui_inputs: bus_plugin_ui_inputs,
+            bus_meta,
         } = built;
 
         let mut strips: Vec<Option<StripPorts>> = (0..strip_count).map(|_| None).collect();
@@ -1544,12 +1570,9 @@ impl JackEngine {
         // Garbage queues are sized so a full command queue's worth of retired
         // objects can never overflow them (the control thread drains each loop).
         let garbage_plugins_capacity = COMMAND_CAPACITY * (strip_count + bus_count + 1);
-        let garbage_chains_capacity = COMMAND_CAPACITY * (bus_count.max(PLUGIN_CHAINS) + 1);
         let garbage_nested_capacity = COMMAND_CAPACITY;
         let (garbage_producer, garbage) =
             rtrb::RingBuffer::<SlotPlugin>::new(garbage_plugins_capacity);
-        let (garbage_chains_producer, garbage_chains) =
-            rtrb::RingBuffer::<Vec<SlotPlugin>>::new(garbage_chains_capacity);
         let (garbage_bus_chains_producer, garbage_bus_chains) =
             rtrb::RingBuffer::<Vec<Vec<SlotPlugin>>>::new(4);
         let (garbage_nested_producer, garbage_nested) =
@@ -1573,7 +1596,6 @@ impl JackEngine {
             bus_chains,
             commands: command_consumer,
             garbage: garbage_producer,
-            garbage_chains: garbage_chains_producer,
             garbage_bus_chains: garbage_bus_chains_producer,
             garbage_nested: garbage_nested_producer,
             garbage_delays: garbage_delays_producer,
@@ -1591,6 +1613,14 @@ impl JackEngine {
                 })
                 .collect(),
             sample_rate: sample_rate as f32,
+            gain_coeff: 1.0,
+            paused: false,
+            dsp_avg: 0.0,
+            dsp_peak: 0.0,
+            bypass_mix_strip: vec![[[1.0; MAX_PLUGINS]; PLUGIN_CHAINS]; strip_count],
+            bypass_mix_bus: vec![[1.0; MAX_PLUGINS]; bus_count],
+            chain_dry: [vec![0.0; capacity], vec![0.0; capacity]],
+            delay_coeff: 1.0,
             strip_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
             strip_pre_fader: (0..strip_count)
                 .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
@@ -1646,11 +1676,13 @@ impl JackEngine {
 
         let pending_rate = Arc::new(AtomicU32::new(0));
         let xruns = Arc::new(AtomicU64::new(0));
+        let shutdown = Arc::new(AtomicBool::new(false));
         let active = client
             .activate_async(
                 Notifications {
                     pending_rate: Arc::clone(&pending_rate),
                     xruns: Arc::clone(&xruns),
+                    shutdown: Arc::clone(&shutdown),
                 },
                 graph,
             )
@@ -1664,7 +1696,6 @@ impl JackEngine {
             active,
             commands,
             garbage,
-            garbage_chains,
             garbage_bus_chains,
             garbage_nested,
             garbage_delays,
@@ -1674,18 +1705,13 @@ impl JackEngine {
             shared_recorder: Arc::clone(&shared_recorder),
             pending_rate,
             xruns,
+            shutdown,
             clock: shared_clock,
             midi_map,
             midi_port,
             graph_sample_rate: sample_rate as u32,
-            state_proxies,
-            plugin_handles,
-            plugin_outputs,
-            plugin_ui_inputs,
-            bus_state_proxies,
-            bus_plugin_handles,
-            bus_plugin_outputs,
-            bus_plugin_ui_inputs,
+            strip_meta,
+            bus_meta,
             strip_ports,
             strip_count,
             bus_ports,
@@ -1788,6 +1814,11 @@ impl JackEngine {
         (rate != 0).then_some(rate)
     }
 
+    /// Whether the JACK/PipeWire server has shut this client down.
+    pub fn server_shut_down(&self) -> bool {
+        self.shutdown.load(Ordering::SeqCst)
+    }
+
     pub fn xrun_count(&self) -> u64 {
         self.xruns.load(Ordering::Relaxed)
     }
@@ -1843,8 +1874,7 @@ impl JackEngine {
         proxy: Option<SlotState>,
         handle: usize,
     ) -> Result<()> {
-        let outputs = plugin.outputs();
-        let ui_inputs = plugin.ui_inputs();
+        let meta = SlotMeta::of(&plugin, proxy, Some(handle));
         self.commands
             .push(EngineCommand::AddPlugin {
                 strip,
@@ -1852,40 +1882,9 @@ impl JackEngine {
                 plugin,
             })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(slots) = self
-            .state_proxies
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
+        if let Some(slots) = self.strip_meta_mut(strip, chain) {
             if slots.len() < MAX_PLUGINS {
-                slots.push(proxy);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_handles
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if slots.len() < MAX_PLUGINS {
-                slots.push(Some(handle));
-            }
-        }
-        if let Some(slots) = self
-            .plugin_outputs
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if slots.len() < MAX_PLUGINS {
-                slots.push(outputs);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_ui_inputs
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if slots.len() < MAX_PLUGINS {
-                slots.push(ui_inputs);
+                slots.push(meta);
             }
         }
         Ok(())
@@ -1895,38 +1894,7 @@ impl JackEngine {
         self.commands
             .push(EngineCommand::RemovePlugin { strip, chain, slot })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(slots) = self
-            .state_proxies
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if slot < slots.len() {
-                slots.remove(slot);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_handles
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if slot < slots.len() {
-                slots.remove(slot);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_outputs
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if slot < slots.len() {
-                slots.remove(slot);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_ui_inputs
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
+        if let Some(slots) = self.strip_meta_mut(strip, chain) {
             if slot < slots.len() {
                 slots.remove(slot);
             }
@@ -1949,44 +1917,10 @@ impl JackEngine {
                 to,
             })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(slots) = self
-            .state_proxies
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
+        if let Some(slots) = self.strip_meta_mut(strip, chain) {
             if from < slots.len() && to < slots.len() {
-                let proxy = slots.remove(from);
-                slots.insert(to, proxy);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_handles
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if from < slots.len() && to < slots.len() {
-                let handle = slots.remove(from);
-                slots.insert(to, handle);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_outputs
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if from < slots.len() && to < slots.len() {
-                let outputs = slots.remove(from);
-                slots.insert(to, outputs);
-            }
-        }
-        if let Some(slots) = self
-            .plugin_ui_inputs
-            .get_mut(strip)
-            .and_then(|chains| chains.get_mut(chain))
-        {
-            if from < slots.len() && to < slots.len() {
-                let inputs = slots.remove(from);
-                slots.insert(to, inputs);
+                let meta = slots.remove(from);
+                slots.insert(to, meta);
             }
         }
         Ok(())
@@ -1996,22 +1930,7 @@ impl JackEngine {
         self.commands
             .push(EngineCommand::ClearStrip { strip })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(chains) = self.state_proxies.get_mut(strip) {
-            for slots in chains.iter_mut() {
-                slots.clear();
-            }
-        }
-        if let Some(chains) = self.plugin_handles.get_mut(strip) {
-            for slots in chains.iter_mut() {
-                slots.clear();
-            }
-        }
-        if let Some(chains) = self.plugin_outputs.get_mut(strip) {
-            for slots in chains.iter_mut() {
-                slots.clear();
-            }
-        }
-        if let Some(chains) = self.plugin_ui_inputs.get_mut(strip) {
+        if let Some(chains) = self.strip_meta.get_mut(strip) {
             for slots in chains.iter_mut() {
                 slots.clear();
             }
@@ -2026,29 +1945,13 @@ impl JackEngine {
         proxy: Option<SlotState>,
         handle: usize,
     ) -> Result<()> {
-        let outputs = plugin.outputs();
-        let ui_inputs = plugin.ui_inputs();
+        let meta = SlotMeta::of(&plugin, proxy, Some(handle));
         self.commands
             .push(EngineCommand::AddBusPlugin { bus, plugin })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(slots) = self.bus_state_proxies.get_mut(bus) {
+        if let Some(slots) = self.bus_meta.get_mut(bus) {
             if slots.len() < MAX_PLUGINS {
-                slots.push(proxy);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_handles.get_mut(bus) {
-            if slots.len() < MAX_PLUGINS {
-                slots.push(Some(handle));
-            }
-        }
-        if let Some(slots) = self.bus_plugin_outputs.get_mut(bus) {
-            if slots.len() < MAX_PLUGINS {
-                slots.push(outputs);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
-            if slots.len() < MAX_PLUGINS {
-                slots.push(ui_inputs);
+                slots.push(meta);
             }
         }
         Ok(())
@@ -2058,22 +1961,7 @@ impl JackEngine {
         self.commands
             .push(EngineCommand::RemoveBusPlugin { bus, slot })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(slots) = self.bus_state_proxies.get_mut(bus) {
-            if slot < slots.len() {
-                slots.remove(slot);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_handles.get_mut(bus) {
-            if slot < slots.len() {
-                slots.remove(slot);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_outputs.get_mut(bus) {
-            if slot < slots.len() {
-                slots.remove(slot);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
+        if let Some(slots) = self.bus_meta.get_mut(bus) {
             if slot < slots.len() {
                 slots.remove(slot);
             }
@@ -2085,28 +1973,10 @@ impl JackEngine {
         self.commands
             .push(EngineCommand::MoveBusPlugin { bus, from, to })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(slots) = self.bus_state_proxies.get_mut(bus) {
+        if let Some(slots) = self.bus_meta.get_mut(bus) {
             if from < slots.len() && to < slots.len() {
-                let proxy = slots.remove(from);
-                slots.insert(to, proxy);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_handles.get_mut(bus) {
-            if from < slots.len() && to < slots.len() {
-                let handle = slots.remove(from);
-                slots.insert(to, handle);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_outputs.get_mut(bus) {
-            if from < slots.len() && to < slots.len() {
-                let outputs = slots.remove(from);
-                slots.insert(to, outputs);
-            }
-        }
-        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
-            if from < slots.len() && to < slots.len() {
-                let inputs = slots.remove(from);
-                slots.insert(to, inputs);
+                let meta = slots.remove(from);
+                slots.insert(to, meta);
             }
         }
         Ok(())
@@ -2116,48 +1986,45 @@ impl JackEngine {
         self.commands
             .push(EngineCommand::ClearBus { bus })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        if let Some(slots) = self.bus_state_proxies.get_mut(bus) {
-            slots.clear();
-        }
-        if let Some(slots) = self.bus_plugin_handles.get_mut(bus) {
-            slots.clear();
-        }
-        if let Some(slots) = self.bus_plugin_outputs.get_mut(bus) {
-            slots.clear();
-        }
-        if let Some(slots) = self.bus_plugin_ui_inputs.get_mut(bus) {
+        if let Some(slots) = self.bus_meta.get_mut(bus) {
             slots.clear();
         }
         Ok(())
     }
 
-    pub fn bus_state_proxy(&self, bus: usize, slot: usize) -> Option<SlotState> {
-        self.bus_state_proxies
-            .get(bus)
+    fn strip_meta_mut(&mut self, strip: usize, chain: usize) -> Option<&mut Vec<SlotMeta>> {
+        self.strip_meta
+            .get_mut(strip)
+            .and_then(|chains| chains.get_mut(chain))
+    }
+
+    fn slot_meta(&self, strip: usize, chain: usize, slot: usize) -> Option<&SlotMeta> {
+        self.strip_meta
+            .get(strip)
+            .and_then(|chains| chains.get(chain))
             .and_then(|slots| slots.get(slot))
-            .and_then(|proxy| proxy.clone())
+    }
+
+    fn bus_slot_meta(&self, bus: usize, slot: usize) -> Option<&SlotMeta> {
+        self.bus_meta.get(bus).and_then(|slots| slots.get(slot))
+    }
+
+    pub fn bus_state_proxy(&self, bus: usize, slot: usize) -> Option<SlotState> {
+        self.bus_slot_meta(bus, slot)?.proxy.clone()
     }
 
     pub fn bus_plugin_handle(&self, bus: usize, slot: usize) -> Option<*mut std::ffi::c_void> {
-        self.bus_plugin_handles
-            .get(bus)
-            .and_then(|slots| slots.get(slot))
-            .and_then(|handle| *handle)
+        self.bus_slot_meta(bus, slot)?
+            .handle
             .map(|handle| handle as *mut std::ffi::c_void)
     }
 
     pub fn bus_plugin_outputs(&self, bus: usize, slot: usize) -> Option<Arc<SharedOutputs>> {
-        self.bus_plugin_outputs
-            .get(bus)
-            .and_then(|slots| slots.get(slot))
-            .and_then(|outputs| outputs.clone())
+        self.bus_slot_meta(bus, slot)?.outputs.clone()
     }
 
     pub fn bus_plugin_ui_inputs(&self, bus: usize, slot: usize) -> Option<Arc<SharedUiInputs>> {
-        self.bus_plugin_ui_inputs
-            .get(bus)
-            .and_then(|slots| slots.get(slot))
-            .and_then(|inputs| inputs.clone())
+        self.bus_slot_meta(bus, slot)?.ui_inputs.clone()
     }
 
     pub fn add_strip_ports(&mut self, strip: usize) -> Result<()> {
@@ -2726,11 +2593,7 @@ impl JackEngine {
     }
 
     pub fn state_proxy(&self, strip: usize, chain: usize, slot: usize) -> Option<SlotState> {
-        self.state_proxies
-            .get(strip)
-            .and_then(|chains| chains.get(chain))
-            .and_then(|slots| slots.get(slot))
-            .and_then(|proxy| proxy.clone())
+        self.slot_meta(strip, chain, slot)?.proxy.clone()
     }
 
     pub fn plugin_handle(
@@ -2739,11 +2602,8 @@ impl JackEngine {
         chain: usize,
         slot: usize,
     ) -> Option<*mut std::ffi::c_void> {
-        self.plugin_handles
-            .get(strip)
-            .and_then(|chains| chains.get(chain))
-            .and_then(|slots| slots.get(slot))
-            .and_then(|handle| *handle)
+        self.slot_meta(strip, chain, slot)?
+            .handle
             .map(|handle| handle as *mut std::ffi::c_void)
     }
 
@@ -2753,11 +2613,7 @@ impl JackEngine {
         chain: usize,
         slot: usize,
     ) -> Option<Arc<SharedOutputs>> {
-        self.plugin_outputs
-            .get(strip)
-            .and_then(|chains| chains.get(chain))
-            .and_then(|slots| slots.get(slot))
-            .and_then(|outputs| outputs.clone())
+        self.slot_meta(strip, chain, slot)?.outputs.clone()
     }
 
     pub fn plugin_ui_inputs(
@@ -2766,11 +2622,7 @@ impl JackEngine {
         chain: usize,
         slot: usize,
     ) -> Option<Arc<SharedUiInputs>> {
-        self.plugin_ui_inputs
-            .get(strip)
-            .and_then(|chains| chains.get(chain))
-            .and_then(|slots| slots.get(slot))
-            .and_then(|inputs| inputs.clone())
+        self.slot_meta(strip, chain, slot)?.ui_inputs.clone()
     }
 
     pub fn rebuild_plugins(
@@ -2800,20 +2652,13 @@ impl JackEngine {
                 bus_chains: built.bus_chains,
             })
             .map_err(|_| anyhow!("engine command queue full"))?;
-        self.state_proxies = built.strip_proxies;
-        self.plugin_handles = built.strip_handles;
-        self.plugin_outputs = built.strip_outputs;
-        self.plugin_ui_inputs = built.strip_ui_inputs;
-        self.bus_state_proxies = built.bus_proxies;
-        self.bus_plugin_handles = built.bus_handles;
-        self.bus_plugin_outputs = built.bus_outputs;
-        self.bus_plugin_ui_inputs = built.bus_ui_inputs;
+        self.strip_meta = built.strip_meta;
+        self.bus_meta = built.bus_meta;
         Ok(())
     }
 
     pub fn drain_garbage(&mut self) {
         while self.garbage.pop().is_ok() {}
-        while self.garbage_chains.pop().is_ok() {}
         while self.garbage_bus_chains.pop().is_ok() {}
         while self.garbage_nested.pop().is_ok() {}
         while self.garbage_delays.pop().is_ok() {}
@@ -2822,27 +2667,65 @@ impl JackEngine {
     }
 }
 
+/// Moves every plugin out of `chain` into the garbage queue while keeping the
+/// chain's allocation, so a later `push` on the audio thread cannot reallocate.
+fn retire_plugins<T>(chain: &mut Vec<T>, garbage: &mut Producer<T>) {
+    while let Some(plugin) = chain.pop() {
+        if let Err(rtrb::PushError::Full(plugin)) = garbage.push(plugin) {
+            std::mem::forget(plugin);
+        }
+    }
+}
+
+/// Whether any plugin in `chain` would currently process audio.
+fn chain_is_active(chain: &[SlotPlugin], bypassed: impl Fn(usize) -> bool) -> bool {
+    chain
+        .iter()
+        .enumerate()
+        .any(|(slot, plugin)| !matches!(plugin, SlotPlugin::Missing) && !bypassed(slot))
+}
+
 fn chain_latency(chain: &[SlotPlugin]) -> u32 {
     chain.iter().map(|plugin| plugin.latency()).sum()
 }
 
-fn set_controls(
-    instance: &mut dyn PluginNode,
-    params: &SharedParams,
-    strip: usize,
-    chain: usize,
-    slot: usize,
-) {
-    let controls = instance.control_count().min(MAX_PARAMS);
-    for param in 0..controls {
-        instance.set_control(param, params.plugin_param(strip, chain, slot, param));
-    }
+/// Which insert chain a plugin runs in.
+#[derive(Clone, Copy)]
+enum ChainTarget {
+    /// A strip's pre-fader (`chain` 0) or post-fader (`chain` 1) inserts.
+    Strip {
+        index: usize,
+        chain: usize,
+    },
+    Bus(usize),
 }
 
-fn set_bus_controls(instance: &mut dyn PluginNode, params: &SharedParams, bus: usize, slot: usize) {
-    let controls = instance.control_count().min(MAX_PARAMS);
-    for param in 0..controls {
-        instance.set_control(param, params.bus_plugin_param(bus, slot, param));
+impl ChainTarget {
+    fn bypassed(self, params: &SharedParams, slot: usize) -> bool {
+        match self {
+            Self::Strip { index, chain } => params.plugin_bypass(index, chain, slot),
+            Self::Bus(bus) => params.bus_plugin_bypass(bus, slot),
+        }
+    }
+
+    /// Copies the shared control values into the plugin's control buffers.
+    fn set_controls(self, instance: &mut dyn PluginNode, params: &SharedParams, slot: usize) {
+        let controls = instance.control_count().min(MAX_PARAMS);
+        for param in 0..controls {
+            let value = match self {
+                Self::Strip { index, chain } => params.plugin_param(index, chain, slot, param),
+                Self::Bus(bus) => params.bus_plugin_param(bus, slot, param),
+            };
+            instance.set_control(param, value);
+        }
+    }
+
+    /// `(is_bus, index, chain)` as `feed_sidechain` addresses a slot.
+    fn sidechain_key(self) -> (bool, usize, usize) {
+        match self {
+            Self::Strip { index, chain } => (false, index, chain),
+            Self::Bus(bus) => (true, bus, 0),
+        }
     }
 }
 
@@ -3041,27 +2924,13 @@ fn build_chains(
     let mut strip_chains: Vec<StripChains> = (0..strip_count)
         .map(|_| std::array::from_fn(|_| Vec::with_capacity(MAX_PLUGINS)))
         .collect();
-    let mut strip_proxies: Vec<StripProxies> = (0..strip_count)
-        .map(|_| std::array::from_fn(|_| Vec::with_capacity(MAX_PLUGINS)))
-        .collect();
-    let mut strip_handles: Vec<StripHandles> = (0..strip_count)
-        .map(|_| std::array::from_fn(|_| Vec::with_capacity(MAX_PLUGINS)))
-        .collect();
-    let mut strip_outputs: Vec<StripOutputs> = (0..strip_count)
-        .map(|_| std::array::from_fn(|_| Vec::with_capacity(MAX_PLUGINS)))
-        .collect();
-    let mut strip_ui_inputs: Vec<StripUiInputs> = (0..strip_count)
+    let mut strip_meta: Vec<StripMeta> = (0..strip_count)
         .map(|_| std::array::from_fn(|_| Vec::with_capacity(MAX_PLUGINS)))
         .collect();
     let mut bus_chains: Vec<Vec<SlotPlugin>> = (0..bus_count)
         .map(|_| Vec::with_capacity(MAX_PLUGINS))
         .collect();
-    let mut bus_proxies: Vec<Vec<Option<SlotState>>> = (0..bus_count).map(|_| Vec::new()).collect();
-    let mut bus_handles: Vec<Vec<Option<usize>>> = (0..bus_count).map(|_| Vec::new()).collect();
-    let mut bus_outputs: Vec<Vec<Option<Arc<SharedOutputs>>>> =
-        (0..bus_count).map(|_| Vec::new()).collect();
-    let mut bus_ui_inputs: Vec<Vec<Option<Arc<SharedUiInputs>>>> =
-        (0..bus_count).map(|_| Vec::new()).collect();
+    let mut bus_meta: Vec<Vec<SlotMeta>> = (0..bus_count).map(|_| Vec::new()).collect();
 
     for strip in &mut model.strips {
         let index = strip.id.0 as usize;
@@ -3089,21 +2958,17 @@ fn build_chains(
                             params.set_plugin_param(index, chain, slot, param, value);
                         }
                         params.set_plugin_bypass(index, chain, slot, plugin.bypassed);
-                        let outputs = slot_plugin.outputs();
-                        let ui_inputs = slot_plugin.ui_inputs();
+                        strip_meta[index][chain].push(SlotMeta::of(
+                            &slot_plugin,
+                            proxy,
+                            Some(handle),
+                        ));
                         strip_chains[index][chain].push(slot_plugin);
-                        strip_proxies[index][chain].push(proxy);
-                        strip_handles[index][chain].push(Some(handle));
-                        strip_outputs[index][chain].push(outputs);
-                        strip_ui_inputs[index][chain].push(ui_inputs);
                     }
                     None => {
                         plugin.missing = true;
                         strip_chains[index][chain].push(SlotPlugin::Missing);
-                        strip_proxies[index][chain].push(None);
-                        strip_handles[index][chain].push(None);
-                        strip_outputs[index][chain].push(None);
-                        strip_ui_inputs[index][chain].push(None);
+                        strip_meta[index][chain].push(SlotMeta::default());
                     }
                 }
                 kept.push(plugin);
@@ -3134,21 +2999,13 @@ fn build_chains(
                         params.set_bus_plugin_param(index, slot, param, value);
                     }
                     params.set_bus_plugin_bypass(index, slot, plugin.bypassed);
-                    let outputs = slot_plugin.outputs();
-                    let ui_inputs = slot_plugin.ui_inputs();
+                    bus_meta[index].push(SlotMeta::of(&slot_plugin, proxy, Some(handle)));
                     bus_chains[index].push(slot_plugin);
-                    bus_proxies[index].push(proxy);
-                    bus_handles[index].push(Some(handle));
-                    bus_outputs[index].push(outputs);
-                    bus_ui_inputs[index].push(ui_inputs);
                 }
                 None => {
                     plugin.missing = true;
                     bus_chains[index].push(SlotPlugin::Missing);
-                    bus_proxies[index].push(None);
-                    bus_handles[index].push(None);
-                    bus_outputs[index].push(None);
-                    bus_ui_inputs[index].push(None);
+                    bus_meta[index].push(SlotMeta::default());
                 }
             }
             kept.push(plugin);
@@ -3158,15 +3015,9 @@ fn build_chains(
 
     Built {
         strip_chains,
-        strip_proxies,
-        strip_handles,
-        strip_outputs,
-        strip_ui_inputs,
+        strip_meta,
         bus_chains,
-        bus_proxies,
-        bus_handles,
-        bus_outputs,
-        bus_ui_inputs,
+        bus_meta,
     }
 }
 
@@ -3423,6 +3274,21 @@ mod tests {
     use super::*;
     use vibemix_core::ids::StripId;
     use vibemix_core::model::{MixerModel, Strip};
+
+    #[test]
+    fn retiring_a_chain_keeps_its_capacity() {
+        let (mut garbage, mut drain) = rtrb::RingBuffer::<u32>::new(8);
+        let mut chain: Vec<u32> = Vec::with_capacity(MAX_PLUGINS);
+        chain.extend([1, 2, 3]);
+        retire_plugins(&mut chain, &mut garbage);
+        assert!(chain.is_empty());
+        assert!(chain.capacity() >= MAX_PLUGINS);
+        let mut retired = 0;
+        while drain.pop().is_ok() {
+            retired += 1;
+        }
+        assert_eq!(retired, 3);
+    }
 
     #[test]
     fn slug_replaces_separators_and_trims() {

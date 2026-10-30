@@ -3,8 +3,8 @@
 
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 
-use vibemix_core::model::{MidiBinding, MidiTarget};
 use vibemix_core::model::MAX_SEND_DELAY_MS;
+use vibemix_core::model::{MidiBinding, MidiTarget};
 
 use crate::params::SharedParams;
 
@@ -129,7 +129,8 @@ impl SharedMidi {
                 break;
             }
             let slot = &self.slots[count];
-            slot.channel.store(binding.channel as u32, Ordering::Relaxed);
+            slot.channel
+                .store(binding.channel as u32, Ordering::Relaxed);
             slot.cc.store(cc as u32, Ordering::Relaxed);
             slot.relative.store(binding.relative, Ordering::Relaxed);
             slot.target

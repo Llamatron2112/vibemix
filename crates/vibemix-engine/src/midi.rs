@@ -237,6 +237,12 @@ impl Clock {
             && self.abs_frame - self.last_seen_abs > self.sample_rate as i64
         {
             self.locked = false;
+            // Forget the tempo history: the first pulse after the gap would
+            // otherwise measure an interval as long as the whole outage.
+            self.last_pulse_abs = -1;
+            self.interval_avg = 0.0;
+            self.interval_count = 0;
+            self.reset_stability();
         }
     }
 
@@ -295,7 +301,11 @@ mod tests {
 
         // Alternating short/long pulses show up as tempo jitter, not glitches.
         for i in 0..24 {
-            let step = if i % 2 == 0 { interval + 20 } else { interval - 20 };
+            let step = if i % 2 == 0 {
+                interval + 20
+            } else {
+                interval - 20
+            };
             clock.process_block(&[MidiEvent::new(0, &[CLOCK])], step);
         }
         assert!(clock.jitter_bpm > 0.1, "jitter={}", clock.jitter_bpm);
@@ -305,6 +315,20 @@ mod tests {
         clock.process_block(&[MidiEvent::new(0, &[CLOCK])], interval * 3);
         clock.process_block(&[MidiEvent::new(0, &[CLOCK])], interval);
         assert!(clock.glitches >= 1, "glitches={}", clock.glitches);
+    }
+
+    #[test]
+    fn tempo_recovers_cleanly_after_the_clock_drops_out() {
+        let sample_rate = 48000.0f32;
+        let mut clock = clock_at(120.0, sample_rate);
+        // The clock stops for three seconds, then resumes at the same tempo.
+        clock.process_block(&[], sample_rate as usize * 3);
+        assert!(!clock.locked);
+        let interval = (sample_rate as f64 * 60.0 / (120.0 * 24.0)).round() as usize;
+        clock.process_block(&[MidiEvent::new(0, &[CLOCK])], interval);
+        clock.process_block(&[MidiEvent::new(0, &[CLOCK])], interval);
+        assert!((clock.bpm - 120.0).abs() < 1.0, "bpm={}", clock.bpm);
+        assert_eq!(clock.glitches, 0);
     }
 
     #[test]

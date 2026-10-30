@@ -175,7 +175,10 @@ pub fn smoke_plugin_clap_ui(bundle: &str, plugin_id: &str) -> i32 {
 
 /// A plugin to smoke-test.
 enum SmokeTarget {
-    Lv2 { uri: String, name: String },
+    Lv2 {
+        uri: String,
+        name: String,
+    },
     Vst3 {
         bundle: String,
         class_id: String,
@@ -413,9 +416,8 @@ fn scan_one(host: &Host, target: &SmokeTarget) -> (ChildOutcome, Option<PluginMe
         let mut buf = Vec::new();
         let mut chunk = [0u8; 256];
         loop {
-            let n = unsafe {
-                libc::read(fds[0], chunk.as_mut_ptr() as *mut libc::c_void, chunk.len())
-            };
+            let n =
+                unsafe { libc::read(fds[0], chunk.as_mut_ptr() as *mut libc::c_void, chunk.len()) };
             if n <= 0 {
                 break;
             }

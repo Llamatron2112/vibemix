@@ -32,8 +32,8 @@ pub struct UiService {
 
 impl UiService {
     pub fn new() -> Self {
-        let dir = std::env::var("XDG_RUNTIME_DIR").unwrap_or_else(|_| "/tmp".to_string());
-        let path = PathBuf::from(format!("{dir}/vibemix-ui-{}.sock", std::process::id()));
+        let dir = socket_dir();
+        let path = dir.join(format!("vibemix-ui-{}.sock", std::process::id()));
         Self {
             path,
             stream: None,
@@ -301,6 +301,28 @@ impl Drop for UiService {
     fn drop(&mut self) {
         self.stop();
         let _ = std::fs::remove_file(&self.path);
+    }
+}
+
+/// Directory for the UI-host socket: `$XDG_RUNTIME_DIR`, or a private
+/// per-user directory under `/tmp` (never `/tmp` itself, where another user
+/// could pre-create or swap the socket path).
+fn socket_dir() -> PathBuf {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+
+    if let Some(dir) = std::env::var_os("XDG_RUNTIME_DIR") {
+        return PathBuf::from(dir);
+    }
+    // SAFETY: `geteuid` has no preconditions.
+    let uid = unsafe { libc::geteuid() };
+    let dir = PathBuf::from(format!("/tmp/vibemix-{uid}"));
+    let _ = std::fs::DirBuilder::new().mode(0o700).create(&dir);
+    match std::fs::symlink_metadata(&dir) {
+        Ok(meta) if meta.is_dir() && meta.uid() == uid => dir,
+        _ => {
+            tracing::warn!(path = %dir.display(), "unsafe UI socket directory; falling back to /tmp");
+            PathBuf::from("/tmp")
+        }
     }
 }
 

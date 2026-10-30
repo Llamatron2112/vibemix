@@ -165,9 +165,12 @@ impl HealthStore {
             entries: self.entries.clone(),
         };
         if let Ok(text) = serde_json::to_string_pretty(&file) {
-            let parent = self.path.parent().unwrap_or_else(|| std::path::Path::new("."));
+            let parent = self
+                .path
+                .parent()
+                .unwrap_or_else(|| std::path::Path::new("."));
             let _ = fs::create_dir_all(parent);
-            let _ = fs::write(&self.path, text);
+            let _ = vibemix_core::config::write_atomic(&self.path, text);
             self.dirty = false;
         }
     }
@@ -224,7 +227,9 @@ pub fn parse_scan_line(line: &str) -> Option<ScanEvent> {
                 .unwrap_or_default()
                 .to_string(),
             meta: VerdictMeta {
-                has_sidechain: value.get("has_sidechain").and_then(serde_json::Value::as_bool),
+                has_sidechain: value
+                    .get("has_sidechain")
+                    .and_then(serde_json::Value::as_bool),
                 inputs: value
                     .get("inputs")
                     .and_then(serde_json::Value::as_u64)
@@ -251,11 +256,26 @@ pub struct Scan {
     pub total: usize,
     child: Option<Child>,
     rx: Option<Receiver<ScanEvent>>,
+    /// When the supervisor process was first seen to have exited. Its output
+    /// may still be in flight, so events are drained for a short grace period
+    /// before the sweep is considered finished.
+    exited_at: Option<std::time::Instant>,
 }
+
+/// How long to keep reading a sweep's output after its process has exited.
+const EXIT_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
 
 impl Default for Scan {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl Drop for Scan {
+    /// The sweep runs in its own process group, so it would otherwise outlive
+    /// the engine.
+    fn drop(&mut self) {
+        self.stop();
     }
 }
 
@@ -267,6 +287,7 @@ impl Scan {
             total: 0,
             child: None,
             rx: None,
+            exited_at: None,
         }
     }
 
@@ -313,6 +334,7 @@ impl Scan {
         }
         self.child = Some(child);
         self.rx = Some(rx);
+        self.exited_at = None;
         self.running = true;
         self.done = 0;
         self.total = 0;
@@ -331,6 +353,7 @@ impl Scan {
             let _ = child.wait();
         }
         self.rx = None;
+        self.exited_at = None;
         self.running = false;
         self.done = 0;
         self.total = 0;
@@ -364,7 +387,10 @@ impl Scan {
         if self.running {
             if let Some(child) = self.child.as_mut() {
                 if matches!(child.try_wait(), Ok(Some(_))) {
-                    self.running = false;
+                    let since = *self.exited_at.get_or_insert_with(std::time::Instant::now);
+                    if since.elapsed() >= EXIT_GRACE {
+                        self.running = false;
+                    }
                 }
             }
         }
