@@ -29,6 +29,50 @@ ApplicationWindow {
         id: backend
     }
 
+    // Debug aid for scripts/gui-shot.py: `--snapshot-to=<png> [--snapshot-after=<ms>]`
+    // saves the window contents after a delay and quits. Inert otherwise.
+    Timer {
+        id: snapshotTimer
+        property string path: ""
+        repeat: false
+        onTriggered: {
+            // `contentItem` itself has no QML engine; grab its largest visible
+            // child (the mixer), not the hidden waiting-for-engine overlay.
+            var target = null
+            var best = 0
+            for (var c = 0; c < root.contentItem.children.length; c++) {
+                var child = root.contentItem.children[c]
+                if (child.visible && child.width * child.height > best) {
+                    best = child.width * child.height
+                    target = child
+                }
+            }
+            console.log("snapshot state: connected=" + backend.connected + " catalog_ready="
+                + backend.catalog_ready + " strips=" + mix.strips.length + " buses=" + mix.buses.length)
+            if (!target || !target.grabToImage(function (result) {
+                result.saveToFile(snapshotTimer.path)
+                Qt.quit()
+            })) {
+                console.log("snapshot failed")
+                Qt.quit()
+            }
+        }
+        Component.onCompleted: {
+            var args = Qt.application.arguments
+            var delay = 8000
+            for (var i = 0; i < args.length; i++) {
+                if (args[i].indexOf("--snapshot-to=") === 0)
+                    snapshotTimer.path = args[i].substring("--snapshot-to=".length)
+                else if (args[i].indexOf("--snapshot-after=") === 0)
+                    delay = parseInt(args[i].substring("--snapshot-after=".length))
+            }
+            if (snapshotTimer.path !== "") {
+                snapshotTimer.interval = delay
+                snapshotTimer.start()
+            }
+        }
+    }
+
     Connections {
         target: backend
         function onPortsChanged() { root.ensurePatchClients() }
@@ -37,17 +81,28 @@ ApplicationWindow {
     // Auto-fit (Options menu): while enabled, drive the window size from the
     // mixer content, clamped to the screen's available area. Inactive otherwise
     // so the window stays freely resizable, and while maximized.
-    Binding {
-        target: root
-        property: "width"
-        when: root.transportUi().autosize && root.visibility !== Window.Maximized
-        value: Math.min(root.autoFitWidth(), Screen.desktopAvailableWidth)
-    }
-    Binding {
-        target: root
-        property: "height"
-        when: root.transportUi().autosize && root.visibility !== Window.Maximized
-        value: Math.min(appMenuBar.height + root.autoFitHeight(), Screen.desktopAvailableHeight)
+    // The window follows the mixer content, but only once the content size has
+    // been stable for a moment. Binding the window size live sent every
+    // intermediate layout (for example a card removed before the grid had been
+    // re-wrapped, which briefly doubled the height) to the window manager, so the
+    // window visibly flashed another geometry.
+    readonly property bool autoFitActive:
+        root.transportUi().autosize && root.visibility !== Window.Maximized
+    readonly property int autoFitTargetWidth:
+        Math.min(root.autoFitWidth(), Screen.desktopAvailableWidth)
+    readonly property int autoFitTargetHeight:
+        Math.min(appMenuBar.height + root.autoFitHeight(), Screen.desktopAvailableHeight)
+    onAutoFitTargetWidthChanged: if (autoFitActive) autoFitTimer.restart()
+    onAutoFitTargetHeightChanged: if (autoFitActive) autoFitTimer.restart()
+    onAutoFitActiveChanged: if (autoFitActive) autoFitTimer.restart()
+    Timer {
+        id: autoFitTimer
+        interval: 60
+        onTriggered: {
+            if (!root.autoFitActive) return
+            if (root.width !== root.autoFitTargetWidth) root.width = root.autoFitTargetWidth
+            if (root.height !== root.autoFitTargetHeight) root.height = root.autoFitTargetHeight
+        }
     }
 
     readonly property int stripBody: 76
@@ -65,6 +120,92 @@ ApplicationWindow {
 
     property var mix: ({ strips: [], buses: [] })
     property var values: ({ strips: {}, buses: {}, params: {} })
+
+    // The strip and bus repeaters are driven by id-only models, so a snapshot
+    // only creates or destroys the cards that were actually added or removed.
+    // (Handing a fresh array to a Repeater re-creates every card, which took
+    // minutes with 64 strips x 32 buses.) Cards look their data up by id; the
+    // lookup tables are plain objects mutated in place and announced by bumping
+    // `dataRevision`, so bindings re-run once per snapshot.
+    ListModel { id: stripIdModel }
+    ListModel { id: busIdModel }
+    property var dataIndex: ({ strips: ({}), buses: ({}) })
+    // JSON text of each entry as last stored, so an unchanged strip or bus keeps
+    // the very same object and none of its bindings fire.
+    property var dataText: ({ strips: ({}), buses: ({}) })
+    property int dataRevision: 0
+    function stripAt(id) { return dataRevision >= 0 ? dataIndex.strips[id] : undefined }
+    function busAt(id) { return dataRevision >= 0 ? dataIndex.buses[id] : undefined }
+
+    // Makes `model` hold exactly `ids` (role `role`) in order, touching only
+    // the entries that changed: removes the gone, moves the reordered, inserts
+    // the new.
+    function syncIdModel(model, role, ids) {
+        var wanted = {}
+        for (var k = 0; k < ids.length; k++) wanted[ids[k]] = true
+        for (var i = model.count - 1; i >= 0; i--)
+            if (!wanted[model.get(i)[role]]) model.remove(i)
+        for (var j = 0; j < ids.length; j++) {
+            if (j < model.count && model.get(j)[role] === ids[j]) continue
+            var found = -1
+            for (var m = j + 1; m < model.count; m++) {
+                if (model.get(m)[role] === ids[j]) { found = m; break }
+            }
+            if (found >= 0) {
+                model.move(found, j, 1)
+            } else {
+                var entry = {}
+                entry[role] = ids[j]
+                model.insert(j, entry)
+            }
+        }
+    }
+
+    function applySnapshot(parsed) {
+        var strips = dataIndex.strips
+        var buses = dataIndex.buses
+        var stripIds = []
+        var busIds = []
+        for (var s = 0; s < parsed.strips.length; s++) {
+            var strip = parsed.strips[s]
+            var stripText = JSON.stringify(strip)
+            if (dataText.strips[strip.id] !== stripText || !strips[strip.id]) {
+                strips[strip.id] = strip
+                dataText.strips[strip.id] = stripText
+            }
+            stripIds.push(strip.id)
+        }
+        for (var b = 0; b < parsed.buses.length; b++) {
+            var bus = parsed.buses[b]
+            var busText = JSON.stringify(bus)
+            if (dataText.buses[bus.id] !== busText || !buses[bus.id]) {
+                buses[bus.id] = bus
+                dataText.buses[bus.id] = busText
+            }
+            busIds.push(bus.id)
+        }
+        mix = parsed
+        syncIdModel(stripIdModel, "sid", stripIds)
+        syncIdModel(busIdModel, "bid", busIds)
+        // Entries of removed items were kept until their cards were destroyed.
+        var liveStrips = {}
+        var liveBuses = {}
+        for (var i = 0; i < stripIds.length; i++) liveStrips[stripIds[i]] = true
+        for (var j = 0; j < busIds.length; j++) liveBuses[busIds[j]] = true
+        for (var key in strips) {
+            if (!liveStrips[key]) {
+                delete strips[key]
+                delete dataText.strips[key]
+            }
+        }
+        for (var bkey in buses) {
+            if (!liveBuses[bkey]) {
+                delete buses[bkey]
+                delete dataText.buses[bkey]
+            }
+        }
+        dataRevision++
+    }
     property var levels: ({ strips: {}, buses: {} })
     property var catalog: []
     property var recorderRows: []
@@ -350,7 +491,9 @@ ApplicationWindow {
         return kind === "strip" ? layout.strips_per_row : layout.buses_per_row
     }
     function paneColumns(kind) {
-        var count = kind === "strip" ? mix.strips.length : mix.buses.length
+        // Count the cards that exist (the id models drive the repeaters), not
+        // the snapshot, so the column count and the cards change together.
+        var count = kind === "strip" ? stripIdModel.count : busIdModel.count
         var fixed = root.layoutColumns(kind)
         if (root.transportUi().autosize) {
             // While auto-fit is on the window is sized to the content, so the
@@ -1364,6 +1507,22 @@ ApplicationWindow {
                     }
 
                     Label {
+                        id: dspLabel
+                        // Audio-callback load: average, with the recent peak in the tooltip.
+                        text: "DSP " + Math.round(backend.dsp_load / 10) + "%"
+                        visible: backend.connected
+                        color: backend.dsp_peak >= 900 ? "#e53935"
+                             : backend.dsp_load >= 600 ? "#fb8c00"
+                             : root.mutedText
+                        font.pixelSize: 11
+
+                        HoverHandler { id: dspHover }
+                        ToolTip.visible: dspHover.hovered
+                        ToolTip.text: "audio callback load (average " + Math.round(backend.dsp_load / 10)
+                                      + "%, recent peak " + Math.round(backend.dsp_peak / 10) + "%)"
+                    }
+
+                    Label {
                         text: backend.xruns + " xruns"
                         visible: backend.xruns > 0
                         color: "#e53935"
@@ -1628,7 +1787,7 @@ ApplicationWindow {
 
     Connections {
         target: backend
-        function onSnapshotChanged() { mix = JSON.parse(backend.snapshot); root.pruneEditors() }
+        function onSnapshotChanged() { root.applySnapshot(JSON.parse(backend.snapshot)); root.pruneEditors() }
     }
     Connections {
         target: backend
@@ -4731,11 +4890,11 @@ ApplicationWindow {
 
                         Repeater {
                             id: stripsRepeater
-                            model: mix.strips
+                            model: stripIdModel
 
                             delegate: Rectangle {
                         id: stripCard
-                        property var stripData: modelData
+                        property var stripData: root.stripAt(model.sid)
                         property string reorderKind: "strip"
                         property bool dragging: false
                         property real dragOffset: 0
@@ -4912,11 +5071,11 @@ ApplicationWindow {
                                 }
 
                                 Repeater {
-                                    model: mix.buses
+                                    model: busIdModel
 
                                     delegate: Column {
                                         id: sendRow
-                                        property var busData: modelData
+                                        property var busData: root.busAt(model.bid)
                                         width: parent.width
                                         spacing: 1
 
@@ -5138,11 +5297,11 @@ ApplicationWindow {
 
                         Repeater {
                             id: busesRepeater
-                            model: mix.buses
+                            model: busIdModel
 
                             delegate: Rectangle {
                         id: busCard
-                        property var busData: modelData
+                        property var busData: root.busAt(model.bid)
                         property string reorderKind: "bus"
                         readonly property bool reorderable: busCard.busData.id !== 0
                         property bool dragging: false
