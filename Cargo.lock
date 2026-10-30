@@ -1166,6 +1166,7 @@ dependencies = [
 name = "vibemix-proto"
 version = "1.0.2"
 dependencies = [
+ "libc",
  "rosc",
  "serde",
 ]
