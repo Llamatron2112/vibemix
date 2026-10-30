@@ -6262,11 +6262,11 @@ ApplicationWindow {
                         // Transient markers, mapped from raw frames by the
                         // current nudge so they follow the rotated waveform.
                         for (var t = 0; t < loopEditor.waveTransients.length; t++) {
-                            var transient = loopEditor.waveTransients[t]
-                            var display = ((transient.frame - total) % frames + frames) % frames
+                            var marker = loopEditor.waveTransients[t]
+                            var display = ((marker.frame - total) % frames + frames) % frames
                             if (display < viewStart - 1.0e-6 || display > viewEnd + 1.0e-6) continue
                             var tx = (display - viewStart) / span * width
-                            var strength = Math.max(0.2, Math.min(1.0, transient.strength || 0.5))
+                            var strength = Math.max(0.2, Math.min(1.0, marker.strength || 0.5))
                             ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25 + 0.55 * strength)
                             ctx.beginPath()
                             ctx.moveTo(tx, 0)
@@ -6410,14 +6410,14 @@ ApplicationWindow {
                                 var best = -1
                                 var bestDistance = 8
                                 for (var i = 0; i < loopEditor.waveTransients.length; i++) {
-                                    var transient = loopEditor.waveTransients[i]
-                                    var display = ((transient.frame - total) % frames + frames) % frames
+                                    var marker = loopEditor.waveTransients[i]
+                                    var display = ((marker.frame - total) % frames + frames) % frames
                                     if (display < loopEditor.viewStart || display > loopEditor.viewEnd) continue
                                     var x = (display - loopEditor.viewStart) / span * width
                                     var distance = Math.abs(x - mouse.x)
                                     if (distance < bestDistance) {
                                         bestDistance = distance
-                                        best = transient.frame
+                                        best = marker.frame
                                     }
                                 }
                                 if (best >= 0) loopEditor.snapTransient(best)
