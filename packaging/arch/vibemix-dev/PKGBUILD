@@ -79,6 +79,9 @@ prepare() {
   repo="$(realpath "$startdir/../../..")"
 
   mkdir -p "$srcdir/$pkgname"
+  # Keep Cargo's incremental build cache; replace the rest of the source tree
+  # so renamed or deleted files cannot linger between builds.
+  find "$srcdir/$pkgname" -mindepth 1 -maxdepth 1 ! -name target -exec rm -rf {} +
   tar -C "$repo" \
       --exclude-vcs \
       --exclude=.cargo \
