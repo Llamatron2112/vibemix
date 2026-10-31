@@ -275,6 +275,7 @@ pub enum ControlMessage {
         send: bool,
         receive: bool,
     },
+    ClockRestartAtBar,
     SetStripMidiChannel {
         strip: u32,
         channel: u32,
@@ -870,6 +871,10 @@ impl ControlMessage {
                 addr: addr::CLOCK_TRANSPORT.to_string(),
                 args: vec![OscType::Int(*send as i32), OscType::Int(*receive as i32)],
             },
+            ClockRestartAtBar => OscMessage {
+                addr: addr::CLOCK_RESTART.to_string(),
+                args: Vec::new(),
+            },
             SetStripMidiChannel { strip, channel } => OscMessage {
                 addr: addr::STRIP_MIDI_CHANNEL.to_string(),
                 args: vec![OscType::Int(*strip as i32), OscType::Int(*channel as i32)],
@@ -1324,6 +1329,7 @@ impl ControlMessage {
                 send: int(args, 0)? != 0,
                 receive: int(args, 1)? != 0,
             }),
+            addr::CLOCK_RESTART => Some(ControlMessage::ClockRestartAtBar),
             addr::STRIP_MIDI_CHANNEL => Some(ControlMessage::SetStripMidiChannel {
                 strip: int(args, 0)? as u32,
                 channel: int(args, 1)? as u32,
@@ -1984,6 +1990,7 @@ mod tests {
             send: false,
             receive: true,
         });
+        roundtrip(ControlMessage::ClockRestartAtBar);
     }
 
     #[test]

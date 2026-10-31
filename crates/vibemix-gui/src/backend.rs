@@ -1161,6 +1161,10 @@ pub mod qobject {
         fn set_clock_transport(&self, send: bool, receive: bool);
 
         #[qinvokable]
+        #[cxx_name = "restartAtBar"]
+        fn restart_at_bar(&self);
+
+        #[qinvokable]
         #[cxx_name = "setLoadLastSessionOnStartup"]
         fn set_load_last_session_on_startup(self: Pin<&mut Self>, on: bool);
 
@@ -1998,6 +2002,11 @@ impl qobject::Backend {
             send: send_transport,
             receive: receive_transport,
         });
+    }
+
+    pub fn restart_at_bar(&self) {
+        note_action("restart clock at next bar");
+        send(ControlMessage::ClockRestartAtBar);
     }
 
     pub fn set_load_last_session_on_startup(mut self: Pin<&mut Self>, on: bool) {

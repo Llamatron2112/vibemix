@@ -1604,6 +1604,18 @@ ApplicationWindow {
                                 }
                             }
                         }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            hoverEnabled: true
+                            enabled: backend.connected && root.clockInfo().playing
+                            cursorShape: enabled ? Qt.PointingHandCursor : Qt.ArrowCursor
+                            onClicked: backend.restartAtBar()
+
+                            ToolTip.visible: containsMouse
+                            ToolTip.delay: 400
+                            ToolTip.text: "restart at the next bar"
+                        }
                     }
 
                     Label {

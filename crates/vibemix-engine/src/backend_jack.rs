@@ -18,7 +18,8 @@ use crate::recorder::{bar_boundary_offset, LoopPlayback, RecordedTake, Recorder,
 
 use crate::dsp;
 use crate::midi::{
-    is_sync_status, is_transport_status, Clock, MasterClock, MidiBlock, CONTINUE, START, STOP,
+    is_sync_status, is_transport_status, restart_start_offset, Clock, MasterClock, MidiBlock,
+    CONTINUE, START, STOP,
 };
 use crate::midi_map::SharedMidi;
 use crate::params::{
@@ -545,6 +546,9 @@ struct MixerGraph {
     master_midi: MidiBlock,
     master: MasterClock,
     master_active: bool,
+    /// A restart was requested in slave mode and is waiting for the last
+    /// clock pulse of the current bar.
+    slave_restart_pending: bool,
     clock: Clock,
     shared_clock: Arc<SharedClock>,
     position: vibemix_lv2::TimePosition,
@@ -1496,6 +1500,10 @@ impl ProcessHandler for MixerGraph {
 
         let master_mode = self.params.clock_master();
         let beats_per_bar = self.params.beats_per_bar();
+        let restart_requested = self.params.take_clock_restart();
+        if master_mode {
+            self.slave_restart_pending = false;
+        }
         let beats_before;
         let playing;
 
@@ -1534,6 +1542,10 @@ impl ProcessHandler for MixerGraph {
                 self.master.reset();
                 self.master_active = true;
             }
+            self.master.set_beats_per_bar(beats_per_bar);
+            if restart_requested && self.params.clock_playing() {
+                self.master.request_restart();
+            }
             let (exact_beats, pulse_beats, frames_at_start) = self.master.process(
                 frames,
                 self.sample_rate as u32,
@@ -1565,8 +1577,10 @@ impl ProcessHandler for MixerGraph {
             );
 
             // Clock/transport goes to the MIDI output in master mode only.
-            // `send_transport` can suppress start/stop while keeping clock.
-            let send_transport = self.params.clock_send_transport();
+            // `send_transport` can suppress start/stop while keeping clock,
+            // but an explicit restart always sends its START.
+            let send_transport =
+                self.params.clock_send_transport() || self.master.force_transport();
             let mut writer = self.midi_out.writer(scope);
             for index in 0..self.master_midi.len() {
                 let event = self.master_midi.get(index);
@@ -1619,6 +1633,33 @@ impl ProcessHandler for MixerGraph {
                 }
             }
 
+            // Scheduled START in the gap after the last pulse of the current
+            // bar. The slave clock resets when it processes the injected
+            // START; the next clock pulse is the new bar's first tick.
+            if restart_requested && self.clock.playing {
+                self.slave_restart_pending = true;
+            }
+            if self.slave_restart_pending && !self.clock.playing {
+                self.slave_restart_pending = false;
+            }
+            if self.slave_restart_pending {
+                if let Some(offset) = restart_start_offset(
+                    self.midi.as_slice(),
+                    self.clock.beats,
+                    beats_per_bar as f64,
+                    frames,
+                ) {
+                    let start = MidiEvent::new(offset as i64, &[START]);
+                    self.midi.push(start);
+                    self.transport_midi.push(start);
+                    self.master_midi.push(start);
+                    self.midi.sort_by_time();
+                    self.transport_midi.sort_by_time();
+                    self.master_midi.sort_by_time();
+                    self.slave_restart_pending = false;
+                }
+            }
+
             // Clock/transport always tracks the input so the GUI can show position.
             beats_before = self.clock.beats;
             self.clock.set_beats_per_bar(beats_per_bar);
@@ -1628,20 +1669,19 @@ impl ProcessHandler for MixerGraph {
             self.position = self.clock.position();
             self.shared_clock.publish(&self.clock);
 
-            // Optional MIDI-transport thru (no clock) in slave mode.
-            if send_transport {
-                let mut writer = self.midi_out.writer(scope);
-                for index in 0..self.master_midi.len() {
-                    let event = self.master_midi.get(index);
-                    if writer
-                        .write(&RawMidi {
-                            time: event.time.max(0) as Frames,
-                            bytes: event.as_slice(),
-                        })
-                        .is_err()
-                    {
-                        self.midi_out_errors += 1;
-                    }
+            // MIDI-transport thru (no clock) in slave mode, plus any explicit
+            // restart START (which ignores the send toggle).
+            let mut writer = self.midi_out.writer(scope);
+            for index in 0..self.master_midi.len() {
+                let event = self.master_midi.get(index);
+                if writer
+                    .write(&RawMidi {
+                        time: event.time.max(0) as Frames,
+                        bytes: event.as_slice(),
+                    })
+                    .is_err()
+                {
+                    self.midi_out_errors += 1;
                 }
             }
         }
@@ -1994,6 +2034,7 @@ impl JackEngine {
             master_midi: MidiBlock::default(),
             master: MasterClock::new(),
             master_active: false,
+            slave_restart_pending: false,
             transport_midi: MidiBlock::default(),
             clock: Clock::new(sample_rate as f32, 4.0),
             shared_clock: Arc::clone(&shared_clock),

@@ -304,6 +304,36 @@ impl Clock {
     }
 }
 
+/// Offset within the block for a restart START, or `None` if the last pulse
+/// of the current bar has not arrived yet (or was the final sample).
+///
+/// `START` belongs just after the last clock pulse before a bar, so the next
+/// pulse is the downbeat of the new bar.
+pub fn restart_start_offset(
+    events: &[MidiEvent],
+    beats_before: f64,
+    beats_per_bar: f64,
+    frames: usize,
+) -> Option<usize> {
+    let bpb = beats_per_bar.max(1.0);
+    let next_bar = ((beats_before / bpb).floor() + 1.0) * bpb;
+    let last_pulse = next_bar - 1.0 / 24.0;
+    if beats_before >= last_pulse - 1.0e-9 && beats_before < next_bar - 1.0e-9 {
+        return Some(0);
+    }
+    let mut beats = beats_before;
+    for event in events {
+        if event.as_slice().first().copied() == Some(CLOCK) {
+            beats += 1.0 / 24.0;
+            if beats >= last_pulse - 1.0e-9 {
+                let offset = event.time.max(0) as usize + 1;
+                return (offset < frames).then_some(offset);
+            }
+        }
+    }
+    None
+}
+
 /// Internal MIDI clock generator.
 ///
 /// The pulse phase is integer (`1 / (2500 * sample_rate)` of a pulse) and
@@ -315,6 +345,14 @@ pub struct MasterClock {
     pulses: u64,
     phase: u64,
     frames_since_start: u64,
+    beats_per_bar: f32,
+    restart_requested: bool,
+    restart_pending: bool,
+    restart_started: bool,
+    restart_start_next: bool,
+    /// A restart START was emitted this block; it must reach `midi_out` even
+    /// when automatic transport sending is disabled.
+    force_transport: bool,
 }
 
 impl Default for MasterClock {
@@ -331,6 +369,12 @@ impl MasterClock {
             pulses: 0,
             phase: 0,
             frames_since_start: 0,
+            beats_per_bar: 4.0,
+            restart_requested: false,
+            restart_pending: false,
+            restart_started: false,
+            restart_start_next: false,
+            force_transport: false,
         }
     }
 
@@ -340,6 +384,33 @@ impl MasterClock {
         self.pulses = 0;
         self.phase = 0;
         self.frames_since_start = 0;
+        self.restart_requested = false;
+        self.restart_pending = false;
+        self.restart_started = false;
+        self.restart_start_next = false;
+        self.force_transport = false;
+    }
+
+    pub fn set_beats_per_bar(&mut self, beats_per_bar: f32) {
+        if beats_per_bar > 0.0 {
+            self.beats_per_bar = beats_per_bar;
+        }
+    }
+
+    /// Schedule a `START` in the gap after the next bar's last clock pulse.
+    pub fn request_restart(&mut self) {
+        self.restart_requested = true;
+        self.restart_pending = false;
+        self.restart_started = false;
+        self.restart_start_next = false;
+    }
+
+    pub fn force_transport(&self) -> bool {
+        self.force_transport
+    }
+
+    fn pulses_per_bar(&self) -> u64 {
+        (self.beats_per_bar * 24.0).round().max(1.0) as u64
     }
 
     pub fn is_playing(&self) -> bool {
@@ -399,12 +470,17 @@ impl MasterClock {
         out: &mut MidiBlock,
     ) -> (f64, f64, u64) {
         self.bpm_milli = bpm_milli.clamp(20_000, 400_000);
+        self.force_transport = false;
         if playing != self.playing {
             if playing {
                 out.push(MidiEvent::new(0, &[START]));
                 self.pulses = 0;
                 self.phase = 0;
                 self.frames_since_start = 0;
+                self.restart_requested = false;
+                self.restart_pending = false;
+                self.restart_started = false;
+                self.restart_start_next = false;
                 self.playing = true;
             } else {
                 out.push(MidiEvent::new(0, &[STOP]));
@@ -412,11 +488,39 @@ impl MasterClock {
                 self.pulses = 0;
                 self.phase = 0;
                 self.frames_since_start = 0;
+                self.restart_requested = false;
+                self.restart_pending = false;
+                self.restart_started = false;
+                self.restart_start_next = false;
                 return (0.0, 0.0, 0);
             }
         }
         if !self.playing {
             return (0.0, 0.0, 0);
+        }
+
+        let ppb = self.pulses_per_bar();
+        // A START queued at the end of the previous block (the last pulse was
+        // the final sample) goes out at the top of this one.
+        if self.restart_start_next {
+            self.restart_start_next = false;
+            self.restart_started = true;
+            self.force_transport = true;
+            out.push(MidiEvent::new(0, &[START]));
+        }
+        if self.restart_requested {
+            self.restart_requested = false;
+            if self.restart_started {
+                // Already waiting for the bar; a second click must not emit
+                // another START.
+            } else if self.pulses % ppb == ppb - 1 {
+                // Already in the gap after this bar's last pulse.
+                self.restart_started = true;
+                self.force_transport = true;
+                out.push(MidiEvent::new(0, &[START]));
+            } else {
+                self.restart_pending = true;
+            }
         }
 
         let beats_before = self.beats_at(sample_rate);
@@ -452,6 +556,26 @@ impl MasterClock {
                     self.phase %= den;
                     self.pulses += 1;
                     out.push(MidiEvent::new((frame - 1) as i64, &[CLOCK]));
+
+                    // The last pulse of the bar has just fired; put START in
+                    // the gap before the next bar pulse.
+                    if self.restart_pending && self.pulses % ppb == ppb - 1 {
+                        self.restart_pending = false;
+                        self.restart_started = true;
+                        self.force_transport = true;
+                        if frame < frames {
+                            out.push(MidiEvent::new(frame as i64, &[START]));
+                        } else {
+                            self.restart_start_next = true;
+                        }
+                    }
+                    // The bar pulse just fired: reset the internal position,
+                    // keeping the fractional phase so pulse spacing continues.
+                    if self.restart_started && self.pulses % ppb == 0 {
+                        self.pulses = 0;
+                        self.frames_since_start = 0;
+                        self.restart_started = false;
+                    }
                 }
             }
         }
@@ -541,6 +665,77 @@ mod tests {
         out.clear();
         master.process(0, sample_rate, true, 120_000, &mut out);
         assert_eq!(out.as_slice()[0].as_slice(), &[START]);
+    }
+
+    #[test]
+    fn restart_at_bar_starts_between_clock_pulses() {
+        let sample_rate = 48_000;
+        let mut master = MasterClock::new();
+        master.set_beats_per_bar(4.0);
+        let mut out = MidiBlock::default();
+        master.process(0, sample_rate, true, 120_000, &mut out); // START
+
+        // Two beats in (half a 4/4 bar), in 1000-frame blocks.
+        for _ in 0..48 {
+            out.clear();
+            master.process(1000, sample_rate, true, 120_000, &mut out);
+        }
+        master.request_restart();
+
+        let mut start_frames = Vec::new();
+        let mut clock_frames = Vec::new();
+        let mut abs = 48_000u64;
+        for _ in 0..120 {
+            out.clear();
+            master.process(1000, sample_rate, true, 120_000, &mut out);
+            for event in out.as_slice() {
+                match event.as_slice() {
+                    [START] => start_frames.push(abs + event.time as u64),
+                    [CLOCK] => clock_frames.push(abs + event.time as u64),
+                    _ => {}
+                }
+            }
+            abs += 1000;
+        }
+
+        assert_eq!(start_frames.len(), 1, "one scheduled START");
+        let start = start_frames[0];
+        let before = clock_frames.iter().copied().filter(|&f| f < start).max();
+        let after = clock_frames.iter().copied().filter(|&f| f > start).min();
+        assert_eq!(before, Some(start - 1), "START follows the last pulse");
+        assert_eq!(after, Some(start + 999), "next pulse is the new bar");
+        // The bar pulse reset the internal position; it is now in bar 2,
+        // rather than the ~7 beats the unreset clock would have reached.
+        assert!(
+            master.beats_at(sample_rate) < 4.0,
+            "{}",
+            master.beats_at(sample_rate)
+        );
+    }
+
+    #[test]
+    fn restart_offset_waits_for_the_last_pulse() {
+        let mut events = Vec::new();
+        for index in 0..95 {
+            events.push(MidiEvent::new(index * 100, &[CLOCK]));
+        }
+        // 95 clocks reach the last pulse of a 4/4 bar (beat 95/24).
+        assert_eq!(restart_start_offset(&events, 0.0, 4.0, 10_000), Some(9_401));
+        // Already in the gap after the last pulse: inject immediately.
+        assert_eq!(restart_start_offset(&[], 95.0 / 24.0, 4.0, 10_000), Some(0));
+        // If the last pulse is the final sample, the next block starts in the
+        // gap; do not put START at a time beyond the block.
+        events[94] = MidiEvent::new(9_999, &[CLOCK]);
+        assert_eq!(restart_start_offset(&events, 0.0, 4.0, 10_000), None);
+        // Mid-bar: wait through the remaining 47 pulses.
+        let mut tail = Vec::new();
+        for index in 0..47 {
+            tail.push(MidiEvent::new(index * 100, &[CLOCK]));
+        }
+        assert_eq!(
+            restart_start_offset(&tail, 48.0 / 24.0, 4.0, 10_000),
+            Some(4_601)
+        );
     }
 
     #[test]

@@ -63,6 +63,7 @@ pub struct SharedParams {
     clock_bpm_milli: AtomicU32,
     clock_send_transport: AtomicBool,
     clock_receive_transport: AtomicBool,
+    clock_restart: AtomicBool,
 }
 
 impl SharedParams {
@@ -133,6 +134,7 @@ impl SharedParams {
             clock_bpm_milli: AtomicU32::new(120_000),
             clock_send_transport: AtomicBool::new(true),
             clock_receive_transport: AtomicBool::new(true),
+            clock_restart: AtomicBool::new(false),
         }
     }
 
@@ -185,6 +187,14 @@ impl SharedParams {
 
     pub fn set_clock_receive_transport(&self, value: bool) {
         self.clock_receive_transport.store(value, Ordering::Relaxed);
+    }
+
+    pub fn request_clock_restart(&self) {
+        self.clock_restart.store(true, Ordering::Relaxed);
+    }
+
+    pub fn take_clock_restart(&self) -> bool {
+        self.clock_restart.swap(false, Ordering::Relaxed)
     }
 
     pub fn beats_per_bar(&self) -> f32 {

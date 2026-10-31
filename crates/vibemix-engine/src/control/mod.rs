@@ -1753,6 +1753,10 @@ impl Controller {
                     catalog: false,
                 }
             }
+            ControlMessage::ClockRestartAtBar => {
+                self.params.request_clock_restart();
+                Actions::default()
+            }
             ControlMessage::SetStripMidiChannel { strip, channel } => {
                 if let Some(entry) = self.model.strip_mut(StripId(strip)) {
                     entry.midi_channel = midi_channel_value(channel);

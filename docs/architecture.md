@@ -746,7 +746,10 @@ slave mode it is silent for clock but can forward start/stop.
   menu, which also toggles the beats:bars and minutes:seconds counters and
   opens a small loop-settings popup (unit beats/bars, value, beats-per-bar).
   In master mode the BPM readout opens a tempo dialog and the transport button
-  starts/stops the internal clock. `Options → MIDI sync…` is a non-modal page
+  starts/stops the internal clock. Clicking the loop indicator while playing
+  schedules a START in the gap after the current bar's last clock pulse and
+  resets the transport at the next bar, in both master and slave modes.
+  `Options → MIDI sync…` is a non-modal page
   with the clock source, master tempo, transport send/receive, plugin transport
   following, and MIDI input/output routing. In beats mode the loop indicator
   groups its cells by bar with a wider gap between bars. The engine publishes

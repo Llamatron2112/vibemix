@@ -179,6 +179,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Restart at the next bar** by clicking the loop indicator while playing.
+  The engine schedules a `START` in the gap after the last clock pulse of the
+  current bar and resets the internal transport at the next bar, so the first
+  tick of the new bar is beat 1 of bar 1. It works in both master and slave
+  modes and deliberately ignores the “Send start/stop” toggle, since the click
+  is an explicit request.
 - **MIDI sync page** (`Options → MIDI sync…`): one window for the clock source
   (*MIDI in (slave)* or *Internal (master)*), master tempo, sending and
   receiving start/stop, plugin transport following, and input/output routing.
