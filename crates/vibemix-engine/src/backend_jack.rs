@@ -27,6 +27,13 @@ use crate::params::{
 
 const COMMAND_CAPACITY: usize = 64;
 
+/// How many finished takes can wait for the control thread. Depth covers
+/// back-to-back loop captures even while a previous take is being analyzed.
+const TAKE_RING_DEPTH: usize = 8;
+
+/// Fractional DSP-load peak decay per real second (independent of the period).
+const PEAK_DECAY_PER_SECOND: f32 = 0.08;
+
 /// Serialized plugin state, backed by either host's cross-thread state handle.
 #[derive(Clone)]
 pub enum SlotState {
@@ -110,6 +117,63 @@ pub enum SlotPlugin {
     /// Placeholder for a plugin that could not be loaded. It keeps the DSP
     /// chain aligned with the model slots and passes audio through untouched.
     Missing,
+}
+
+/// Every scratch buffer sized by the host period, in one unit so a period
+/// change can swap them together. The fields mirror the matching `MixerGraph`
+/// members; the allocation happens on the control thread and the swap in
+/// `apply_commands` is plain pointer moves at the top of a block, when no
+/// references are held — so no pause is required.
+pub struct ScratchBuffers {
+    chain_dry: [Vec<f32>; 2],
+    strip_scratch: [Vec<f32>; 2],
+    strip_pre_fader: Vec<[Vec<f32>; 2]>,
+    strip_input: Vec<[Vec<f32>; 2]>,
+    strip_post_fader: Vec<[Vec<f32>; 2]>,
+    strip_pre_snapshot: Vec<[Vec<f32>; 2]>,
+    strip_post_snapshot: Vec<[Vec<f32>; 2]>,
+    send_scratch: [Vec<f32>; 2],
+    sidechain_mix: [Vec<f32>; 2],
+    sidechain_silence: [Vec<f32>; 2],
+    bus_scratch: [Vec<f32>; 2],
+    bus_accum: Vec<[Vec<f32>; 2]>,
+    bus_out: Vec<[Vec<f32>; 2]>,
+    record_mix: [Vec<f32>; 2],
+}
+
+impl ScratchBuffers {
+    pub fn new(capacity: usize, strip_count: usize, bus_count: usize) -> Self {
+        Self {
+            chain_dry: [vec![0.0; capacity], vec![0.0; capacity]],
+            strip_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            strip_pre_fader: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            strip_input: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            strip_post_fader: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            strip_pre_snapshot: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            strip_post_snapshot: (0..strip_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            send_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            sidechain_mix: [vec![0.0; capacity], vec![0.0; capacity]],
+            sidechain_silence: [vec![0.0; capacity], vec![0.0; capacity]],
+            bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
+            bus_accum: (0..bus_count)
+                .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
+                .collect(),
+            bus_out: (0..bus_count)
+                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
+                .collect(),
+            record_mix: [vec![0.0; capacity], vec![0.0; capacity]],
+        }
+    }
 }
 
 impl SlotPlugin {
@@ -222,6 +286,29 @@ pub struct Notifications {
     shutdown: Arc<AtomicBool>,
 }
 
+/// MIDI loss counters published by the audio thread once per block, read by
+/// the control thread for GUI diagnostics. The audio thread cannot log, so
+/// losses are surfaced here instead.
+#[derive(Default)]
+pub struct MidiStats {
+    dropped: AtomicU64,
+    oversize: AtomicU64,
+    out_errors: AtomicU64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct MidiStatsSnapshot {
+    /// Incoming MIDI events dropped because a block already queued the maximum.
+    pub dropped: u64,
+    /// Incoming messages skipped because they are longer than the fixed
+    /// 4-byte event payload (e.g. SysEx), which cannot be forwarded
+    /// losslessly.
+    pub oversize: u64,
+    /// MIDI-out port writes that failed (e.g. the JACK port buffer was full),
+    /// so clock/transport pulses were not delivered.
+    pub out_errors: u64,
+}
+
 impl NotificationHandler for Notifications {
     /// Runs in a signal-handler-like context: only flag the shutdown here and
     /// let the control thread react.
@@ -307,6 +394,14 @@ pub enum EngineCommand {
     SetSampleRate {
         sample_rate: f32,
         delays: Vec<Vec<dsp::DelayLine>>,
+    },
+    /// Swap in scratch buffers grown for a larger host period. The allocation
+    /// happened on the control thread; the swap is applied at the top of the
+    /// next callback pass, where no references into the scratch vectors are
+    /// held yet.
+    ResizeBuffers {
+        capacity: usize,
+        buffers: Box<ScratchBuffers>,
     },
     /// Sidechain-aware strip processing order and per-slot cycle flags.
     SetStripOrder {
@@ -435,11 +530,16 @@ struct MixerGraph {
     /// then, which is rare (cycles).
     sidechain_delayed_any: bool,
     garbage_order: Producer<RetiredOrder>,
+    garbage_scratch: Producer<ScratchBuffers>,
     bus_scratch: [Vec<f32>; 2],
     bus_accum: Vec<[Vec<f32>; 2]>,
     capacity: usize,
     midi_in: Port<MidiIn>,
     midi_out: Port<MidiOut>,
+    /// Loss counters shared with the control thread (published once per block).
+    midi_stats: Arc<MidiStats>,
+    /// MIDI-out writes that failed this block's lifetime (cumulative).
+    midi_out_errors: u64,
     midi: MidiBlock,
     /// Generated clock/transport events for the current block.
     master_midi: MidiBlock,
@@ -454,6 +554,9 @@ struct MixerGraph {
     shared_recorder: Arc<SharedRecorder>,
     loop_slots: Vec<Option<LoopPlayback>>,
     loop_garbage: Producer<Box<[f32]>>,
+    /// Informs the control thread that the period grew past the fixed
+    /// capacity and scratch buffers must be resized (see `ResizeBuffers`).
+    pending_period: Arc<AtomicU32>,
     buffer_size: usize,
     /// Strip input tap (after input gain, before the pre-fader insert chain).
     strip_input: Vec<[Vec<f32>; 2]>,
@@ -617,6 +720,12 @@ impl MixerGraph {
                     }
                     self.sample_rate = sample_rate;
                 }
+                EngineCommand::ResizeBuffers { capacity, buffers } => {
+                    // Applied at the top of the block, before any borrow of
+                    // the scratch vectors; the old set is retired off-thread.
+                    self.swap_scratch(*buffers);
+                    self.capacity = capacity;
+                }
                 EngineCommand::SetStripOrder { order, delayed } => {
                     let old_order = std::mem::replace(&mut self.strip_order, order);
                     let old_delayed = std::mem::replace(&mut self.strip_delayed, delayed);
@@ -714,6 +823,44 @@ impl MixerGraph {
                     }
                 }
             }
+        }
+    }
+
+    /// Swaps the freshly allocated scratch set into the graph, retiring the
+    /// old one off-thread. Leak-bounded fallback like the other garbage rings.
+    fn swap_scratch(&mut self, buffers: ScratchBuffers) {
+        let old = ScratchBuffers {
+            chain_dry: std::mem::replace(&mut self.chain_dry, buffers.chain_dry),
+            strip_scratch: std::mem::replace(&mut self.strip_scratch, buffers.strip_scratch),
+            strip_pre_fader: std::mem::replace(&mut self.strip_pre_fader, buffers.strip_pre_fader),
+            strip_input: std::mem::replace(&mut self.strip_input, buffers.strip_input),
+            strip_post_fader: std::mem::replace(
+                &mut self.strip_post_fader,
+                buffers.strip_post_fader,
+            ),
+            strip_pre_snapshot: std::mem::replace(
+                &mut self.strip_pre_snapshot,
+                buffers.strip_pre_snapshot,
+            ),
+            strip_post_snapshot: std::mem::replace(
+                &mut self.strip_post_snapshot,
+                buffers.strip_post_snapshot,
+            ),
+            send_scratch: std::mem::replace(&mut self.send_scratch, buffers.send_scratch),
+            sidechain_mix: std::mem::replace(&mut self.sidechain_mix, buffers.sidechain_mix),
+            sidechain_silence: std::mem::replace(
+                &mut self.sidechain_silence,
+                buffers.sidechain_silence,
+            ),
+            bus_scratch: std::mem::replace(&mut self.bus_scratch, buffers.bus_scratch),
+            bus_accum: std::mem::replace(&mut self.bus_accum, buffers.bus_accum),
+            bus_out: std::mem::replace(&mut self.bus_out, buffers.bus_out),
+            record_mix: std::mem::replace(&mut self.record_mix, buffers.record_mix),
+        };
+        if let Err(old) = self.garbage_scratch.push(old) {
+            // Ring sizes cover every queued command; overflow cannot happen,
+            // but leaking is better than freeing on the audio thread.
+            std::mem::forget(old);
         }
     }
 
@@ -1358,6 +1505,13 @@ impl ProcessHandler for MixerGraph {
             // still remote-control the internal start/stop.
             let receive_transport = self.params.clock_receive_transport();
             for raw in self.midi_in.iter(scope) {
+                // Messages longer than the fixed 4-byte payload (SysEx and
+                // friends) cannot be forwarded losslessly; skip them instead
+                // of truncating them into garbage bytes.
+                if raw.bytes.len() > 4 {
+                    self.midi_stats.oversize.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let event = MidiEvent::new(raw.time as i64, raw.bytes);
                 let status = event.as_slice().first().copied().unwrap_or(0);
                 if is_transport_status(status) {
@@ -1420,10 +1574,15 @@ impl ProcessHandler for MixerGraph {
                 if !send_transport && is_transport_status(status) {
                     continue;
                 }
-                let _ = writer.write(&RawMidi {
-                    time: event.time.max(0) as Frames,
-                    bytes: event.as_slice(),
-                });
+                if writer
+                    .write(&RawMidi {
+                        time: event.time.max(0) as Frames,
+                        bytes: event.as_slice(),
+                    })
+                    .is_err()
+                {
+                    self.midi_out_errors += 1;
+                }
             }
         } else {
             if self.master_active {
@@ -1434,6 +1593,13 @@ impl ProcessHandler for MixerGraph {
             let receive_transport = self.params.clock_receive_transport();
             let send_transport = self.params.clock_send_transport();
             for raw in self.midi_in.iter(scope) {
+                // Messages longer than the fixed 4-byte payload (SysEx and
+                // friends) cannot be forwarded losslessly; skip them instead
+                // of truncating them into garbage bytes.
+                if raw.bytes.len() > 4 {
+                    self.midi_stats.oversize.fetch_add(1, Ordering::Relaxed);
+                    continue;
+                }
                 let event = MidiEvent::new(raw.time as i64, raw.bytes);
                 let status = event.as_slice().first().copied().unwrap_or(0);
                 if is_transport_status(status) {
@@ -1467,10 +1633,15 @@ impl ProcessHandler for MixerGraph {
                 let mut writer = self.midi_out.writer(scope);
                 for index in 0..self.master_midi.len() {
                     let event = self.master_midi.get(index);
-                    let _ = writer.write(&RawMidi {
-                        time: event.time.max(0) as Frames,
-                        bytes: event.as_slice(),
-                    });
+                    if writer
+                        .write(&RawMidi {
+                            time: event.time.max(0) as Frames,
+                            bytes: event.as_slice(),
+                        })
+                        .is_err()
+                    {
+                        self.midi_out_errors += 1;
+                    }
                 }
             }
         }
@@ -1557,9 +1728,20 @@ impl ProcessHandler for MixerGraph {
             let budget = raw_frames as f32 / self.sample_rate;
             let load = started.elapsed().as_secs_f32() / budget;
             self.dsp_avg += (load - self.dsp_avg) * budget.min(1.0);
-            self.dsp_peak = (self.dsp_peak * 0.9995).max(load);
+            // Linear decay per real second, so the peak's persistence does not
+            // depend on the host period.
+            self.dsp_peak = (self.dsp_peak - PEAK_DECAY_PER_SECOND * budget).max(load);
             self.meters.store_dsp(self.dsp_avg, self.dsp_peak);
         }
+
+        // MIDI loss counters are published once per block; the audio thread
+        // cannot log, so the control thread reports them instead.
+        let dropped =
+            self.midi.dropped() + self.master_midi.dropped() + self.transport_midi.dropped();
+        self.midi_stats.dropped.store(dropped, Ordering::Relaxed);
+        self.midi_stats
+            .out_errors
+            .store(self.midi_out_errors, Ordering::Relaxed);
 
         Control::Continue
     }
@@ -1568,10 +1750,14 @@ impl ProcessHandler for MixerGraph {
         let size = size as usize;
         self.buffer_size = size;
         if size > self.capacity {
+            // The control thread will allocate larger scratch buffers and
+            // swap them in; until then frames beyond the capacity are
+            // zero-filled rather than replaying stale samples.
+            self.pending_period.store(size as u32, Ordering::SeqCst);
             tracing::warn!(
                 size,
                 capacity = self.capacity,
-                "host period exceeds buffer capacity; processing is truncated"
+                "host period exceeds buffer capacity; resizing scratch buffers"
             );
         } else {
             tracing::debug!(size, "host period changed");
@@ -1585,12 +1771,15 @@ pub struct JackEngine {
     commands: Producer<EngineCommand>,
     garbage: Consumer<SlotPlugin>,
     garbage_bus_chains: Consumer<Vec<Vec<SlotPlugin>>>,
+    garbage_scratch: Consumer<ScratchBuffers>,
     garbage_nested: Consumer<Vec<StripChains>>,
     garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
     garbage_order: Consumer<RetiredOrder>,
     take_rx: Consumer<RecordedTake>,
     loop_garbage_rx: Consumer<Box<[f32]>>,
     shared_recorder: Arc<SharedRecorder>,
+    midi_stats: Arc<MidiStats>,
+    pending_period: Arc<AtomicU32>,
     pending_rate: Arc<AtomicU32>,
     xruns: Arc<AtomicU64>,
     shutdown: Arc<AtomicBool>,
@@ -1718,9 +1907,19 @@ impl JackEngine {
         let (garbage_delays_producer, garbage_delays) =
             rtrb::RingBuffer::<Vec<Vec<dsp::DelayLine>>>::new(4);
         let (garbage_order_producer, garbage_order) = rtrb::RingBuffer::<RetiredOrder>::new(4);
-        let (takes, take_rx) = rtrb::RingBuffer::<RecordedTake>::new(4);
+        // Resizes are rare (a period growth) and synchronous per command, so
+        // two pending slots cover any queue state.
+        let (garbage_scratch_producer, garbage_scratch) =
+            rtrb::RingBuffer::<ScratchBuffers>::new(2);
+        // Depth covers back-to-back takes even while the control thread runs
+        // the (expensive) transient analysis of a previous one; taking ownership
+        // of the buffer means depth only costs pre-allocated memory.
+        let (takes, take_rx) = rtrb::RingBuffer::<RecordedTake>::new(TAKE_RING_DEPTH);
         let (loop_garbage, loop_garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(COMMAND_CAPACITY);
         let shared_recorder = Arc::new(SharedRecorder::new());
+        let midi_stats = Arc::new(MidiStats::default());
+        let pending_period = Arc::new(AtomicU32::new(0));
+        let scratch = ScratchBuffers::new(capacity, strip_count, bus_count);
 
         let graph = MixerGraph {
             params: Arc::clone(&params),
@@ -1757,27 +1956,23 @@ impl JackEngine {
             dsp_peak: 0.0,
             bypass_mix_strip: vec![[[1.0; MAX_PLUGINS]; PLUGIN_CHAINS]; strip_count],
             bypass_mix_bus: vec![[1.0; MAX_PLUGINS]; bus_count],
-            chain_dry: [vec![0.0; capacity], vec![0.0; capacity]],
             delay_coeff: 1.0,
-            strip_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
-            strip_pre_fader: (0..strip_count)
-                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
-                .collect(),
-            strip_input: (0..strip_count)
-                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
-                .collect(),
-            strip_post_fader: (0..strip_count)
-                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
-                .collect(),
-            strip_pre_snapshot: (0..strip_count)
-                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
-                .collect(),
-            strip_post_snapshot: (0..strip_count)
-                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
-                .collect(),
-            send_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
-            sidechain_mix: [vec![0.0; capacity], vec![0.0; capacity]],
-            sidechain_silence: [vec![0.0; capacity], vec![0.0; capacity]],
+            // Period-sized scratch buffers, built in one place so a later
+            // resize produces the identical layout.
+            chain_dry: scratch.chain_dry,
+            strip_scratch: scratch.strip_scratch,
+            strip_pre_fader: scratch.strip_pre_fader,
+            strip_input: scratch.strip_input,
+            strip_post_fader: scratch.strip_post_fader,
+            strip_pre_snapshot: scratch.strip_pre_snapshot,
+            strip_post_snapshot: scratch.strip_post_snapshot,
+            send_scratch: scratch.send_scratch,
+            sidechain_mix: scratch.sidechain_mix,
+            sidechain_silence: scratch.sidechain_silence,
+            bus_scratch: scratch.bus_scratch,
+            bus_accum: scratch.bus_accum,
+            bus_out: scratch.bus_out,
+            record_mix: scratch.record_mix,
             strip_order: (0..strip_count).collect(),
             strip_delayed: (0..strip_count)
                 .map(|_| {
@@ -1788,17 +1983,13 @@ impl JackEngine {
                 .collect(),
             sidechain_delayed_any: false,
             garbage_order: garbage_order_producer,
-            bus_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
-            bus_accum: (0..bus_count)
-                .map(|_| [vec![0.0f32; capacity], vec![0.0f32; capacity]])
-                .collect(),
-            bus_out: (0..bus_count)
-                .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
-                .collect(),
+            garbage_scratch: garbage_scratch_producer,
             capacity,
             buffer_size,
             midi_in,
             midi_out,
+            midi_stats: Arc::clone(&midi_stats),
+            midi_out_errors: 0,
             midi: MidiBlock::default(),
             master_midi: MidiBlock::default(),
             master: MasterClock::new(),
@@ -1813,7 +2004,7 @@ impl JackEngine {
             shared_recorder: Arc::clone(&shared_recorder),
             loop_slots: (0..MAX_LOOPS).map(|_| None).collect(),
             loop_garbage,
-            record_mix: [vec![0.0; capacity], vec![0.0; capacity]],
+            pending_period: Arc::clone(&pending_period),
         };
 
         let pending_rate = Arc::new(AtomicU32::new(0));
@@ -1839,12 +2030,15 @@ impl JackEngine {
             commands,
             garbage,
             garbage_bus_chains,
+            garbage_scratch,
             garbage_nested,
             garbage_delays,
             garbage_order,
             take_rx,
             loop_garbage_rx,
             shared_recorder: Arc::clone(&shared_recorder),
+            midi_stats,
+            pending_period,
             pending_rate,
             xruns,
             shutdown,
@@ -1879,6 +2073,15 @@ impl JackEngine {
 
     pub fn recorder(&self) -> &Arc<SharedRecorder> {
         &self.shared_recorder
+    }
+
+    /// Current MIDI loss counters from the audio thread.
+    pub fn midi_stats(&self) -> MidiStatsSnapshot {
+        MidiStatsSnapshot {
+            dropped: self.midi_stats.dropped.load(Ordering::Relaxed),
+            oversize: self.midi_stats.oversize.load(Ordering::Relaxed),
+            out_errors: self.midi_stats.out_errors.load(Ordering::Relaxed),
+        }
     }
 
     pub fn take_recording(&mut self) -> Option<RecordedTake> {
@@ -1969,6 +2172,30 @@ impl JackEngine {
     pub fn take_pending_sample_rate(&self) -> Option<u32> {
         let rate = self.pending_rate.swap(0, Ordering::SeqCst);
         (rate != 0).then_some(rate)
+    }
+
+    /// Returns and clears a period-growth request from the JACK notification.
+    /// The value is the new period, which the tied scratch capacity must grow
+    /// to cover.
+    pub fn take_pending_buffer_size(&self) -> Option<usize> {
+        let size = self.pending_period.swap(0, Ordering::SeqCst);
+        (size != 0).then_some(size as usize)
+    }
+
+    /// Replaces the graph's period-sized scratch buffers with a set built for
+    /// `capacity`. Applied on the audio thread at the top of the next block:
+    /// the swap is pointer moves, the allocation happened here.
+    pub fn resize_buffers(&mut self, capacity: usize) -> Result<()> {
+        self.commands
+            .push(EngineCommand::ResizeBuffers {
+                capacity,
+                buffers: Box::new(ScratchBuffers::new(
+                    capacity,
+                    self.strip_count,
+                    self.bus_count,
+                )),
+            })
+            .map_err(|_| anyhow!("engine command queue full"))
     }
 
     /// Whether the JACK/PipeWire server has shut this client down.
@@ -2848,6 +3075,7 @@ impl JackEngine {
     pub fn drain_garbage(&mut self) {
         while self.garbage.pop().is_ok() {}
         while self.garbage_bus_chains.pop().is_ok() {}
+        while self.garbage_scratch.pop().is_ok() {}
         while self.garbage_nested.pop().is_ok() {}
         while self.garbage_delays.pop().is_ok() {}
         while self.garbage_order.pop().is_ok() {}
@@ -3547,6 +3775,35 @@ mod tests {
             bus_port_bases(&model).get(&0).map(String::as_str),
             Some("Master")
         );
+    }
+
+    #[test]
+    fn scratch_buffers_cover_the_period() {
+        let scratch = ScratchBuffers::new(4096, 3, 2);
+        assert_eq!(scratch.chain_dry.len(), 2);
+        assert_eq!(scratch.chain_dry[0].len(), 4096);
+        assert_eq!(scratch.strip_scratch[0].len(), 4096);
+        for field in [
+            &scratch.strip_pre_fader,
+            &scratch.strip_input,
+            &scratch.strip_post_fader,
+            &scratch.strip_pre_snapshot,
+            &scratch.strip_post_snapshot,
+        ] {
+            assert_eq!(field.len(), 3);
+            assert_eq!(field[0][0].len(), 4096);
+            assert_eq!(field[0][1].len(), 4096);
+        }
+        assert_eq!(scratch.send_scratch[0].len(), 4096);
+        assert_eq!(scratch.sidechain_mix[0].len(), 4096);
+        assert_eq!(scratch.sidechain_silence[0].len(), 4096);
+        assert_eq!(scratch.bus_scratch[0].len(), 4096);
+        assert_eq!(scratch.bus_accum.len(), 2);
+        assert_eq!(scratch.bus_accum[0][0].len(), 4096);
+        assert_eq!(scratch.bus_out.len(), 2);
+        assert_eq!(scratch.bus_out[0][0].len(), 4096);
+        assert_eq!(scratch.record_mix[0].len(), 4096);
+        assert_eq!(scratch.record_mix[1].len(), 4096);
     }
 }
 

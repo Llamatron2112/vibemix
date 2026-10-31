@@ -148,7 +148,7 @@ fn exercise(mut model: MixerModel) {
     let params = SharedParams::new(8, 4);
     apply_model(&params, &model);
     sync_model_from_params(&params, &mut model);
-    let json = build_state_json(&model, &params, &[], 48_000, 0, (0.0, 0.0));
+    let json = build_state_json(&model, &params, &[], 48_000, 0, (0.0, 0.0), 0, 0, 0);
     assert!(serde_json::from_str::<serde_json::Value>(&json).is_ok());
     let _ = compute_strip_order(&model, 8);
     let _ = sidechain_signature(&model);

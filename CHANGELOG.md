@@ -8,6 +8,32 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **A finished loop take can no longer be lost silently.** The take queue
+  between the audio and control threads now reports a dedicated discard reason
+  (with a recorder status message) when it fills, is deeper (8), and the
+  transient-analysis backlog no longer drops back-to-back captures invisibly.
+- **MIDI loss is now visible.** Incoming events dropped when a block's event
+  list is full, long messages (SysEx) skipped instead of truncated into
+  garbage bytes, and failed MIDI-out writes are counted and shown in the GUI
+  next to the xrun status (previous behaviour silently swallowed all of them).
+- **A host period larger than the fixed buffer capacity no longer punches a
+  silence hole.** The engine previously truncated processing with a warning;
+  it now resizes its scratch buffers through the command queue (allocation on
+  the control thread, pointer-swap on the audio thread) so the graph covers
+  the new period.
+- **The plugin editor mailbox (`SharedUiInputs`) can no longer allocate or
+  reallocate on the audio thread**, breaking one real-time invariant: the
+  free-list is reserved up front, the queue is bounded, and overflow events
+  are counted on the control thread.
+- **The internal MIDI clock no longer iterates the phase once per sample.**
+  Pulse scheduling is closed-form over the same drift-free integer phase —
+  pulse-exact (verified frame-for-frame against the previous generator) and
+  one division per pulse instead of per sample.
+- **The DSP-load peak now decays per real second** instead of per block, so
+  the "recent peak" read-out behaves the same at every period. Plugin editor
+  host processes are nice'd like the smoke-test children so a busy editor
+  cannot compete with the audio thread.
+
 - **Arming the recorder while the internal master clock is already running**
   now starts the take on the next bar. Bar detection uses pulse-aligned beats,
   separate from the exact plugin time, so the fractional phase between clock

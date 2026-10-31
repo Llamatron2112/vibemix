@@ -2,6 +2,8 @@
 //! and produces the `time:Position` handed to plugins each block. Everything is
 //! allocation-free so it can run on the audio thread.
 
+use std::cell::Cell;
+
 use vibemix_lv2::{MidiEvent, TimePosition};
 
 pub const MAX_MIDI_EVENTS: usize = 256;
@@ -10,6 +12,9 @@ pub const MAX_MIDI_EVENTS: usize = 256;
 pub struct MidiBlock {
     events: [MidiEvent; MAX_MIDI_EVENTS],
     count: usize,
+    /// Events silently dropped because the block already held the maximum.
+    /// The audio thread cannot log, so the graph publishes the total.
+    dropped: Cell<u64>,
 }
 
 impl Default for MidiBlock {
@@ -17,6 +22,7 @@ impl Default for MidiBlock {
         Self {
             events: [MidiEvent::default(); MAX_MIDI_EVENTS],
             count: 0,
+            dropped: Cell::new(0),
         }
     }
 }
@@ -30,7 +36,14 @@ impl MidiBlock {
         if self.count < MAX_MIDI_EVENTS {
             self.events[self.count] = event;
             self.count += 1;
+        } else {
+            self.dropped.set(self.dropped.get() + 1);
         }
+    }
+
+    /// Total number of events dropped by `push` over this block list's life.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.get()
     }
 
     pub fn as_slice(&self) -> &[MidiEvent] {
@@ -410,14 +423,35 @@ impl MasterClock {
         let pulse_beats = self.pulses as f64 / 24.0;
         let frames_before = self.frames_since_start;
         let den = 2500u64 * sample_rate as u64;
-        if den > 0 {
-            let increment = self.bpm_milli as u64;
-            for frame in 0..frames {
-                self.phase += increment;
-                if self.phase >= den {
-                    self.phase -= den;
+        let increment = self.bpm_milli as u64;
+        if den > 0 && increment > 0 {
+            // Closed-form pulse scheduling with the drift-free integer phase:
+            // from the current phase, the next pulse fires after
+            // `ceil((den - phase) / increment)` frames, on the last of them.
+            // Equivalent to advancing one frame at a time, without a
+            // per-sample loop (a division happens only per pulse).
+            //
+            // A sample-rate change can leave the phase above the new `den`;
+            // reduce it first so the advance computation cannot underflow.
+            if self.phase >= den {
+                self.phase %= den;
+            }
+            let mut frame = 0usize;
+            while frame < frames {
+                let advance = (den - self.phase).div_ceil(increment) as usize;
+                if frame + advance > frames {
+                    self.phase += increment * (frames - frame) as u64;
+                    frame = frames;
+                } else {
+                    frame += advance;
+                    self.phase += increment * advance as u64;
+                    // `advance` leaves the phase in `[den, den + increment)`;
+                    // `increment` is far below `den` (BPM ≤ 400 at any sane
+                    // rate), so one reduction restores the invariant. The
+                    // modulo also keeps the loop live for pathological rates.
+                    self.phase %= den;
                     self.pulses += 1;
-                    out.push(MidiEvent::new(frame as i64, &[CLOCK]));
+                    out.push(MidiEvent::new((frame - 1) as i64, &[CLOCK]));
                 }
             }
         }
@@ -429,6 +463,23 @@ impl MasterClock {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn midi_block_counts_dropped_events() {
+        let mut block = MidiBlock::default();
+        block.clear();
+        for index in 0..MAX_MIDI_EVENTS {
+            block.push(MidiEvent::new(index as i64, &[0x90, 60, 100]));
+        }
+        assert_eq!(block.dropped(), 0);
+        block.push(MidiEvent::new(0, &[CLOCK]));
+        block.push(MidiEvent::new(1, &[CLOCK]));
+        assert_eq!(block.len(), MAX_MIDI_EVENTS);
+        assert_eq!(block.dropped(), 2);
+        // Clearing the block keeps the cumulative drop counter.
+        block.clear();
+        assert_eq!(block.dropped(), 2);
+    }
 
     #[test]
     fn classifies_transport_and_sync_messages() {
@@ -514,6 +565,88 @@ mod tests {
         master.process(24_000, sample_rate, true, 60_000, &mut out);
         assert_eq!(out.len(), 12);
         assert!((master.beats_at(sample_rate) - 20.5).abs() < 1.0e-9);
+    }
+
+    /// The reference one-frame-at-a-time pulse generator the closed-form
+    /// scheduler must reproduce exactly. Returns absolute frame indices.
+    struct ReferenceClock {
+        den: u64,
+        increment: u64,
+        phase: u64,
+        frames: u64,
+        /// Total pulses fired since creation (cumulative, like `master.pulses`).
+        pulses: u64,
+    }
+
+    impl ReferenceClock {
+        fn new(bpm_milli: u32, sample_rate: u32) -> Self {
+            let den = 2500u64 * sample_rate as u64;
+            let increment = bpm_milli as u64;
+            Self {
+                den,
+                increment,
+                phase: 0,
+                frames: 0,
+                pulses: 0,
+            }
+        }
+
+        fn process(&mut self, frames: usize) -> Vec<u64> {
+            let mut fired = Vec::new();
+            for frame in 0..frames as u64 {
+                self.phase += self.increment;
+                if self.phase >= self.den {
+                    self.phase -= self.den;
+                    self.pulses += 1;
+                    fired.push(self.frames + frame);
+                }
+            }
+            self.frames += frames as u64;
+            fired
+        }
+    }
+
+    #[test]
+    fn master_clock_matches_frame_by_frame_reference() {
+        // Varied block sizes, tempos and rates; the closed-form scheduler must
+        // fire pulses on exactly the same frames as the per-frame loop and
+        // land on the same final phase.
+        for &sample_rate in &[48_000u32, 44_100, 96_000, 192_000, 8_000] {
+            for &bpm_milli in &[20_000u32, 60_000, 120_000, 250_037, 400_000] {
+                let mut master = MasterClock::new();
+                let mut out = MidiBlock::default();
+                master.process(0, sample_rate, true, bpm_milli, &mut out); // START
+                out.clear();
+                let mut reference = ReferenceClock::new(bpm_milli, sample_rate);
+
+                for blocks in 0..40usize {
+                    let frames = 16 + blocks * 113;
+                    out.clear();
+                    master.process(frames, sample_rate, true, bpm_milli, &mut out);
+                    let fired = reference.process(frames);
+
+                    let block_start = reference.frames - frames as u64;
+                    let clock_times: Vec<u64> = out
+                        .as_slice()
+                        .iter()
+                        .filter(|event| event.as_slice() == [CLOCK])
+                        .map(|event| event.time.max(0) as u64 + block_start)
+                        .collect();
+                    assert_eq!(
+                        clock_times, fired,
+                        "pulse frames diverged at {bpm_milli} BPM / {sample_rate} Hz"
+                    );
+                    assert_eq!(
+                        master.phase, reference.phase,
+                        "phase diverged at {bpm_milli} BPM / {sample_rate} Hz"
+                    );
+                    assert_eq!(
+                        master.pulses, reference.pulses,
+                        "pulses diverged at {bpm_milli} BPM / {sample_rate} Hz block_start={block_start}, fired={fired:?}, clock={clock_times:?}"
+                    );
+                }
+            }
+        }
     }
 
     fn clock_at(bpm: f64, sample_rate: f32) -> Clock {

@@ -1174,6 +1174,9 @@ pub struct SharedRecorder {
 
 pub const DISCARD_LOST_CLOCK: u32 = 1;
 pub const DISCARD_OVERFLOW: u32 = 2;
+/// The finished-take ring was full because the control thread had not yet
+/// picked up earlier takes; the take was discarded rather than lost silently.
+pub const DISCARD_TAKE_QUEUE: u32 = 3;
 
 impl SharedRecorder {
     pub fn new() -> Self {

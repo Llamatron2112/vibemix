@@ -1,6 +1,6 @@
 use std::cell::UnsafeCell;
 use std::collections::VecDeque;
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
 /// Lock-free snapshot of a plugin instance's output ports, shared between the
@@ -154,10 +154,20 @@ fn slot_buffer_len(slot: &AtomSlot) -> usize {
 
 /// Mailbox for UI→DSP atom events, from the control thread (UI writes) to the
 /// audio thread. The audio thread only ever `try_lock`s, so it never blocks,
-/// and buffers are recycled so it never allocates or frees either.
+/// and buffers are recycled so it never allocates or frees either: the `free`
+/// list is reserved for the queue limit up front, so the audio thread's push
+/// into it only ever uses capacity that already exists.
 pub struct SharedUiInputs {
     inner: Mutex<UiInputInner>,
+    /// Events dropped by `push` because the queue was already at its limit.
+    dropped: AtomicU64,
 }
+
+/// Maximum number of atom events queued from UIs at once. Buffers circulate
+/// between `queue` and `free`, so this bounds the shared allocation; a UI that
+/// floods the mailbox faster than the audio thread drains it loses events
+/// (counted by [`SharedUiInputs::dropped`]) instead of growing unbounded.
+pub const UI_INPUT_QUEUE_LIMIT: usize = 64;
 
 #[derive(Default)]
 struct UiInputInner {
@@ -167,19 +177,50 @@ struct UiInputInner {
 
 impl SharedUiInputs {
     pub fn new() -> Self {
+        let mut free = Vec::new();
+        // Reserved once so `drain` on the audio thread never reallocates: the
+        // number of circulating buffers never exceeds the queue limit.
+        free.reserve_exact(UI_INPUT_QUEUE_LIMIT);
         Self {
-            inner: Mutex::new(UiInputInner::default()),
+            inner: Mutex::new(UiInputInner {
+                queue: VecDeque::new(),
+                free,
+            }),
+            dropped: AtomicU64::new(0),
         }
     }
 
     /// Control thread: queue one atom event for plugin port `port`.
     pub fn push(&self, port: u32, bytes: &[u8]) {
-        if let Ok(mut inner) = self.inner.lock() {
-            let mut buffer = inner.free.pop().unwrap_or_default();
-            buffer.clear();
-            buffer.extend_from_slice(bytes);
-            inner.queue.push_back((port, buffer));
-        }
+        let Ok(mut inner) = self.inner.lock() else {
+            self.drop_event(port, bytes.len(), "could not lock the UI input mailbox");
+            return;
+        };
+        let mut buffer = if let Some(free) = inner.free.pop() {
+            free
+        } else {
+            if inner.queue.len() >= UI_INPUT_QUEUE_LIMIT {
+                drop(inner);
+                self.drop_event(port, bytes.len(), "UI input queue full");
+                return;
+            }
+            // Allocation happens here, on the control thread.
+            Vec::with_capacity(bytes.len().max(64))
+        };
+        buffer.clear();
+        buffer.extend_from_slice(bytes);
+        inner.queue.push_back((port, buffer));
+    }
+
+    fn drop_event(&self, port: u32, len: usize, reason: &'static str) {
+        let count = self.dropped.fetch_add(1, Ordering::Relaxed) + 1;
+        tracing::debug!(
+            dropped = count,
+            port,
+            len,
+            reason,
+            "plugin UI event dropped"
+        );
     }
 
     /// Audio thread: drain the queued events, recycling their buffers.
@@ -191,6 +232,11 @@ impl SharedUiInputs {
             f(port, &bytes);
             inner.free.push(bytes);
         }
+    }
+
+    /// How many events `push` has dropped because the queue was full.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -244,5 +290,33 @@ mod tests {
         let (bytes, format) = outputs.read_atom(0).unwrap();
         assert_eq!(&bytes[..], &[9, 8]);
         assert_eq!(format, 0xbeef);
+    }
+
+    #[test]
+    fn ui_input_queue_drops_beyond_limit() {
+        let inputs = SharedUiInputs::new();
+        for index in 0..(UI_INPUT_QUEUE_LIMIT + 8) {
+            inputs.push(3, &[index as u8]);
+        }
+        assert_eq!(inputs.dropped(), 8);
+
+        let mut drained = 0usize;
+        inputs.drain(|port, bytes| {
+            assert_eq!(port, 3);
+            assert_eq!(bytes.len(), 1);
+            drained += 1;
+        });
+        assert_eq!(drained, UI_INPUT_QUEUE_LIMIT);
+        // The dropped count is cumulative, not reset by draining.
+        assert_eq!(inputs.dropped(), 8);
+
+        // After draining, the recycled buffer is reused and the free list
+        // stays within its reserved capacity.
+        inputs.push(4, &[9, 9]);
+        inputs.drain(|port, bytes| {
+            assert_eq!(port, 4);
+            assert_eq!(bytes, &[9, 9]);
+        });
+        assert_eq!(inputs.dropped(), 8);
     }
 }

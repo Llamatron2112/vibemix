@@ -644,6 +644,15 @@ impl Controller {
                 }
             }
 
+            // A period growth past the fixed capacity needs larger scratch
+            // buffers; resize through the command queue (the allocation is
+            // done here, the audio thread only swaps pointers).
+            if let Some(size) = self.engine.take_pending_buffer_size() {
+                if let Err(error) = self.engine.resize_buffers(size) {
+                    tracing::warn!(%error, size, "failed to resize engine scratch buffers");
+                }
+            }
+
             // A MIDI control-surface CC changed a parameter; push it to the UI
             // immediately instead of waiting for the next state query.
             if self.engine.midi_map().take_changed() {
@@ -2151,6 +2160,7 @@ impl Controller {
     }
 
     fn send_state(&self, address: &Path) {
+        let midi_stats = self.engine.midi_stats();
         let message = ControlMessage::State {
             json: build_state_json(
                 &self.model,
@@ -2159,6 +2169,9 @@ impl Controller {
                 self.sample_rate,
                 self.engine.xrun_count(),
                 self.meters.dsp_load(),
+                midi_stats.dropped,
+                midi_stats.oversize,
+                midi_stats.out_errors,
             ),
         };
         self.send_message(&message, address);

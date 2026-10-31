@@ -34,6 +34,12 @@ static LAST_RX_MS: AtomicU64 = AtomicU64::new(0);
 static START: OnceLock<std::time::Instant> = OnceLock::new();
 const ENGINE_SILENCE_MS: u64 = 5000;
 static XRUNS: AtomicU32 = AtomicU32::new(0);
+/// MIDI loss counters from the engine's state snapshot: incoming events
+/// dropped (block buffer full), incoming messages skipped (longer than the
+/// 4-byte payload, e.g. SysEx), and failed MIDI-out writes.
+static MIDI_DROPPED: AtomicU32 = AtomicU32::new(0);
+static MIDI_OVERSIZE: AtomicU32 = AtomicU32::new(0);
+static MIDI_OUT_ERRORS: AtomicU32 = AtomicU32::new(0);
 /// Audio-callback load in tenths of a percent (average, peak).
 static DSP_LOAD: AtomicU32 = AtomicU32::new(0);
 static DSP_PEAK: AtomicU32 = AtomicU32::new(0);
@@ -294,6 +300,11 @@ fn receive_loop(socket: UnixDatagram) {
                     }
                     if let Some(xruns) = xruns_from_state(&value) {
                         XRUNS.store(xruns, Ordering::SeqCst);
+                    }
+                    if let Some((dropped, oversize, out_errors)) = midi_stats_from_state(&value) {
+                        MIDI_DROPPED.store(dropped, Ordering::SeqCst);
+                        MIDI_OVERSIZE.store(oversize, Ordering::SeqCst);
+                        MIDI_OUT_ERRORS.store(out_errors, Ordering::SeqCst);
                     }
                     if let Some((load, peak)) = dsp_from_state(&value) {
                         DSP_LOAD.store(load, Ordering::SeqCst);
@@ -581,6 +592,21 @@ fn xruns_from_state(value: &serde_json::Value) -> Option<u32> {
     Some(xruns.min(u32::MAX as u64) as u32)
 }
 
+/// MIDI loss counters from a state snapshot
+/// `(dropped, oversize, out_errors)`, all optional so older engines keep
+/// working.
+fn midi_stats_from_state(value: &serde_json::Value) -> Option<(u32, u32, u32)> {
+    let counter = |key: &str| -> Option<u32> {
+        let count = value.get(key)?.as_u64()?;
+        Some(count.min(u32::MAX as u64) as u32)
+    };
+    Some((
+        counter("midi_dropped")?,
+        counter("midi_oversize")?,
+        counter("midi_out_errors")?,
+    ))
+}
+
 fn build_plugins(
     plugins: Option<&Vec<serde_json::Value>>,
     location: u64,
@@ -831,6 +857,9 @@ pub mod qobject {
         #[qproperty(QString, window_geometry)]
         #[qproperty(i32, sample_rate)]
         #[qproperty(i32, xruns)]
+        #[qproperty(i32, midi_dropped)]
+        #[qproperty(i32, midi_oversize)]
+        #[qproperty(i32, midi_out_errors)]
         #[qproperty(i32, dsp_load)]
         #[qproperty(i32, dsp_peak)]
         #[qproperty(bool, has_clipboard)]
@@ -1215,6 +1244,9 @@ pub struct BackendRust {
     window_geometry: QString,
     sample_rate: i32,
     xruns: i32,
+    midi_dropped: i32,
+    midi_oversize: i32,
+    midi_out_errors: i32,
     dsp_load: i32,
     dsp_peak: i32,
     has_clipboard: bool,
@@ -1261,6 +1293,9 @@ impl Default for BackendRust {
             window_geometry: QString::from(""),
             sample_rate: 48000,
             xruns: 0,
+            midi_dropped: 0,
+            midi_oversize: 0,
+            midi_out_errors: 0,
             dsp_load: 0,
             dsp_peak: 0,
             has_clipboard: false,
@@ -1424,6 +1459,12 @@ impl qobject::Backend {
         self.as_mut()
             .set_sample_rate(SAMPLE_RATE.load(Ordering::SeqCst) as i32);
         self.as_mut().set_xruns(XRUNS.load(Ordering::SeqCst) as i32);
+        self.as_mut()
+            .set_midi_dropped(MIDI_DROPPED.load(Ordering::SeqCst) as i32);
+        self.as_mut()
+            .set_midi_oversize(MIDI_OVERSIZE.load(Ordering::SeqCst) as i32);
+        self.as_mut()
+            .set_midi_out_errors(MIDI_OUT_ERRORS.load(Ordering::SeqCst) as i32);
         self.as_mut()
             .set_dsp_load(DSP_LOAD.load(Ordering::SeqCst) as i32);
         self.as_mut()

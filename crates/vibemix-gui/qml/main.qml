@@ -1629,6 +1629,27 @@ ApplicationWindow {
                         font.pixelSize: 11
                     }
 
+                    Label {
+                        text: "midi " + (backend.midi_dropped
+                              + backend.midi_oversize
+                              + backend.midi_out_errors)
+                        visible: backend.midi_dropped > 0
+                              || backend.midi_oversize > 0
+                              || backend.midi_out_errors > 0
+                        color: "#fb8c00"
+                        font.pixelSize: 11
+
+                        HoverHandler { id: midiStatsHover }
+                        ToolTip.visible: midiStatsHover.hovered
+                        ToolTip.delay: 300
+                        ToolTip.text: "lost MIDI (input events dropped "
+                                      + backend.midi_dropped
+                                      + ", long messages skipped "
+                                      + backend.midi_oversize
+                                      + ", output writes failed "
+                                      + backend.midi_out_errors + ")"
+                    }
+
                     Rectangle {
                         implicitWidth: 8
                         implicitHeight: 8

@@ -307,6 +307,11 @@ impl Recorder {
             };
             if let Err(take) = take_tx.push(take) {
                 let rtrb::PushError::Full(take) = take;
+                // The control thread only consumes takes between its other
+                // work (transient analysis is not cheap), so the ring can fill
+                // when takes complete back to back. Surface the loss instead
+                // of discarding silently.
+                shared.note_discard(crate::params::DISCARD_TAKE_QUEUE);
                 if let Err(buffer) = garbage.push(take.buffer) {
                     std::mem::forget(buffer);
                 }
@@ -549,6 +554,60 @@ mod tests {
         assert_eq!(take.frames, 2);
         assert!((take.buffer[0] - 0.1).abs() < 1e-6);
         assert_eq!(shared.state(), RecorderState::Idle);
+    }
+
+    #[test]
+    fn full_take_ring_reports_the_discard() {
+        let shared = SharedRecorder::new();
+        // A take queue that is already full; the next completed take cannot
+        // be delivered and must surface a discard reason rather than vanish.
+        let (mut take_tx, _take_rx) = rtrb::RingBuffer::<RecordedTake>::new(1);
+        take_tx
+            .push(RecordedTake {
+                buffer: vec![0.0; 2].into_boxed_slice(),
+                frames: 1,
+                sample_rate: 48_000,
+                latency_frames: 0,
+                loop_beats: 1.0,
+            })
+            .unwrap();
+        let (mut garbage_tx, mut garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(2);
+        let mut recorder = Recorder::new();
+        recorder.arm(
+            vec![0.0; 8 * 2].into_boxed_slice(),
+            8,
+            4,
+            2,
+            0,
+            1.0,
+            &shared,
+        );
+
+        let left = [0.1, 0.2, 0.3, 0.4];
+        let right = [1.0, 2.0, 3.0, 4.0];
+        let events = [
+            MidiEvent::new(0, &[CLOCK]),
+            MidiEvent::new(1, &[CLOCK]),
+            MidiEvent::new(2, &[CLOCK]),
+        ];
+        recorder.process(
+            4,
+            &events,
+            95.0 / 24.0,
+            4.0,
+            &left,
+            &right,
+            48_000,
+            &shared,
+            &mut take_tx,
+            &mut garbage_tx,
+        );
+
+        assert_eq!(shared.take_discard(), crate::params::DISCARD_TAKE_QUEUE);
+        assert_eq!(shared.state(), RecorderState::Idle);
+        // The undelivered buffer went to the garbage queue (and was not lost).
+        assert!(garbage_rx.pop().is_ok());
+        assert!(garbage_rx.pop().is_err());
     }
 
     #[test]

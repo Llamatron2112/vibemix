@@ -66,6 +66,7 @@ pub(super) fn plugin_list_json<F: Fn(usize, usize) -> f32>(
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 pub(super) fn build_state_json(
     model: &MixerModel,
     params: &SharedParams,
@@ -73,6 +74,9 @@ pub(super) fn build_state_json(
     sample_rate: u32,
     xruns: u64,
     dsp_load: (f32, f32),
+    midi_dropped: u64,
+    midi_oversize: u64,
+    midi_out_errors: u64,
 ) -> String {
     let strips: Vec<serde_json::Value> = model
         .strips
@@ -147,6 +151,9 @@ pub(super) fn build_state_json(
         "window": window,
         "sample_rate": sample_rate,
         "xruns": xruns,
+        "midi_dropped": midi_dropped,
+        "midi_oversize": midi_oversize,
+        "midi_out_errors": midi_out_errors,
         "dsp_load": dsp_load.0,
         "dsp_peak": dsp_load.1,
         "beats_per_bar": model.beats_per_bar,

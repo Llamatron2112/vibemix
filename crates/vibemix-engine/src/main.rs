@@ -138,6 +138,9 @@ fn main() -> Result<()> {
     }
 
     if let Some(path) = args.ui_host.as_deref() {
+        // A plugin UI misbehaving (busy rendering, spinning) must not steal
+        // CPU from the audio thread; the same nicing used for smoke tests.
+        smoke::lower_priority();
         let code = match vibemix_lv2::ui_server::run_ui_host(path) {
             Ok(()) => 0,
             Err(error) => {

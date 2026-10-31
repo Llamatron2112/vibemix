@@ -298,6 +298,12 @@ impl Controller {
             crate::params::DISCARD_OVERFLOW => {
                 tracing::warn!("recorder buffer overflow; take discarded")
             }
+            crate::params::DISCARD_TAKE_QUEUE => {
+                tracing::warn!("finished takes arrived faster than they could be processed; one take was discarded");
+                self.recorder_status.message =
+                    "loop capture dropped: processing could not keep up".to_string();
+                self.recorder_dirty = true;
+            }
             _ => {}
         }
 
