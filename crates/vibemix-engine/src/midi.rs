@@ -369,7 +369,12 @@ impl MasterClock {
         }
     }
 
-    /// Returns the beat position and frame count at the start of the block.
+    /// Returns the exact beat position, the pulse-aligned beat position and
+    /// the frame count at the start of the block.
+    ///
+    /// Bar detection (the recorder and quantized loop starts) must start from
+    /// `pulse_beats`, because clock events advance it by exactly `1/24`.
+    /// `exact_beats` includes the fractional phase and is for plugin time.
     /// A stop resets the position to zero, so the next play always sends
     /// `START`.
     pub fn process(
@@ -379,7 +384,7 @@ impl MasterClock {
         playing: bool,
         bpm_milli: u32,
         out: &mut MidiBlock,
-    ) -> (f64, u64) {
+    ) -> (f64, f64, u64) {
         self.bpm_milli = bpm_milli.clamp(20_000, 400_000);
         if playing != self.playing {
             if playing {
@@ -394,14 +399,15 @@ impl MasterClock {
                 self.pulses = 0;
                 self.phase = 0;
                 self.frames_since_start = 0;
-                return (0.0, 0);
+                return (0.0, 0.0, 0);
             }
         }
         if !self.playing {
-            return (0.0, 0);
+            return (0.0, 0.0, 0);
         }
 
         let beats_before = self.beats_at(sample_rate);
+        let pulse_beats = self.pulses as f64 / 24.0;
         let frames_before = self.frames_since_start;
         let den = 2500u64 * sample_rate as u64;
         if den > 0 {
@@ -416,7 +422,7 @@ impl MasterClock {
             }
         }
         self.frames_since_start += frames as u64;
-        (beats_before, frames_before)
+        (beats_before, pulse_beats, frames_before)
     }
 }
 
@@ -447,25 +453,34 @@ mod tests {
         let mut out = MidiBlock::default();
 
         // Play from zero: START at frame 0, then no pulse at frame 0.
-        let (beats, frames) = master.process(0, sample_rate, true, 120_000, &mut out);
+        let (beats, pulse_beats, frames) = master.process(0, sample_rate, true, 120_000, &mut out);
         assert_eq!(beats, 0.0);
+        assert_eq!(pulse_beats, 0.0);
         assert_eq!(frames, 0);
         assert_eq!(out.as_slice()[0].as_slice(), &[START]);
 
         // One second at 120 BPM is 2 beats = 48 pulses, one every 1000 frames.
         out.clear();
-        let (beats, frames) = master.process(48_000, sample_rate, true, 120_000, &mut out);
+        let (beats, pulse_beats, frames) =
+            master.process(48_000, sample_rate, true, 120_000, &mut out);
         assert_eq!(beats, 0.0);
+        assert_eq!(pulse_beats, 0.0);
         assert_eq!(frames, 0);
         assert_eq!(out.len(), 48);
         assert_eq!(out.get(0).time, 999);
         assert_eq!(out.get(47).time, 47_999);
         assert!((master.beats_at(sample_rate) - 2.0).abs() < 1.0e-9);
 
+        // The next block starts at the pulse-aligned beat 2.0, not a fraction.
+        out.clear();
+        let (_, pulse_beats, _) = master.process(0, sample_rate, true, 120_000, &mut out);
+        assert_eq!(pulse_beats, 2.0);
+
         // Stop resets the position and emits STOP.
         out.clear();
-        let (beats, frames) = master.process(0, sample_rate, false, 120_000, &mut out);
+        let (beats, pulse_beats, frames) = master.process(0, sample_rate, false, 120_000, &mut out);
         assert_eq!(beats, 0.0);
+        assert_eq!(pulse_beats, 0.0);
         assert_eq!(frames, 0);
         assert_eq!(out.as_slice()[0].as_slice(), &[STOP]);
         assert_eq!(master.beats_at(sample_rate), 0.0);

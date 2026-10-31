@@ -1380,14 +1380,16 @@ impl ProcessHandler for MixerGraph {
                 self.master.reset();
                 self.master_active = true;
             }
-            let (beats, frames_at_start) = self.master.process(
+            let (exact_beats, pulse_beats, frames_at_start) = self.master.process(
                 frames,
                 self.sample_rate as u32,
                 self.params.clock_playing(),
                 self.params.clock_bpm_milli(),
                 &mut self.master_midi,
             );
-            beats_before = beats;
+            // Recorder/loop bar detection needs pulse-aligned beats; plugin
+            // time uses the exact position including the phase.
+            beats_before = pulse_beats;
             playing = self.master.is_playing();
             for index in 0..self.master_midi.len() {
                 let event = self.master_midi.get(index);
@@ -1397,12 +1399,12 @@ impl ProcessHandler for MixerGraph {
             self.midi.sort_by_time();
             self.position =
                 self.master
-                    .position(beats_before, frames_at_start, beats_per_bar, playing);
+                    .position(exact_beats, frames_at_start, beats_per_bar, playing);
             self.shared_clock.publish_state(
                 true,
                 playing,
                 self.master.bpm(),
-                beats_before,
+                exact_beats,
                 frames_at_start,
                 0.0,
                 0,

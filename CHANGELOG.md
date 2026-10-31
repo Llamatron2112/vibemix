@@ -8,6 +8,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Arming the recorder while the internal master clock is already running**
+  now starts the take on the next bar. Bar detection uses pulse-aligned beats,
+  separate from the exact plugin time, so the fractional phase between clock
+  pulses no longer hides the boundary.
 - **MIDI sync settings now survive save/reload.** The GUI state snapshot was
   dropping `midi_sync`, so “Plugins follow transport” always read unchecked and
   did not mark the session dirty; it is now passed through. Saved MIDI peers
