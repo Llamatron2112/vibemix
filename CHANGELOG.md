@@ -8,6 +8,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **MIDI sync settings now survive save/reload.** The GUI state snapshot was
+  dropping `midi_sync`, so “Plugins follow transport” always read unchecked and
+  did not mark the session dirty; it is now passed through. Saved MIDI peers
+  whose JACK port is temporarily missing are also kept in the session instead
+  of being erased by the next save.
 - **Zooming the loop editor no longer drops back to the whole-loop envelope.**
   The editor keeps the last window's samples and envelope, remaps them into the
   new view, and only requests a new resolution after the gesture settles.

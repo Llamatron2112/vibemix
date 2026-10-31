@@ -2457,8 +2457,19 @@ impl JackEngine {
     /// Records the external JACK ports currently feeding each strip input and
     /// each bus output into the model, so a session save can restore them.
     pub fn capture_connections(&self, model: &mut MixerModel) {
-        model.midi_connections = Some(self.midi_port.get_connections());
-        model.midi_out_connections = Some(self.midi_out_port.get_connections());
+        let exists = |name: &str| self.active.as_client().port_by_name(name).is_some();
+        let saved_in = model.midi_connections.take();
+        model.midi_connections = Some(merge_missing_connections(
+            self.midi_port.get_connections(),
+            saved_in.as_deref(),
+            &exists,
+        ));
+        let saved_out = model.midi_out_connections.take();
+        model.midi_out_connections = Some(merge_missing_connections(
+            self.midi_out_port.get_connections(),
+            saved_out.as_deref(),
+            &exists,
+        ));
 
         for strip in &mut model.strips {
             let index = strip.id.0 as usize;
@@ -3305,6 +3316,25 @@ fn rename_port(client: *mut jack::jack_sys::jack_client_t, port: &mut Port<Unown
     }
 }
 
+/// Keep saved MIDI peers whose JACK port is currently absent, so a device that
+/// enumerates late is not dropped from the session by the next save. A peer
+/// that exists but is disconnected is intentionally omitted.
+fn merge_missing_connections(
+    current: Vec<String>,
+    saved: Option<&[String]>,
+    exists: &dyn Fn(&str) -> bool,
+) -> Vec<String> {
+    let mut out = current;
+    if let Some(saved) = saved {
+        for name in saved {
+            if !out.iter().any(|entry| entry == name) && !exists(name) {
+                out.push(name.clone());
+            }
+        }
+    }
+    out
+}
+
 fn restore_input(
     client: &Client,
     port: &Port<Unowned>,
@@ -3471,6 +3501,24 @@ mod tests {
         assert_eq!(port_slug("drums:kit"), "drums_kit");
         assert_eq!(port_slug("a   b"), "a_b");
         assert_eq!(port_slug("___"), "");
+    }
+
+    #[test]
+    fn saved_midi_peers_survive_while_missing() {
+        let saved = vec![
+            "present-disconnected".to_string(),
+            "missing-device".to_string(),
+        ];
+        let current = vec!["connected".to_string()];
+        let merged = merge_missing_connections(current, Some(&saved), &|name| {
+            name == "present-disconnected"
+        });
+        assert_eq!(merged, vec!["connected", "missing-device"]);
+
+        // Once the missing peer exists, a normal disconnection drops it.
+        let merged =
+            merge_missing_connections(vec!["connected".to_string()], Some(&saved), &|_| true);
+        assert_eq!(merged, vec!["connected"]);
     }
 
     #[test]
