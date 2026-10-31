@@ -1578,29 +1578,36 @@ ApplicationWindow {
                         font.family: "monospace"
                     }
 
-                    Row {
+                    Item {
                         id: loopIndicator
                         visible: root.transportUi().loop_indicator && backend.clock.length > 0
-                        spacing: 0
+                        Layout.preferredWidth: loopCells.implicitWidth
+                        Layout.preferredHeight: 6
+                        Layout.alignment: Qt.AlignVCenter
 
-                        // Cells are loop units. In beats mode the first beat of
-                        // every bar carries a wider gap on its left, so bars read
-                        // as groups; in bars mode each cell is already a bar.
-                        Repeater {
-                            model: root.loopInfo().count
+                        Row {
+                            id: loopCells
+                            spacing: 0
 
-                            Item {
-                                property int gap: root.transportUi().loop_bars
-                                    ? 2
-                                    : ((index > 0 && index % root.loopBeatsPerBar() === 0) ? 6 : 2)
-                                width: 6 + (index === 0 ? 0 : gap)
-                                height: 6
+                            // Cells are loop units. In beats mode the first beat of
+                            // every bar carries a wider gap on its left, so bars read
+                            // as groups; in bars mode each cell is already a bar.
+                            Repeater {
+                                model: root.loopInfo().count
 
-                                Rectangle {
-                                    width: 6
+                                Item {
+                                    property int gap: root.transportUi().loop_bars
+                                        ? 2
+                                        : ((index > 0 && index % root.loopBeatsPerBar() === 0) ? 6 : 2)
+                                    width: 6 + (index === 0 ? 0 : gap)
                                     height: 6
-                                    anchors.right: parent.right
-                                    color: index <= root.loopInfo().index ? root.accentColor : root.borderColor
+
+                                    Rectangle {
+                                        width: 6
+                                        height: 6
+                                        anchors.right: parent.right
+                                        color: index <= root.loopInfo().index ? root.accentColor : root.borderColor
+                                    }
                                 }
                             }
                         }
