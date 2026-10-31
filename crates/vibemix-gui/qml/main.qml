@@ -316,6 +316,12 @@ ApplicationWindow {
         }
     }
     readonly property var portCache: root.parsePorts(backend.ports)
+    readonly property var portIndex: {
+        var map = ({})
+        var ports = root.portCache
+        for (var i = 0; i < ports.length; i++) map[ports[i].name] = ports[i]
+        return map
+    }
     function portList() { return root.portCache }
     function portClients() {
         var ports = root.portList()
@@ -356,9 +362,19 @@ ApplicationWindow {
         }
         return out
     }
+    function portByName(name) {
+        return root.portIndex[name] || null
+    }
     function portConnected(sourceName, sink) {
-        return sink && Array.isArray(sink.connections)
-            && sink.connections.indexOf(sourceName) >= 0
+        if (!sink) return false
+        // Some JACK/PipeWire versions only populate the connection list on the
+        // source side, so check both ends.
+        if (Array.isArray(sink.connections) && sink.connections.indexOf(sourceName) >= 0) {
+            return true
+        }
+        var source = root.portByName(sourceName)
+        return source !== null && Array.isArray(source.connections)
+            && source.connections.indexOf(sink.name) >= 0
     }
     /// Current level (0..1 linear peak) of a vibemix port, from the existing
     /// strip/bus meter taps. External ports have no tap and report 0.
