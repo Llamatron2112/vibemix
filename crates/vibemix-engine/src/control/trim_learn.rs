@@ -20,8 +20,6 @@ const SIGNAL_FLOOR_DB: f32 = -60.0;
 const HYSTERESIS_DB: f32 = 0.25;
 /// How long the signal must stay below the target before boosting.
 const BOOST_HOLD: Duration = Duration::from_millis(200);
-/// Peak-hold release rate: loud material keeps the boost limit conservative.
-const RELEASE_DB_PER_SEC: f32 = 12.0;
 const EPS: f32 = 0.005;
 
 #[derive(Debug, Clone, Copy)]
@@ -37,6 +35,9 @@ pub(super) struct Decision {
 pub(super) struct TrimLearn {
     held_peak_db: f32,
     below_for: Duration,
+    /// One interval is discarded after a trim change so the detector cannot
+    /// re-apply a cut based on a peak measured at the previous gain.
+    settle: bool,
 }
 
 impl Default for TrimLearn {
@@ -44,6 +45,7 @@ impl Default for TrimLearn {
         Self {
             held_peak_db: SIGNAL_FLOOR_DB,
             below_for: Duration::ZERO,
+            settle: false,
         }
     }
 }
@@ -51,6 +53,20 @@ impl Default for TrimLearn {
 impl TrimLearn {
     pub fn reset(&mut self) {
         *self = Self::default();
+    }
+
+    /// True when the next update must be discarded while the trim smoother
+    /// catches up with the new value.
+    pub fn settling(&self) -> bool {
+        self.settle
+    }
+
+    pub fn finish_settle(&mut self) {
+        self.settle = false;
+    }
+
+    pub fn mark_changed(&mut self) {
+        self.settle = true;
     }
 
     /// `peak` is the maximum post-trim linear peak since the previous call and
@@ -65,14 +81,16 @@ impl TrimLearn {
             SIGNAL_FLOOR_DB
         };
 
-        // Slow release, then fold in the newest peak.
-        let release = RELEASE_DB_PER_SEC * dt.as_secs_f32();
-        self.held_peak_db = (self.held_peak_db - release).max(SIGNAL_FLOOR_DB);
+        // Latch the loudest peak seen while learn is enabled. A quiet passage
+        // therefore cannot make the trim climb back up; toggle learn off/on to
+        // start a fresh latch.
         self.held_peak_db = self.held_peak_db.max(peak_db);
 
         if peak_db > TARGET_DB {
             let next = (current_db + (TARGET_DB - peak_db)).clamp(TRIM_MIN_DB, TRIM_MAX_DB);
-            self.below_for = Duration::ZERO;
+            // The pre-cut peak belongs to the old gain. Latch the expected
+            // post-cut level instead of the old peak.
+            self.held_peak_db = (peak_db + (next - current_db)).max(SIGNAL_FLOOR_DB);
             let limit = if next <= TRIM_MIN_DB + 0.01 && peak_db > TARGET_DB + 0.05 {
                 TRIM_LEARN_MIN
             } else {
@@ -190,6 +208,18 @@ mod tests {
     }
 
     #[test]
+    fn cut_latches_against_a_later_quiet_boost() {
+        let mut controller = TrimLearn::default();
+        let cut = update(&mut controller, 6.0, 0.0, 50);
+        let current = cut.trim_db.expect("cut");
+        for _ in 0..10 {
+            assert!(update(&mut controller, -20.0, current, 500)
+                .trim_db
+                .is_none());
+        }
+    }
+
+    #[test]
     fn boost_uses_half_the_headroom() {
         let mut controller = TrimLearn::default();
         let next = update(&mut controller, -20.0, 0.0, 1000)
@@ -224,7 +254,10 @@ mod tests {
         let mut decision = update(&mut controller, TARGET_DB - 0.2, 0.0, 1000);
         assert!(decision.trim_db.is_none());
         assert_eq!(decision.limit, TRIM_LEARN_NONE);
-        decision = update(&mut controller, TARGET_DB - 1.0, 0.0, 1000);
-        assert!(decision.trim_db.is_some());
+        // A near-target peak latches, so a later quiet section does not boost.
+        for _ in 0..3 {
+            decision = update(&mut controller, TARGET_DB - 1.0, 0.0, 1000);
+            assert!(decision.trim_db.is_none());
+        }
     }
 }

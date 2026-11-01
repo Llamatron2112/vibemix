@@ -156,8 +156,10 @@ thread peak-holds the post-trim signal; every 25 ms the control thread cuts
 immediately if the held peak is above −0.1 dBFS, or boosts progressively (half
 the measured headroom, up to 6 dB) when the signal has real level and the held
 peak has enough headroom. A boost never exceeds the point where the held peak
-would hit the target, and the held peak
-releases slowly so a quiet passage cannot immediately undo the safety margin.
+would hit the target. The loudest peak seen while learn is enabled is latched,
+so a quiet passage cannot make the trim climb back up; toggle learn off/on to
+start a fresh latch. One interval is discarded after every trim change so a cut
+cannot be applied twice from a peak measured at the previous gain.
 The final trim is just the normal input-gain value and saves with the session;
 the learn-active state and its limit warning are transient. One undo entry is
 created when learn starts.

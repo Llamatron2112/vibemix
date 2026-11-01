@@ -930,6 +930,13 @@ impl Controller {
             let Some(state) = self.trim_learn.get_mut(index) else {
                 continue;
             };
+            if state.settling() {
+                // Discard the interval that contains the trim ramp, then start
+                // measuring again at the new gain.
+                state.finish_settle();
+                self.meters.take_strip_trim_peak(index);
+                continue;
+            }
             let peak = self.meters.take_strip_trim_peak(index);
             let current = self.params.strip_input_gain(index);
             let decision = state.update(peak, current, dt);
@@ -939,6 +946,8 @@ impl Controller {
                     // Keep the session readable; the engine keeps full precision.
                     strip.input_gain_db = (next * 100.0).round() / 100.0;
                 }
+                state.mark_changed();
+                self.meters.take_strip_trim_peak(index);
                 changed = true;
             }
             if self.params.trim_learn_limit(index) != decision.limit {

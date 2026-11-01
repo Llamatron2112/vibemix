@@ -10,9 +10,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 - **Trim learn.** A strip's trim right-click menu can start a continuous learn
   mode that peak-holds the post-trim signal, cuts immediately above −0.1 dBFS,
-  and boosts gradually only within the measured headroom. Silence never causes
-  a boost, the final trim is saved with the session, and the whole learn
-  session is one undo step.
+  and boosts gradually only within the measured headroom. The loudest peak is
+  latched (toggle learn off/on to relearn), silence never causes a boost, the
+  final trim is saved with the session, and the whole learn session is one undo
+  step.
 - **Automatic delay compensation (PDC) for sends and buses.** Each send now
   receives the extra delay needed for every path into a bus (and into the
   master) to arrive together, on top of its manual `delay_ms` alignment. Dry
