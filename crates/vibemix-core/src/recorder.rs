@@ -147,6 +147,62 @@ pub struct LoopSlot {
     pub playing: bool,
     #[serde(default)]
     pub saved: bool,
+    /// Play once and stop instead of wrapping at the loop end.
+    #[serde(default)]
+    pub one_shot: bool,
+    /// Offer this loop as a timing reference in the export/align editor.
+    #[serde(default)]
+    pub reference: bool,
+    /// Stable hash of the raw sample content, for reference signatures.
+    #[serde(default)]
+    pub raw_hash: u64,
+    /// Persistent, non-destructive export settings.
+    #[serde(default)]
+    pub export: LoopExport,
+}
+
+/// A reference loop captured at alignment time. The signature makes a later
+/// edit/re-render of the reference visible to loops that used it.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoopReference {
+    #[serde(default)]
+    pub id: u32,
+    #[serde(default)]
+    pub raw_hash: u64,
+    #[serde(default)]
+    pub one_shot: bool,
+    #[serde(default)]
+    pub export_offset: i64,
+    #[serde(default)]
+    pub export_start: u64,
+    #[serde(default)]
+    pub export_end: u64,
+}
+
+/// Persistent export settings. `offset` is the circular rotation for loop
+/// material; `start`/`end` select a range for one-shot material.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct LoopExport {
+    #[serde(default)]
+    pub offset: i64,
+    #[serde(default)]
+    pub start: u64,
+    #[serde(default)]
+    pub end: u64,
+    #[serde(default)]
+    pub reference: Option<LoopReference>,
+}
+
+/// FNV-1a over the raw sample bits, used to detect a changed reference loop.
+pub fn content_hash(samples: &[f32]) -> u64 {
+    let mut hash = 0xcbf2_9ce4_8422_2325u64;
+    for sample in samples {
+        for byte in sample.to_bits().to_le_bytes() {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+    }
+    hash
 }
 
 fn default_gain() -> f32 {
@@ -278,6 +334,98 @@ pub enum RecorderAction {
     SnapSeam {
         slot: u32,
     },
+    /// Play the loop once and stop, or wrap normally.
+    SetLoopOneShot {
+        slot: u32,
+        one_shot: bool,
+    },
+    /// Offer this loop as a timing reference.
+    SetLoopReference {
+        slot: u32,
+        reference: bool,
+    },
+    /// Persist non-destructive export settings.
+    SetLoopExport {
+        slot: u32,
+        export: LoopExport,
+    },
+    /// Render a WAV using explicit, WYSIWYG export settings.
+    LoopRender {
+        slot: u32,
+        path: String,
+        bit_depth: u8,
+        #[serde(default)]
+        normalize: bool,
+        #[serde(default)]
+        one_shot: bool,
+        #[serde(default)]
+        offset: i64,
+        #[serde(default)]
+        start: u64,
+        #[serde(default)]
+        end: u64,
+        /// Stored alongside the new file for later align/preview use.
+        #[serde(default)]
+        export: LoopExport,
+    },
+    /// Dry audition of a loop plus a metronome or reference loop.
+    LoopPreview {
+        slot: u32,
+        #[serde(default)]
+        offset: i64,
+        #[serde(default)]
+        one_shot: bool,
+        #[serde(default)]
+        start: u64,
+        #[serde(default)]
+        end: u64,
+        #[serde(default = "default_gain")]
+        gain: f32,
+        #[serde(default)]
+        reference: Option<PreviewReference>,
+        #[serde(default)]
+        metronome: bool,
+        #[serde(default = "default_preview_bpm")]
+        bpm: f32,
+        #[serde(default = "default_preview_beats_per_bar")]
+        beats_per_bar: f32,
+        #[serde(default = "default_preview_subdivision")]
+        subdivision: u32,
+        #[serde(default = "default_click_gain")]
+        click_gain: f32,
+    },
+    LoopPreviewStop,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
+pub struct PreviewReference {
+    pub slot: u32,
+    #[serde(default)]
+    pub offset: i64,
+    #[serde(default)]
+    pub one_shot: bool,
+    #[serde(default)]
+    pub start: u64,
+    #[serde(default)]
+    pub end: u64,
+    #[serde(default = "default_gain")]
+    pub gain: f32,
+}
+
+fn default_preview_bpm() -> f32 {
+    120.0
+}
+
+fn default_preview_beats_per_bar() -> f32 {
+    4.0
+}
+
+fn default_preview_subdivision() -> u32 {
+    1
+}
+
+fn default_click_gain() -> f32 {
+    0.5
 }
 
 /// Peak envelope for the loop editor.
@@ -613,6 +761,25 @@ mod tests {
         assert_eq!(rotate_interleaved(&src, 2, 1), vec![3.0, 4.0, 1.0, 2.0]);
         assert_eq!(rotate_interleaved(&src, 2, -1), vec![3.0, 4.0, 1.0, 2.0]);
         assert_eq!(rotate_interleaved(&src, 2, 3), vec![3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn loop_render_action_parses_from_the_editor_json() {
+        let json = r#"{"action":"loop_render","slot":0,"path":"/tmp/x.wav","bit_depth":32,"normalize":false,"one_shot":true,"offset":100,"start":0,"end":1000,"export":{"offset":100,"start":0,"end":1000,"reference":null}}"#;
+        let action: RecorderAction = serde_json::from_str(json).expect("parse loop_render");
+        match action {
+            RecorderAction::LoopRender {
+                one_shot,
+                offset,
+                start,
+                end,
+                ..
+            } => {
+                assert!(one_shot);
+                assert_eq!((offset, start, end), (100, 0, 1000));
+            }
+            _ => panic!("wrong action"),
+        }
     }
 
     #[test]

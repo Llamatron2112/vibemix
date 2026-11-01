@@ -8,6 +8,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Loop export and alignment.** The loop editor can render a new WAV from
+  exactly what is aligned on screen without changing the loop used by the
+  mixer. A one-shot loop plays once and exports a selected start/end range.
+  Align mode stops the transport and auditions the loop dry with a
+  sample-accurate click or another loop marked as a timing reference; the
+  reference id, content hash and export offset are stored so edits to the
+  reference are flagged. The grid subdivides adaptively down to 1/16 with
+  optional snapping, and reference/one-shot state is saved with the session.
+  The export offset is stored separately from the live playback nudge, and the
+  original loop is never replaced.
 - **Loops and recording now live in the mixer.** Strip cards carry a record
   source flag (off → post-fader → pre-fader → input) and bus cards an output
   flag; clicking any other part of a card drags it to reorder. A loops pane

@@ -348,6 +348,8 @@ pub struct LoopPlayback {
     pub mute: bool,
     /// Bus this loop is mixed into (0 = master).
     pub output_bus: usize,
+    /// Play once and stop instead of wrapping.
+    pub one_shot: bool,
     /// Fading out before it stops, so a stop does not click.
     pub stopping: bool,
     /// Smoothed output level (follows `gain`, `mute` and `stopping`).
@@ -367,6 +369,7 @@ impl LoopPlayback {
             gain: 1.0,
             mute: false,
             output_bus: 0,
+            one_shot: false,
             stopping: false,
             level: 1.0,
         }
@@ -429,6 +432,11 @@ impl LoopPlayback {
         };
         if level_start == 0.0 && level_end == 0.0 {
             self.pos = (self.pos + count) % self.frames;
+            if self.one_shot {
+                self.playing = false;
+                self.pending = false;
+                self.pos = 0;
+            }
         } else {
             let step = (level_end - level_start) / count.max(1) as f32;
             for (n, i) in (from..frames).enumerate() {
@@ -442,6 +450,13 @@ impl LoopPlayback {
                 out_r[i] += self.buffer[index + 1] * level;
                 self.pos += 1;
                 if self.pos >= self.frames {
+                    if self.one_shot {
+                        self.playing = false;
+                        self.pending = false;
+                        self.stopping = false;
+                        self.pos = 0;
+                        break;
+                    }
                     self.pos = 0;
                 }
             }
@@ -495,6 +510,18 @@ mod tests {
         r.fill(0.0);
         playback.mix(&mut l, &mut r, 0, 4, 1.0);
         assert_eq!(l, [1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(playback.pos, 0);
+    }
+
+    #[test]
+    fn one_shot_plays_once_then_stops() {
+        let mut playback = loop_with(&[1.0, 2.0, 3.0, 4.0]);
+        playback.one_shot = true;
+        let (mut l, mut r) = ([0.0f32; 8], [0.0f32; 8]);
+        playback.mix(&mut l, &mut r, 0, 8, 1.0);
+        assert_eq!(&l[..4], &[1.0, 2.0, 3.0, 4.0]);
+        assert_eq!(&l[4..], &[0.0, 0.0, 0.0, 0.0]);
+        assert!(!playback.playing);
         assert_eq!(playback.pos, 0);
     }
 

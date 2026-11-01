@@ -434,6 +434,7 @@ pub enum EngineCommand {
         frames: usize,
         offset: i64,
         bus: usize,
+        one_shot: bool,
     },
     /// Change the playback rotation in place, keeping the loop running.
     LoopOffset {
@@ -444,6 +445,12 @@ pub enum EngineCommand {
         slot: usize,
         bus: usize,
     },
+    LoopOneShot {
+        slot: usize,
+        one_shot: bool,
+    },
+    LoopPreview(PreviewSpec),
+    LoopPreviewStop,
     ClearLoop {
         slot: usize,
     },
@@ -484,6 +491,63 @@ struct BusPorts {
 struct BusReturnPorts {
     in_l: Port<AudioIn>,
     in_r: Port<AudioIn>,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewReference {
+    pub slot: usize,
+    pub offset: i64,
+    pub one_shot: bool,
+    pub start: u64,
+    pub end: u64,
+    pub gain: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct PreviewSpec {
+    pub slot: usize,
+    pub offset: i64,
+    pub one_shot: bool,
+    pub start: u64,
+    pub end: u64,
+    pub gain: f32,
+    pub reference: Option<PreviewReference>,
+    pub metronome: bool,
+    pub bpm: f32,
+    pub beats_per_bar: f32,
+    pub subdivision: u32,
+    pub click_gain: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PreviewRuntime {
+    spec: PreviewSpec,
+    new_pos: usize,
+    new_done: bool,
+    ref_pos: usize,
+    ref_done: bool,
+    frames_to_click: f32,
+    click_index: u64,
+    click_env: f32,
+    click_phase: f32,
+    click_freq: f32,
+}
+
+impl PreviewRuntime {
+    fn new(spec: PreviewSpec) -> Self {
+        Self {
+            spec,
+            new_pos: 0,
+            new_done: false,
+            ref_pos: 0,
+            ref_done: false,
+            frames_to_click: 0.0,
+            click_index: 0,
+            click_env: 0.0,
+            click_phase: 0.0,
+            click_freq: 1000.0,
+        }
+    }
 }
 
 struct MixerGraph {
@@ -613,6 +677,9 @@ struct MixerGraph {
     /// Previous block's transport state, used to relaunch loops when the
     /// transport starts or restarts.
     transport_playing: bool,
+    /// Dry editor audition: loop plus reference/metronome, mixed after the
+    /// master chain so bus PDC cannot shift their relative timing.
+    preview: Option<PreviewRuntime>,
 }
 
 impl MixerGraph {
@@ -845,6 +912,7 @@ impl MixerGraph {
                     frames,
                     offset,
                     bus,
+                    one_shot,
                 } => {
                     if slot < self.loop_slots.len() {
                         if let Some(old) = self.loop_slots[slot].take() {
@@ -853,6 +921,7 @@ impl MixerGraph {
                         let mut playback = LoopPlayback::new(buffer, frames);
                         playback.set_offset(offset);
                         playback.output_bus = bus.min(self.bus_chains.len().saturating_sub(1));
+                        playback.one_shot = one_shot;
                         self.loop_slots[slot] = Some(playback);
                         if let Some(line) = self.loop_delays.get_mut(slot) {
                             line.invalidate();
@@ -865,6 +934,18 @@ impl MixerGraph {
                     if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
                     {
                         loop_slot.set_offset(offset);
+                    }
+                }
+                EngineCommand::LoopPreview(spec) => {
+                    self.preview = Some(PreviewRuntime::new(spec));
+                }
+                EngineCommand::LoopPreviewStop => {
+                    self.preview = None;
+                }
+                EngineCommand::LoopOneShot { slot, one_shot } => {
+                    if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
+                    {
+                        loop_slot.one_shot = one_shot;
                     }
                 }
                 EngineCommand::LoopBus { slot, bus } => {
@@ -1486,6 +1567,145 @@ impl MixerGraph {
         }
     }
 
+    /// Mix the dry editor audition (loop, optional reference and click)
+    /// straight into the master output. Running after the master chain keeps
+    /// the relative timing exact and free of bus PDC.
+    fn mix_preview(&mut self, frames: usize) {
+        let Self {
+            preview,
+            loop_slots,
+            loop_scratch,
+            bus_out,
+            sample_rate,
+            ..
+        } = self;
+        let Some(preview) = preview.as_mut() else {
+            return;
+        };
+        let [left, right] = loop_scratch;
+        left[..frames].fill(0.0);
+        right[..frames].fill(0.0);
+        let spec = preview.spec;
+
+        if !preview.new_done {
+            if let Some(Some(slot)) = loop_slots.get(spec.slot) {
+                let n = slot.frames;
+                if n > 0 {
+                    let (start, length) = if spec.one_shot {
+                        let start = (spec.start as usize).min(n - 1);
+                        let end = if spec.end == 0 || spec.end as usize > n {
+                            n
+                        } else {
+                            spec.end as usize
+                        };
+                        let end = end.max(start + 1);
+                        (start, end - start)
+                    } else {
+                        (0, n)
+                    };
+                    let base = (spec.offset.rem_euclid(n as i64) as usize + start) % n;
+                    for i in 0..frames {
+                        let read = (base + preview.new_pos) % n;
+                        left[i] += slot.buffer[read * 2] * spec.gain;
+                        right[i] += slot.buffer[read * 2 + 1] * spec.gain;
+                        preview.new_pos += 1;
+                        if preview.new_pos >= length {
+                            if spec.one_shot {
+                                preview.new_done = true;
+                                preview.new_pos = 0;
+                                break;
+                            }
+                            preview.new_pos = 0;
+                        }
+                    }
+                } else {
+                    preview.new_done = true;
+                }
+            } else {
+                preview.new_done = true;
+            }
+        }
+
+        if let Some(reference) = spec.reference {
+            if !preview.ref_done {
+                if let Some(Some(slot)) = loop_slots.get(reference.slot) {
+                    let n = slot.frames;
+                    if n > 0 {
+                        let (start, length) = if reference.one_shot {
+                            let start = (reference.start as usize).min(n - 1);
+                            let end = if reference.end == 0 || reference.end as usize > n {
+                                n
+                            } else {
+                                reference.end as usize
+                            };
+                            let end = end.max(start + 1);
+                            (start, end - start)
+                        } else {
+                            (0, n)
+                        };
+                        let base = (reference.offset.rem_euclid(n as i64) as usize + start) % n;
+                        for i in 0..frames {
+                            let read = (base + preview.ref_pos) % n;
+                            left[i] += slot.buffer[read * 2] * reference.gain;
+                            right[i] += slot.buffer[read * 2 + 1] * reference.gain;
+                            preview.ref_pos += 1;
+                            if preview.ref_pos >= length {
+                                if reference.one_shot {
+                                    preview.ref_done = true;
+                                    preview.ref_pos = 0;
+                                    break;
+                                }
+                                preview.ref_pos = 0;
+                            }
+                        }
+                    } else {
+                        preview.ref_done = true;
+                    }
+                } else {
+                    preview.ref_done = true;
+                }
+            }
+        } else {
+            preview.ref_done = true;
+        }
+
+        if spec.metronome {
+            let sub = spec.subdivision.clamp(1, 16) as f64;
+            let bar = (spec.beats_per_bar.max(1.0) as f64 * sub).round().max(1.0) as u64;
+            let bpm = spec.bpm.clamp(20.0, 400.0) as f64;
+            let step = ((*sample_rate) as f64 * 60.0 / (bpm * sub)) as f32;
+            let tau = std::f32::consts::TAU;
+            let sr = *sample_rate;
+            for i in 0..frames {
+                if preview.frames_to_click <= 0.0 {
+                    let index = preview.click_index;
+                    preview.click_freq = if index % bar == 0 {
+                        1600.0
+                    } else if index % sub as u64 == 0 {
+                        1100.0
+                    } else {
+                        800.0
+                    };
+                    preview.click_env = 1.0;
+                    preview.click_phase = 0.0;
+                    preview.click_index = preview.click_index.wrapping_add(1);
+                    preview.frames_to_click += step;
+                }
+                if preview.click_env > 1.0e-4 {
+                    let click = preview.click_phase.sin() * preview.click_env * spec.click_gain;
+                    left[i] += click;
+                    right[i] += click;
+                    preview.click_env *= 0.9993;
+                    preview.click_phase += tau * preview.click_freq / sr;
+                }
+                preview.frames_to_click -= 1.0;
+            }
+        }
+
+        dsp::add_scaled(&mut bus_out[0][0][..frames], &left[..frames], 1.0);
+        dsp::add_scaled(&mut bus_out[0][1][..frames], &right[..frames], 1.0);
+    }
+
     /// Mix launcher playback into the master input. Quantized slots start on
     /// the next bar boundary in this block; without a running clock they start
     /// immediately.
@@ -2007,6 +2227,8 @@ impl ProcessHandler for MixerGraph {
             &mut self.loop_garbage,
         );
 
+        self.mix_preview(frames);
+
         if raw_frames > frames {
             // Period beyond the fixed buffer capacity: silence the tail of the
             // bus outputs rather than emit stale samples.
@@ -2320,6 +2542,7 @@ impl JackEngine {
             slave_restart_pending: false,
             transport_midi: MidiBlock::default(),
             transport_playing: false,
+            preview: None,
             clock: Clock::new(sample_rate as f32, 4.0),
             shared_clock: Arc::clone(&shared_clock),
             position: vibemix_lv2::TimePosition::default(),
@@ -2449,6 +2672,7 @@ impl JackEngine {
         frames: usize,
         offset: i64,
         bus: usize,
+        one_shot: bool,
     ) -> Result<()> {
         self.commands
             .push(EngineCommand::SetLoop {
@@ -2457,7 +2681,26 @@ impl JackEngine {
                 frames,
                 offset,
                 bus,
+                one_shot,
             })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_one_shot(&mut self, slot: usize, one_shot: bool) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopOneShot { slot, one_shot })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_preview(&mut self, spec: PreviewSpec) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopPreview(spec))
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_preview_stop(&mut self) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopPreviewStop)
             .map_err(|_| anyhow!("engine command queue full"))
     }
 

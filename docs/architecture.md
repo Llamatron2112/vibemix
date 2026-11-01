@@ -702,6 +702,13 @@ exists.
   metadata, output bus and paths. Saved loops are read and analysed on the I/O
   worker; a pending slot keeps its saved metadata visible until the file is
   installed. Removing a loop's output bus retargets it to master.
+- The editor renders a new WAV from the current visual rotation without
+  changing the live loop; one-shot loops export a selected start/end range and
+  play once in the mixer. Align mode stops the transport and auditions the loop
+  dry with a sample-accurate click or another loop marked as a reference. The
+  reference's id, raw-content hash and export offset are stored with the
+  dependent loop's export settings, and a changed/missing reference is flagged.
+  The grid subdivides adaptively with zoom (up to 1/16) and can snap.
 - Loop cards start/stop playback on left click and expose edit, save, mute and
   output-bus selection on right click; delete asks for confirmation. Each card
   shows a whole-loop envelope, playback progress or queued state, a compact

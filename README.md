@@ -64,6 +64,11 @@ small OSC control protocol.
   strip/bus sidechain panel.
 - **Meters**: click a meter to cycle its tap (strip IN/GAIN/OUT; bus
   IN/SEND/RET/OUT).
+- **Loop export**: the editor's Save is WYSIWYG — it renders the current
+  visual rotation (or the selected one-shot range) to a new WAV and leaves the
+  mixer loop untouched. Align mode stops the transport and plays the loop dry
+  with a sample-accurate click or another loop marked as a timing reference;
+  one-shot loops play once. The grid subdivides with zoom and can snap.
 - **Loop recorder**: click the record flag on strip cards to cycle its source
   (post-fader → pre-fader → input → off), or on a bus card to record that bus
   output; master cannot be recorded. Changes are refused while armed or

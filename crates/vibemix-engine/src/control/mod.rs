@@ -19,8 +19,8 @@ use vibemix_core::model::{
 };
 use vibemix_core::params::{clamp_trim_db, linear_to_db, Gain, Pan};
 use vibemix_core::recorder::{
-    rotate_interleaved, snap_seam, LoopSlot, RecorderAction, RecorderSettings, RecorderSource,
-    RecorderStatus, Transient,
+    snap_seam, LoopSlot, RecorderAction, RecorderSettings, RecorderSource, RecorderStatus,
+    Transient,
 };
 use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 

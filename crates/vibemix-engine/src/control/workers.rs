@@ -10,10 +10,10 @@ use std::thread;
 
 use vibemix_core::model::MixerModel;
 use vibemix_core::recorder::{
-    detect_transients_with_sensitivity, peaks, LoopSlot, LoopWaveform, Transient,
+    detect_transients_with_sensitivity, peaks, LoopExport, LoopSlot, LoopWaveform, Transient,
 };
 
-use super::loops::write_loop_wav;
+use super::loops::write_loop_range;
 
 /// Requested view for the loop editor. Kept so a finished analysis can refresh
 /// the markers without waiting for another GUI gesture.
@@ -74,6 +74,11 @@ pub(super) struct SaveLoopJob {
     pub bit_depth: u8,
     pub nudge: i64,
     pub normalize: bool,
+    pub one_shot: bool,
+    pub start: u64,
+    pub end: u64,
+    pub export: LoopExport,
+    pub update_path: bool,
 }
 
 pub(super) struct SaveSessionJob {
@@ -136,8 +141,9 @@ pub(super) struct LoopSaved {
     pub generation: u64,
     pub path: PathBuf,
     pub bit_depth: u8,
-    pub nudge: i64,
     pub normalize: bool,
+    pub export: LoopExport,
+    pub update_path: bool,
     pub result: Result<(), String>,
 }
 
@@ -360,13 +366,16 @@ fn run_waveform(job: WaveformJob) -> WorkerOutput {
 }
 
 fn run_save_loop(job: SaveLoopJob) -> LoopSaved {
-    let result = write_loop_wav(
+    let result = write_loop_range(
         &job.path,
         &job.raw,
         job.frames,
         job.sample_rate,
         job.bit_depth,
         job.nudge,
+        job.start,
+        job.end,
+        job.one_shot,
         job.normalize,
     )
     .map_err(|error| error.to_string());
@@ -375,8 +384,9 @@ fn run_save_loop(job: SaveLoopJob) -> LoopSaved {
         generation: job.generation,
         path: job.path,
         bit_depth: job.bit_depth,
-        nudge: job.nudge,
         normalize: job.normalize,
+        export: job.export,
+        update_path: job.update_path,
         result,
     }
 }
@@ -560,6 +570,11 @@ mod tests {
             bit_depth: 24,
             nudge: 0,
             normalize: false,
+            one_shot: false,
+            start: 0,
+            end: frames as u64,
+            export: LoopExport::default(),
+            update_path: true,
         });
         result.result.expect("save");
         let (read, read_frames) = super::super::loops::read_loop_wav(&path, 48_000).unwrap();

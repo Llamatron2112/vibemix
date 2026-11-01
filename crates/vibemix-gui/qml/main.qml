@@ -212,6 +212,11 @@ ApplicationWindow {
     property int loopSaveTargetId: -1
     property int loopSaveDepth: 24
     property bool loopSaveNormalize: false
+    property bool loopSaveOneShot: false
+    property int loopSaveOffset: 0
+    property int loopSaveStart: 0
+    property int loopSaveEnd: 0
+    property var loopSaveReference: null
     property var meterSource: ({})
     property var busMeterSource: ({})
     property bool sliderHovered: false
@@ -1023,9 +1028,28 @@ ApplicationWindow {
     }
     function saveLoop(slot, bitDepth, normalize) {
         if (!slot) return
+        var oneShot = slot.one_shot === true
+        var offset = slot.nudge_samples
+        var start = (slot.export && slot.export.start !== undefined) ? slot.export.start : 0
+        var end = (slot.export && slot.export.end) ? slot.export.end : slot.frames
+        if (loopEditor.visible && loopEditor.slotId === slot.id) {
+            offset = loopEditor.alignMode
+                ? loopEditor.exportOffset : Math.round(loopEditor.displayTotal())
+            if (oneShot) {
+                start = Math.round(loopEditor.selectionStart)
+                end = Math.round(loopEditor.selectionEnd)
+            }
+        }
         root.loopSaveTargetId = slot.id
         root.loopSaveDepth = bitDepth
         root.loopSaveNormalize = normalize
+        root.loopSaveOneShot = oneShot
+        root.loopSaveOffset = offset
+        root.loopSaveStart = start
+        root.loopSaveEnd = end
+        root.loopSaveReference = loopEditor.visible && loopEditor.slotId === slot.id
+            ? loopEditor.referenceSignature()
+            : (slot.export ? slot.export.reference : null)
         var folder = root.loopFolder()
         var base = String(slot.name || "loop").replace(/[^A-Za-z0-9_-]+/g, "-")
         if (base.length === 0) base = "loop"
@@ -1037,12 +1061,23 @@ ApplicationWindow {
         var slot = root.loopById(root.loopSaveTargetId)
         if (!slot) return
         var path = root.localPath(url)
+        var exportSettings = {
+            offset: root.loopSaveOffset,
+            start: root.loopSaveStart,
+            end: root.loopSaveEnd,
+            reference: root.loopSaveReference
+        }
         root.sendRecorderAction({
-            action: "loop_save",
+            action: "loop_render",
             slot: slot.id,
             path: path,
             bit_depth: root.loopSaveDepth,
-            normalize: root.loopSaveNormalize
+            normalize: root.loopSaveNormalize,
+            one_shot: root.loopSaveOneShot,
+            offset: root.loopSaveOffset,
+            start: root.loopSaveStart,
+            end: root.loopSaveEnd,
+            export: exportSettings
         })
     }
     function renameLoop(slot, name) {
@@ -4983,6 +5018,10 @@ ApplicationWindow {
         modality: Qt.NonModal
         flags: Qt.Window
         transientParent: root
+        onClosing: {
+            if (loopEditor.alignMode) loopEditor.storeExportSettings()
+            loopEditor.stopPreview()
+        }
         visible: false
         width: 560
         height: 720
@@ -6143,6 +6182,26 @@ ApplicationWindow {
                                         text: loopData.mute ? "Unmute" : "Mute"
                                         onTriggered: root.toggleLoopMute(loopData)
                                     }
+                                    MenuItem {
+                                        text: "One-shot"
+                                        checkable: true
+                                        checked: loopData.one_shot === true
+                                        onTriggered: root.sendRecorderAction({
+                                            action: "set_loop_one_shot",
+                                            slot: loopData.id,
+                                            one_shot: !(loopData.one_shot === true)
+                                        })
+                                    }
+                                    MenuItem {
+                                        text: "Timing reference"
+                                        checkable: true
+                                        checked: loopData.reference === true
+                                        onTriggered: root.sendRecorderAction({
+                                            action: "set_loop_reference",
+                                            slot: loopData.id,
+                                            reference: !(loopData.reference === true)
+                                        })
+                                    }
                                     MenuSeparator { }
                                     Menu {
                                         id: outputBusMenu
@@ -6194,6 +6253,20 @@ ApplicationWindow {
                                             font.pixelSize: 10
                                             font.bold: true
                                             elide: Text.ElideRight
+                                        }
+                                        Label {
+                                            visible: loopData.one_shot === true
+                                            text: "1×"
+                                            color: root.accentColor
+                                            font.pixelSize: 9
+                                            font.bold: true
+                                        }
+                                        Label {
+                                            visible: loopData.reference === true
+                                            text: "REF"
+                                            color: "#f9a825"
+                                            font.pixelSize: 8
+                                            font.bold: true
                                         }
                                     }
 
@@ -6290,6 +6363,14 @@ ApplicationWindow {
     Window {
         id: loopEditor
         property int slotId: -1
+        property real selectionStart: 0
+        property real selectionEnd: 0
+        property bool alignMode: false
+        property int referenceId: -1
+        property bool previewPlaying: false
+        property int gridDiv: 0
+        property bool snapGrid: false
+        property int exportOffset: 0
         property var editorPeaks: []
         property var basePeaks: []
         property var waveSamples: []
@@ -6328,10 +6409,204 @@ ApplicationWindow {
             if (!slot) return 0
             return slot.base_nudge + slot.transient_nudge + displayManual()
         }
+        function exportOffsetMod() {
+            var slot = currentSlot()
+            var frames = slot && slot.frames ? slot.frames : 1
+            return ((exportOffset % frames) + frames) % frames
+        }
+        function exportOffsetText() {
+            var slot = currentSlot()
+            var ms = slot && slot.sample_rate > 0 ? exportOffset * 1000 / slot.sample_rate : 0
+            return exportOffset + " smp (" + (ms >= 0 ? "+" : "") + ms.toFixed(2) + " ms)"
+        }
+        function setExportOffset(value) {
+            exportOffset = Math.round(value)
+            requestWaveform(null)
+            editorWave.requestPaint()
+            ruler.requestPaint()
+        }
         function displayTotalMod() {
             var slot = currentSlot()
             var frames = slot && slot.frames ? slot.frames : 1
             return ((displayTotal() % frames) + frames) % frames
+        }
+        function isOneShot() {
+            var slot = currentSlot()
+            return slot ? slot.one_shot === true : false
+        }
+        function selectStartAtCursor() {
+            var slot = currentSlot()
+            if (!slot) return
+            var frame = cursorFrame >= 0 ? cursorFrame : viewStart
+            selectionStart = Math.max(0, Math.min(selectionEnd - 1, Math.round(frame)))
+            editorWave.requestPaint()
+        }
+        function selectEndAtCursor() {
+            var slot = currentSlot()
+            if (!slot) return
+            var frame = cursorFrame >= 0 ? cursorFrame : viewEnd
+            selectionEnd = Math.max(selectionStart + 1, Math.min(slot.frames, Math.round(frame)))
+            editorWave.requestPaint()
+        }
+        function toggleOneShot() {
+            var slot = currentSlot()
+            if (!slot) return
+            root.sendRecorderAction({
+                action: "set_loop_one_shot",
+                slot: slot.id,
+                one_shot: !(slot.one_shot === true)
+            })
+            if (!(slot.one_shot === true)) {
+                selectionStart = 0
+                selectionEnd = slot.frames
+            }
+            editorWave.requestPaint()
+        }
+        function toggleReference() {
+            var slot = currentSlot()
+            if (!slot) return
+            root.sendRecorderAction({
+                action: "set_loop_reference",
+                slot: slot.id,
+                reference: !(slot.reference === true)
+            })
+        }
+        function referenceLoops() {
+            var loops = root.loopList()
+            var out = []
+            for (var i = 0; i < loops.length; i++) {
+                if (loops[i].id !== slotId && loops[i].reference === true) out.push(loops[i])
+            }
+            return out
+        }
+        function referenceChoices() {
+            var out = [{ id: -1, name: "metronome" }]
+            var refs = referenceLoops()
+            for (var i = 0; i < refs.length; i++) out.push(refs[i])
+            return out
+        }
+        function referenceLabel() {
+            if (referenceId < 0) return "metronome"
+            var ref = root.loopById(referenceId)
+            return ref ? ref.name : "missing reference"
+        }
+        function referenceStale() {
+            var slot = currentSlot()
+            if (!slot || !slot.export || !slot.export.reference) return 0
+            var sig = slot.export.reference
+            var ref = root.loopById(sig.id)
+            if (!ref) return 2
+            var refExportSet = ref.export && ref.export.end > 0
+            var refOffset = refExportSet ? ref.export.offset : ref.nudge_samples
+            var refStart = refExportSet ? ref.export.start : 0
+            var refEnd = refExportSet ? ref.export.end : ref.frames
+            if ((ref.raw_hash || 0) !== (sig.raw_hash || 0)
+                || (ref.one_shot === true) !== (sig.one_shot === true)
+                || refOffset !== sig.export_offset
+                || refStart !== sig.export_start
+                || refEnd !== sig.export_end)
+                return 1
+            return 0
+        }
+        function gridSubdivision() {
+            if (gridDiv > 0) return gridDiv
+            var slot = currentSlot()
+            if (!slot || width <= 0) return 1
+            var frames = Math.max(1, slot.frames ? slot.frames : 1)
+            var span = Math.max(1, viewEnd - viewStart)
+            var beats = Math.max(1, slot.loop_beats || 1)
+            var pxPerBeat = width * (frames / beats) / span
+            if (pxPerBeat > 320) return 16
+            if (pxPerBeat > 160) return 8
+            if (pxPerBeat > 80) return 4
+            if (pxPerBeat > 40) return 2
+            return 1
+        }
+        function referenceSignature() {
+            if (referenceId < 0) return null
+            var ref = root.loopById(referenceId)
+            if (!ref) return null
+            var set = ref.export && ref.export.end > 0
+            return {
+                id: ref.id,
+                raw_hash: ref.raw_hash || 0,
+                one_shot: ref.one_shot === true,
+                export_offset: set ? ref.export.offset : ref.nudge_samples,
+                export_start: set ? ref.export.start : 0,
+                export_end: set ? ref.export.end : ref.frames
+            }
+        }
+        function storeExportSettings() {
+            var slot = currentSlot()
+            if (!slot) return
+            var offset = alignMode
+                ? exportOffset
+                : (slot.export && slot.export.end > 0 ? slot.export.offset : slot.nudge_samples)
+            root.sendRecorderAction({
+                action: "set_loop_export",
+                slot: slot.id,
+                export: {
+                    offset: offset,
+                    start: Math.round(selectionStart),
+                    end: Math.round(selectionEnd),
+                    reference: referenceSignature()
+                }
+            })
+        }
+        function startPreview() {
+            var slot = currentSlot()
+            if (!slot) return
+            if (previewPlaying) {
+                stopPreview()
+                return
+            }
+            if (root.clockInfo().playing) backend.setClockPlaying(false)
+            var ref = referenceId >= 0 ? root.loopById(referenceId) : null
+            var sig = referenceSignature()
+            var refOffset = sig ? sig.export_offset : 0
+            var refStart = sig ? sig.export_start : 0
+            var refEnd = sig ? sig.export_end : (ref ? ref.frames : 0)
+            var previewOffset = alignMode ? exportOffset : Math.round(displayTotal())
+            var exportSettings = {
+                offset: previewOffset,
+                start: Math.round(selectionStart),
+                end: Math.round(selectionEnd),
+                reference: sig
+            }
+            root.sendRecorderAction({
+                action: "set_loop_export",
+                slot: slot.id,
+                export: exportSettings
+            })
+            root.sendRecorderAction({
+                action: "loop_preview",
+                slot: slot.id,
+                offset: previewOffset,
+                one_shot: slot.one_shot === true,
+                start: Math.round(selectionStart),
+                end: Math.round(selectionEnd),
+                gain: 1.0,
+                reference: ref ? {
+                    slot: ref.id,
+                    offset: refOffset,
+                    one_shot: ref.one_shot === true,
+                    start: refStart,
+                    end: refEnd,
+                    gain: 1.0
+                } : null,
+                metronome: !ref,
+                bpm: ref && ref.bpm > 1 ? ref.bpm
+                    : (slot.bpm > 1 ? slot.bpm : root.clockInfo().bpm),
+                beats_per_bar: root.beatsPerBar(),
+                subdivision: gridSubdivision(),
+                click_gain: 0.5
+            })
+            previewPlaying = true
+        }
+        function stopPreview() {
+            if (!previewPlaying) return
+            root.sendRecorderAction({ action: "loop_preview_stop" })
+            previewPlaying = false
         }
         function clampView(start, end) {
             var slot = currentSlot()
@@ -6353,14 +6628,18 @@ ApplicationWindow {
             viewEnd = Math.round(view.end)
             waveSeq += 1
             var full = view.start === 0 && view.end === slot.frames
+            var requested = nudge
+            if (requested === undefined || requested === null) {
+                requested = loopEditor.alignMode ? loopEditor.exportOffset : null
+            }
             root.sendRecorderAction({
                 action: "waveform",
                 slot: slot.id,
                 start: view.start,
                 end: view.end,
                 // `null` asks the engine for its actual playback rotation;
-                // a numeric value is an editor preview (audio unchanged).
-                nudge: (nudge === undefined || nudge === null) ? null : nudge,
+                // a numeric value is an editor/export preview (audio unchanged).
+                nudge: requested,
                 seq: waveSeq,
                 buckets: full ? 16384 : 8192,
                 base: false
@@ -6450,9 +6729,13 @@ ApplicationWindow {
             var beats = cursorFrame / frames * Math.max(1, slot.loop_beats || 1)
             var bpb = Math.max(1, root.beatsPerBar())
             var bar = Math.floor(beats / bpb) + 1
-            var beat = Math.floor(beats % bpb) + 1
+            var beat = (beats - (bar - 1) * bpb) + 1
+            var beatText = Math.abs(beat - Math.round(beat)) < 1.0e-4
+                ? String(Math.round(beat))
+                : beat.toFixed(2)
             var ms = slot.sample_rate > 0 ? cursorFrame * 1000 / slot.sample_rate : 0
-            return bar + "." + beat + " · " + ms.toFixed(1) + " ms · " + Math.round(cursorFrame) + " smp"
+            return bar + "." + beatText + " · " + ms.toFixed(1) + " ms · "
+                + Math.round(cursorFrame) + " smp"
         }
         function transientDisplayFrame(raw) {
             var slot = currentSlot()
@@ -6504,6 +6787,7 @@ ApplicationWindow {
             })
         }
         function openFor(id) {
+            stopPreview()
             slotId = id
             waveNudge = displayTotalMod()
             editorPeaks = []
@@ -6515,6 +6799,16 @@ ApplicationWindow {
             viewEnd = 0
             waveStart = 0
             waveEnd = 0
+            var openedSlot = root.loopById(id)
+            selectionStart = openedSlot && openedSlot.export && openedSlot.export.start
+                ? openedSlot.export.start : 0
+            selectionEnd = openedSlot && openedSlot.export && openedSlot.export.end
+                ? openedSlot.export.end : (openedSlot ? openedSlot.frames : 0)
+            referenceId = openedSlot && openedSlot.export && openedSlot.export.reference
+                ? openedSlot.export.reference.id : -1
+            exportOffset = openedSlot && openedSlot.export && openedSlot.export.end > 0
+                ? openedSlot.export.offset
+                : (openedSlot ? openedSlot.nudge_samples : 0)
             cursorFrame = -1
             dragManual = 0
             dragging = false
@@ -6618,22 +6912,28 @@ ApplicationWindow {
                     var span = Math.max(1, end - start)
                     var beats = Math.max(1, slot.loop_beats || 1)
                     var bpb = Math.max(1, Math.round(root.beatsPerBar()))
+                    var sub = Math.max(1, loopEditor.gridSubdivision())
                     var beatPx = width * (frames / beats) / span
+                    var tickPx = beatPx / sub
                     ctx.strokeStyle = root.borderColor
                     ctx.fillStyle = root.mutedText
                     ctx.font = "9px monospace"
                     ctx.textBaseline = "middle"
-                    for (var b = 0; b <= beats; b++) {
-                        var frame = b / beats * frames
+                    for (var b = 0; b <= beats * sub; b++) {
+                        var frame = b / (beats * sub) * frames
                         if (frame < start - 1.0e-6 || frame > end + 1.0e-6) continue
                         var x = (frame - start) / span * width
+                        var onBeat = b % sub === 0
+                        ctx.globalAlpha = onBeat ? 1.0 : 0.35
                         ctx.beginPath()
                         ctx.moveTo(x, 0)
                         ctx.lineTo(x, height)
                         ctx.stroke()
-                        var bar = Math.floor(b / bpb) + 1
-                        var beat = (b % bpb) + 1
-                        if (b % bpb === 0 || beatPx >= 34) {
+                        ctx.globalAlpha = 1.0
+                        var beatIndex = Math.floor(b / sub)
+                        var bar = Math.floor(beatIndex / bpb) + 1
+                        var beat = (beatIndex % bpb) + 1
+                        if (onBeat && (beatIndex % bpb === 0 || beatPx >= 34)) {
                             ctx.fillText(bar + "." + beat, x + 2, height * 0.5)
                         }
                     }
@@ -6791,18 +7091,39 @@ ApplicationWindow {
                             ctx.fillText("HF", 3, hfHeight - 3)
                         }
 
-                        // Beat grid, clipped to the visible window.
+                        // Beat/subdivision grid, clipped to the visible window.
                         var beats = Math.max(1, slot.loop_beats || 1)
-                        ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25)
-                        ctx.beginPath()
-                        for (var b = 0; b <= beats; b++) {
-                            var beatFrame = b / beats * frames
-                            if (beatFrame < viewStart - 1.0e-6 || beatFrame > viewEnd + 1.0e-6) continue
-                            var bx = (beatFrame - viewStart) / span * width
-                            ctx.moveTo(bx, 0)
-                            ctx.lineTo(bx, height)
+                        var sub = Math.max(1, loopEditor.gridSubdivision())
+                        for (var g = 0; g < 2; g++) {
+                            ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, g === 0 ? 0.25 : 0.10)
+                            ctx.beginPath()
+                            var step = g === 0 ? sub : 1
+                            for (var b = 0; b <= beats * sub; b += step) {
+                                if (g === 0 && b % sub !== 0) continue
+                                var beatFrame = b / (beats * sub) * frames
+                                if (beatFrame < viewStart - 1.0e-6 || beatFrame > viewEnd + 1.0e-6) continue
+                                var bx = (beatFrame - viewStart) / span * width
+                                ctx.moveTo(bx, 0)
+                                ctx.lineTo(bx, height)
+                            }
+                            ctx.stroke()
                         }
-                        ctx.stroke()
+
+                        if (slot.one_shot === true) {
+                            var s0 = Math.max(viewStart, Math.min(viewEnd, loopEditor.selectionStart))
+                            var s1 = Math.max(viewStart, Math.min(viewEnd, loopEditor.selectionEnd))
+                            if (s1 > s0) {
+                                var sx = (s0 - viewStart) / span * width
+                                var sw = (s1 - s0) / span * width
+                                ctx.fillStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.10)
+                                ctx.fillRect(sx, 0, sw, height)
+                                ctx.strokeStyle = root.accentColor
+                                ctx.beginPath()
+                                ctx.moveTo(sx, 0); ctx.lineTo(sx, height)
+                                ctx.moveTo(sx + sw, 0); ctx.lineTo(sx + sw, height)
+                                ctx.stroke()
+                            }
+                        }
 
                         // Transient markers, mapped from raw frames by the
                         // current nudge so they follow the rotated waveform.
@@ -6896,7 +7217,7 @@ ApplicationWindow {
                         pressX = mouse.x
                         pressY = mouse.y
                         moved = false
-                        if (mouse.modifiers & Qt.AltModifier) {
+                        if ((mouse.modifiers & Qt.AltModifier) && !loopEditor.alignMode) {
                             pressManual = loopEditor.displayManual()
                             loopEditor.dragManual = pressManual
                             loopEditor.dragging = true
@@ -6919,6 +7240,17 @@ ApplicationWindow {
                         var viewSpan = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                         loopEditor.cursorFrame = loopEditor.viewStart
                             + (mouse.x / Math.max(1, width)) * viewSpan
+                        if (loopEditor.snapGrid) {
+                            var slotNow = loopEditor.currentSlot()
+                            if (slotNow) {
+                                var framesNow = Math.max(1, slotNow.frames)
+                                var beatsNow = Math.max(1, slotNow.loop_beats || 1)
+                                var subNow = Math.max(1, loopEditor.gridSubdivision())
+                                var stepNow = framesNow / (beatsNow * subNow)
+                                loopEditor.cursorFrame =
+                                    Math.round(loopEditor.cursorFrame / stepNow) * stepNow
+                            }
+                        }
                         if (pressed) {
                             var dx = mouse.x - pressX
                             var dy = mouse.y - pressY
@@ -7123,6 +7455,32 @@ ApplicationWindow {
 
             RowLayout {
                 Layout.fillWidth: true
+                visible: loopEditor.alignMode
+                spacing: 4
+                Label {
+                    text: "export"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                FlatButton { text: "-100"; implicitWidth: 40; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset - 100) }
+                FlatButton { text: "-10"; implicitWidth: 36; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset - 10) }
+                FlatButton { text: "-1"; implicitWidth: 30; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset - 1) }
+                Label {
+                    Layout.fillWidth: true
+                    text: loopEditor.exportOffsetText()
+                    color: root.textColor
+                    font.pixelSize: 11
+                    font.family: "monospace"
+                    horizontalAlignment: Text.AlignHCenter
+                }
+                FlatButton { text: "+1"; implicitWidth: 30; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset + 1) }
+                FlatButton { text: "+10"; implicitWidth: 36; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset + 10) }
+                FlatButton { text: "+100"; implicitWidth: 40; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset + 100) }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: !loopEditor.alignMode
                 spacing: 4
                 Label {
                     text: "nudge"
@@ -7147,6 +7505,7 @@ ApplicationWindow {
 
             RowLayout {
                 Layout.fillWidth: true
+                visible: !loopEditor.alignMode
                 spacing: 4
                 Label {
                     text: "manual"
@@ -7180,6 +7539,7 @@ ApplicationWindow {
 
             Label {
                 Layout.fillWidth: true
+                visible: !loopEditor.alignMode
                 text: {
                     var slot = root.loopById(loopEditor.slotId)
                     if (!slot) return ""
@@ -7188,6 +7548,138 @@ ApplicationWindow {
                 }
                 color: root.mutedText
                 font.pixelSize: 10
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 8
+                CheckBox {
+                    text: "one-shot"
+                    checked: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        return slot ? slot.one_shot === true : false
+                    }
+                    onToggled: loopEditor.toggleOneShot()
+                }
+                CheckBox {
+                    text: "reference"
+                    checked: {
+                        var slot = root.loopById(loopEditor.slotId)
+                        return slot ? slot.reference === true : false
+                    }
+                    onToggled: loopEditor.toggleReference()
+                }
+                CheckBox {
+                    text: "align"
+                    checked: loopEditor.alignMode
+                    onToggled: {
+                        loopEditor.alignMode = checked
+                        if (checked) {
+                            var slot = root.loopById(loopEditor.slotId)
+                            if (slot) {
+                                loopEditor.exportOffset =
+                                    slot.export && slot.export.end > 0
+                                        ? slot.export.offset : slot.nudge_samples
+                            }
+                            loopEditor.requestWaveform(null)
+                        } else {
+                            loopEditor.storeExportSettings()
+                            loopEditor.stopPreview()
+                            loopEditor.requestWaveform(null)
+                        }
+                    }
+                }
+                FlatButton {
+                    text: loopEditor.gridDiv === 0
+                        ? "grid auto"
+                        : ("grid 1/" + loopEditor.gridDiv)
+                    onClicked: {
+                        var values = [0, 2, 4, 8, 16]
+                        var at = values.indexOf(loopEditor.gridDiv)
+                        loopEditor.gridDiv = values[(at + 1) % values.length]
+                        ruler.requestPaint()
+                        editorWave.requestPaint()
+                    }
+                }
+                CheckBox {
+                    text: "snap"
+                    checked: loopEditor.snapGrid
+                    onToggled: loopEditor.snapGrid = checked
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: loopEditor.alignMode
+                spacing: 4
+                Label {
+                    text: "reference"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                ComboBox {
+                    Layout.fillWidth: true
+                    font.pixelSize: 11
+                    textRole: "name"
+                    model: loopEditor.referenceChoices()
+                    currentIndex: {
+                        var choices = loopEditor.referenceChoices()
+                        for (var i = 0; i < choices.length; i++)
+                            if (choices[i].id === loopEditor.referenceId) return i
+                        return 0
+                    }
+                    onActivated: {
+                        loopEditor.referenceId = model[index].id
+                        loopEditor.stopPreview()
+                    }
+                }
+                FlatButton {
+                    text: loopEditor.previewPlaying ? "stop" : "preview"
+                    onClicked: loopEditor.startPreview()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: {
+                        var state = loopEditor.referenceStale()
+                        if (state === 2) return "reference missing"
+                        if (state === 1) return "reference changed"
+                        return ""
+                    }
+                    color: "#f9a825"
+                    font.pixelSize: 10
+                    elide: Text.ElideRight
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                visible: loopEditor.isOneShot()
+                spacing: 4
+                Label {
+                    text: "start"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                FlatButton {
+                    text: Math.round(loopEditor.selectionStart) + " smp"
+                    onClicked: loopEditor.selectStartAtCursor()
+                }
+                Label {
+                    text: "end"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                FlatButton {
+                    text: Math.round(loopEditor.selectionEnd) + " smp"
+                    onClicked: loopEditor.selectEndAtCursor()
+                }
+                Label {
+                    Layout.fillWidth: true
+                    text: loopEditor.cursorText()
+                    color: root.mutedText
+                    font.pixelSize: 9
+                    elide: Text.ElideRight
+                }
             }
 
             RowLayout {

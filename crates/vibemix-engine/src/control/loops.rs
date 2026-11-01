@@ -1,6 +1,7 @@
 //! Split out of the controller; see `mod.rs`.
 
 use super::*;
+use vibemix_core::recorder::LoopExport;
 
 pub(super) fn loops_dir() -> PathBuf {
     config_dir().join("loops")
@@ -58,6 +59,7 @@ pub(super) fn sanitize_file_name(name: &str) -> String {
 ///
 /// When `normalize` is set, the rotated buffer is scaled so its peak sits at
 /// -1 dBFS (0.891251). Silent buffers are left alone.
+#[allow(dead_code)]
 pub(super) fn write_loop_wav(
     path: &Path,
     raw: &[f32],
@@ -65,6 +67,36 @@ pub(super) fn write_loop_wav(
     sample_rate: u32,
     bit_depth: u8,
     nudge: i64,
+    normalize: bool,
+) -> anyhow::Result<()> {
+    write_loop_range(
+        path,
+        raw,
+        frames,
+        sample_rate,
+        bit_depth,
+        nudge,
+        0,
+        frames as u64,
+        false,
+        normalize,
+    )
+}
+
+/// Write a loop or a one-shot range. `offset` rotates the source; for a
+/// one-shot, `start..end` is selected in the rotated timeline and is not
+/// wrapped past the loop length.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn write_loop_range(
+    path: &Path,
+    raw: &[f32],
+    frames: usize,
+    sample_rate: u32,
+    bit_depth: u8,
+    offset: i64,
+    start: u64,
+    end: u64,
+    one_shot: bool,
     normalize: bool,
 ) -> anyhow::Result<()> {
     // Same rule as sessions: never replace an existing file that is not a WAV.
@@ -77,6 +109,9 @@ pub(super) fn write_loop_wav(
     }
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent)?;
+    }
+    if frames == 0 {
+        anyhow::bail!("cannot export an empty loop");
     }
     let depth = match bit_depth {
         16 | 24 | 32 => bit_depth,
@@ -93,7 +128,25 @@ pub(super) fn write_loop_wav(
         },
     };
     let mut writer = hound::WavWriter::create(path, spec)?;
-    let mut rotated = rotate_interleaved(raw, frames, nudge);
+    let length = if one_shot {
+        let start = start.min(frames as u64) as usize;
+        let end = end.min(frames as u64) as usize;
+        end.saturating_sub(start)
+    } else {
+        frames
+    };
+    let length = if length == 0 { frames } else { length };
+    let mut rotated = Vec::with_capacity(length * 2);
+    for i in 0..length {
+        let frame = if one_shot {
+            offset as i128 + start as i128 + i as i128
+        } else {
+            offset as i128 + i as i128
+        };
+        let index = frame.rem_euclid(frames as i128) as usize;
+        rotated.push(raw[index * 2]);
+        rotated.push(raw[index * 2 + 1]);
+    }
     if normalize {
         let peak = rotated
             .iter()
@@ -351,12 +404,14 @@ impl Controller {
                             pending.slot.peaks = loaded.peaks;
                             pending.slot.playing = false;
                             let raw: Arc<[f32]> = Arc::from(loaded.raw);
+                            pending.slot.raw_hash = vibemix_core::recorder::content_hash(&raw);
                             if let Err(error) = self.engine.set_loop(
                                 index,
                                 raw.to_vec().into_boxed_slice(),
                                 loaded.frames,
                                 pending.slot.nudge_samples,
                                 pending.slot.output_bus.0 as usize,
+                                pending.slot.one_shot,
                             ) {
                                 tracing::warn!(%error, "failed to install loaded loop");
                             } else {
@@ -398,11 +453,14 @@ impl Controller {
                                 .path
                                 .parent()
                                 .map(|parent| parent.to_string_lossy().into_owned());
-                            runtime.slot.path = Some(result.path.to_string_lossy().into_owned());
-                            // If the loop moved while the worker was writing,
-                            // the file is from the old rotation.
-                            runtime.slot.saved = runtime.slot.nudge_samples == result.nudge;
+                            let still_current = runtime.slot.export == result.export;
+                            if result.update_path {
+                                runtime.slot.path =
+                                    Some(result.path.to_string_lossy().into_owned());
+                            }
+                            runtime.slot.saved = still_current;
                             runtime.slot.normalize = result.normalize;
+                            runtime.slot.export = result.export;
                             if let Some(dir) = saved_dir {
                                 self.model.recorder.save_dir = dir;
                             }
@@ -562,6 +620,10 @@ impl Controller {
             mute: false,
             playing: false,
             saved: false,
+            one_shot: false,
+            reference: false,
+            raw_hash: vibemix_core::recorder::content_hash(&buffer[..frames * 2]),
+            export: vibemix_core::recorder::LoopExport::default(),
         };
         if let Err(error) = self.engine.set_loop(
             slot_index,
@@ -569,6 +631,7 @@ impl Controller {
             frames,
             total,
             slot.output_bus.0 as usize,
+            slot.one_shot,
         ) {
             tracing::warn!(%error, "failed to install recorded loop");
             self.recorder_status.message = error.to_string();
@@ -720,6 +783,104 @@ impl Controller {
                     self.rebuild_model_loops();
                     self.loops_dirty = true;
                 }
+            }
+            RecorderAction::SetLoopOneShot { slot, one_shot } => {
+                let index = slot as usize;
+                if let Some(runtime) = self.loops.get_mut(index).and_then(Option::as_mut) {
+                    runtime.slot.one_shot = one_shot;
+                    let _ = self.engine.loop_one_shot(index, one_shot);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                } else if let Some(pending) = self
+                    .pending_loop_loads
+                    .iter_mut()
+                    .find(|pending| pending.index == index)
+                {
+                    pending.slot.one_shot = one_shot;
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::SetLoopReference { slot, reference } => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.reference = reference;
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                } else if let Some(pending) = self
+                    .pending_loop_loads
+                    .iter_mut()
+                    .find(|pending| pending.index == slot as usize)
+                {
+                    pending.slot.reference = reference;
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::SetLoopExport { slot, export } => {
+                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                    runtime.slot.export = export;
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::LoopRender {
+                slot,
+                path,
+                bit_depth,
+                normalize,
+                one_shot,
+                offset,
+                start,
+                end,
+                export,
+            } => self.render_loop(
+                slot, path, bit_depth, normalize, one_shot, offset, start, end, export,
+            ),
+            RecorderAction::LoopPreview {
+                slot,
+                offset,
+                one_shot,
+                start,
+                end,
+                gain,
+                reference,
+                metronome,
+                bpm,
+                beats_per_bar,
+                subdivision,
+                click_gain,
+            } => {
+                let reference = reference.and_then(|reference| {
+                    self.loops
+                        .get(reference.slot as usize)
+                        .and_then(Option::as_ref)
+                        .map(|_| crate::backend_jack::PreviewReference {
+                            slot: reference.slot as usize,
+                            offset: reference.offset,
+                            one_shot: reference.one_shot,
+                            start: reference.start,
+                            end: reference.end,
+                            gain: reference.gain,
+                        })
+                });
+                let spec = crate::backend_jack::PreviewSpec {
+                    slot: slot as usize,
+                    offset,
+                    one_shot,
+                    start,
+                    end,
+                    gain,
+                    reference,
+                    metronome,
+                    bpm,
+                    beats_per_bar,
+                    subdivision,
+                    click_gain,
+                };
+                let _ = self.engine.loop_preview(spec);
+            }
+            RecorderAction::LoopPreviewStop => {
+                let _ = self.engine.loop_preview_stop();
             }
             RecorderAction::LoopPlay { slot, quantized } => {
                 if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
@@ -901,6 +1062,74 @@ impl Controller {
         self.recorder_dirty = true;
     }
 
+    /// Render a WAV using explicit WYSIWYG settings and store them on the
+    /// slot. The live loop's playback rotation is not changed.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn render_loop(
+        &mut self,
+        slot: u32,
+        path: String,
+        bit_depth: u8,
+        normalize: bool,
+        one_shot: bool,
+        offset: i64,
+        start: u64,
+        end: u64,
+        export: LoopExport,
+    ) {
+        let path = PathBuf::from(path);
+        let (frames, sample_rate, generation, raw) = {
+            let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) else {
+                self.recorder_status.message = "loop is not loaded yet".to_string();
+                self.recorder_dirty = true;
+                return;
+            };
+            let frames = runtime.slot.frames as usize;
+            if frames == 0 {
+                return;
+            }
+            runtime.slot.export = export.clone();
+            runtime.slot.one_shot = one_shot;
+            let _ = self.engine.loop_one_shot(slot as usize, one_shot);
+            (
+                frames,
+                runtime.slot.sample_rate,
+                runtime.generation,
+                Arc::clone(&runtime.raw),
+            )
+        };
+        let end = if end == 0 || end > frames as u64 {
+            frames as u64
+        } else {
+            end
+        };
+        let start = start.min(end.saturating_sub(1));
+        self.rebuild_model_loops();
+        self.loops_dirty = true;
+        self.recorder_status.message = format!("saving {}…", path.display());
+        self.recorder_dirty = true;
+        let job = IoJob::SaveLoop(SaveLoopJob {
+            slot,
+            generation,
+            raw,
+            frames,
+            sample_rate,
+            path,
+            bit_depth,
+            nudge: offset,
+            normalize,
+            one_shot,
+            start,
+            end,
+            export,
+            update_path: false,
+        });
+        if !self.workers.submit_io(job) {
+            self.recorder_status.message = "file-I/O worker is unavailable".to_string();
+            self.recorder_dirty = true;
+        }
+    }
+
     pub(super) fn save_loop(
         &mut self,
         slot: u32,
@@ -945,6 +1174,11 @@ impl Controller {
             bit_depth,
             nudge: runtime.slot.nudge_samples,
             normalize,
+            one_shot: runtime.slot.one_shot,
+            start: runtime.slot.export.start,
+            end: runtime.slot.export.end,
+            export: runtime.slot.export.clone(),
+            update_path: true,
         });
         if !self.workers.submit_io(job) {
             self.recorder_status.message = "file-I/O worker is unavailable".to_string();
@@ -1095,6 +1329,21 @@ mod wav_tests {
                 assert!((a - b).abs() <= tolerance, "{depth}: {a} vs {b}");
             }
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn one_shot_export_range_is_rotated_and_trimmed() {
+        let dir = std::env::temp_dir().join(format!("vibemix-wav-range-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("range.wav");
+        let raw = vec![0.0, 0.0, 0.1, 0.1, 0.2, 0.2, 0.3, 0.3, 0.4, 0.4];
+        write_loop_range(&path, &raw, 5, 48_000, 32, 1, 2, 4, true, false).unwrap();
+        let (read, frames) = read_loop_wav(&path, 48_000).unwrap();
+        assert_eq!(frames, 2);
+        // Rotate by one and take display frames 2..4 -> raw frames 3 and 4.
+        assert!((read[0] - 0.3).abs() < 1.0e-5);
+        assert!((read[2] - 0.4).abs() < 1.0e-5);
         fs::remove_dir_all(&dir).unwrap();
     }
 
