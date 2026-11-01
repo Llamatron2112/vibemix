@@ -274,6 +274,10 @@ pub struct MixerModel {
     /// to plugins.
     #[serde(default = "default_true")]
     pub midi_sync: bool,
+    /// Automatic delay compensation for sends, buses and launcher playback.
+    /// Off leaves only the per-send manual delay.
+    #[serde(default = "default_true")]
+    pub pdc: bool,
     /// Loop recorder sources and save settings.
     #[serde(default)]
     pub recorder: crate::recorder::RecorderSettings,
@@ -453,6 +457,7 @@ impl MixerModel {
             transport_ui: TransportUi::default(),
             layout: LayoutSettings::default(),
             midi_sync: true,
+            pdc: true,
             recorder: crate::recorder::RecorderSettings::default(),
             clock: ClockSettings::default(),
             loops: Vec::new(),
@@ -580,6 +585,7 @@ mod tests {
 
         let text = toml::to_string(&model).expect("serialize");
         let parsed: MixerModel = toml::from_str(&text).expect("deserialize");
+        assert!(parsed.pdc);
         assert_eq!(parsed.name, "untitled");
         assert_eq!(parsed.strips.len(), 1);
         assert_eq!(parsed.buses.len(), 1);
@@ -633,6 +639,13 @@ mod tests {
                 maximized: true,
             })
         );
+    }
+
+    #[test]
+    fn pdc_defaults_on_for_old_sessions() {
+        let parsed: MixerModel =
+            toml::from_str("name = \"old\"\nstrips = []\nbuses = []\n").expect("parse");
+        assert!(parsed.pdc);
     }
 
     #[test]

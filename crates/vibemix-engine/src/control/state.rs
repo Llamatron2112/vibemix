@@ -161,6 +161,7 @@ pub(super) fn build_state_json(
         "transport_ui": model.transport_ui,
         "layout": model.layout,
         "midi_sync": model.midi_sync,
+        "pdc": model.pdc,
         "midi_connections": model.midi_connections,
         "midi_out_connections": model.midi_out_connections,
         "clock": model.clock,
@@ -174,6 +175,7 @@ pub(super) fn build_state_json(
 pub fn apply_model(params: &SharedParams, model: &MixerModel) {
     params.set_beats_per_bar(model.beats_per_bar);
     params.set_midi_sync(model.midi_sync);
+    params.set_pdc_enabled(model.pdc);
     params.set_clock_master(model.clock.master);
     params.set_clock_send_transport(model.clock.send_transport);
     params.set_clock_receive_transport(model.clock.receive_transport);
@@ -259,6 +261,7 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
 /// or bypass the model), so this must run before the model is saved or
 /// snapshotted for undo, otherwise those changes would be lost.
 pub fn sync_model_from_params(params: &SharedParams, model: &mut MixerModel) {
+    model.pdc = params.pdc_enabled();
     for bus in &mut model.buses {
         let index = bus.id.0 as usize;
         bus.gain = Gain(params.bus_gain(index));
@@ -755,8 +758,12 @@ impl Controller {
     pub(super) fn restore_model(&mut self, snapshot: MixerModel) {
         let structure_changed = !structure_eq(&self.model, &snapshot);
         let window = self.model.window.clone();
+        // Delay compensation is a global preference, not part of an edit:
+        // undo/redo must not silently switch the audio timing.
+        let pdc = self.model.pdc;
         self.model = snapshot;
         self.model.window = window;
+        self.model.pdc = pdc;
         self.model.normalize_buses();
         self.rebuild_shared_bindings();
 

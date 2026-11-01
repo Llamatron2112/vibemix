@@ -1687,6 +1687,14 @@ impl Controller {
                     catalog: false,
                 }
             }
+            ControlMessage::SetPdc { enabled } => {
+                self.model.pdc = enabled;
+                self.params.set_pdc_enabled(enabled);
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
             ControlMessage::MidiLearn {
                 kind,
                 location,

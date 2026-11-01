@@ -1414,6 +1414,13 @@ ApplicationWindow {
                 checked: root.transportUi().autosize
                 onTriggered: root.toggleAutoFit()
             }
+            MenuItem {
+                text: "Automatic delay compensation"
+                checkable: true
+                checked: mix.pdc !== false
+                enabled: backend.connected
+                onTriggered: backend.setPdc(checked)
+            }
             MenuSeparator { }
             MenuItem {
                 text: "Layout…"

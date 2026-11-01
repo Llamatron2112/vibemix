@@ -15,6 +15,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   inserts are included, and launcher playback is delayed by the same amount so
   recorded loops stay aligned with live sources. The compensation is bounded by
   the 500 ms send-delay capacity; a warning is logged if a path exceeds it.
+  It can be turned off from **Options → Automatic delay compensation** (saved
+  with the session); when off, sends use only their manual delay and no
+  launcher delay is applied, while JACK and the recorder still see the real
+  uncompensated latency.
 - **JACK output latency reporting.** Bus output ports report their actual
   processing latency (`jack_port_set_latency_range`), including send PDC, bus
   inserts and the master chain, so other JACK clients can compensate.

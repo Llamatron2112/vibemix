@@ -18,7 +18,8 @@ small OSC control protocol.
   semantics: a pre-fader `SEND`, a `RET` trim, and the bus fader post-device).
 - Per-send **alignment delay** (0–500 ms) to phase-align parallel paths, plus
   **automatic delay compensation** for bus inserts, parallel sends and the
-  master path. Bus output latency is reported to JACK.
+  master path (toggleable in Options and saved with the session). Bus output
+  latency is reported to JACK.
 - **Plugin hosting: LV2, VST3 and CLAP** (audio effects; MIDI passthrough;
   sidechain where the plugin exposes it).
 - **Plugin browser** with a name filter, per-format/channel/sidechain/failed

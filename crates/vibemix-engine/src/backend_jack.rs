@@ -1164,6 +1164,7 @@ impl MixerGraph {
 
         let max_frames = self.max_pdc_frames;
         let sample_rate = self.sample_rate;
+        let pdc_enabled = self.params.pdc_enabled();
         let params = &self.params;
         let plan = &mut self.latency;
         plan.update(
@@ -1175,6 +1176,7 @@ impl MixerGraph {
             |strip, bus| params.send_gain(strip, bus),
             |strip, bus| params.send_pre_fader(strip, bus),
             |strip, bus| params.send_delay(strip, bus) * sample_rate / 1000.0,
+            pdc_enabled,
             max_frames,
         );
 

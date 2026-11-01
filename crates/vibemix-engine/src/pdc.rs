@@ -40,8 +40,10 @@ impl PdcPlan {
     ///
     /// `send_manual_frames` is the user's alignment delay converted to frames;
     /// it is part of each path, so a manual delay shifts the whole destination
-    /// rather than being overwritten. `max_frames` is the longest delay a send
-    /// line can hold (the manual-delay capacity); longer paths are clamped and
+    /// rather than being overwritten. `enabled` turns automatic compensation
+    /// off while still computing the real latency used for JACK reporting and
+    /// the recorder. `max_frames` is the longest delay a send line can hold
+    /// (the manual-delay capacity); longer compensated paths are clamped and
     /// `limited` is set.
     #[allow(clippy::too_many_arguments)]
     pub fn update<G, P, M>(
@@ -54,6 +56,7 @@ impl PdcPlan {
         send_gain: G,
         send_pre_fader: P,
         send_manual_frames: M,
+        enabled: bool,
         max_frames: u32,
     ) where
         G: Fn(usize, usize) -> f32,
@@ -85,7 +88,9 @@ impl PdcPlan {
         // First pass: the slowest path through each destination. For buses
         // that reach master the target is global (including the inserts of
         // intermediate buses); for hardware-only buses it is local, so a large
-        // master path cannot needlessly delay a separate monitor output.
+        // master path cannot needlessly delay a separate monitor output. The
+        // local maximum is computed for every bus too: with compensation off it
+        // is the real latency each bus output carries.
         let mut master_target = 0.0f32;
         self.local.fill(0.0);
         for strip in 0..strips {
@@ -94,11 +99,12 @@ impl PdcPlan {
                     continue;
                 }
                 let requested = send_manual_frames(strip, bus);
-                if requested > max {
+                if enabled && requested > max {
                     limited = true;
                 }
                 let manual = requested.clamp(0.0, max);
                 let tap = tap(strip, bus);
+                self.local[bus] = self.local[bus].max(tap + manual);
                 if reaches_master(bus) {
                     let upstream = if bus != 0 {
                         bus_chain.get(bus).copied().unwrap_or(0) as f32
@@ -106,16 +112,18 @@ impl PdcPlan {
                         0.0
                     };
                     master_target = master_target.max(tap + manual + upstream);
-                } else {
-                    self.local[bus] = self.local[bus].max(tap + manual);
                 }
             }
         }
-        if master_target > max {
-            master_target = max;
-            limited = true;
-        }
-        if self.local.iter().any(|value| *value > max) {
+        let compensation_target = if enabled {
+            if master_target > max {
+                limited = true;
+            }
+            master_target.min(max)
+        } else {
+            master_target
+        };
+        if enabled && self.local.iter().any(|value| *value > max) {
             limited = true;
         }
 
@@ -123,42 +131,57 @@ impl PdcPlan {
         // target is the latency at the destination input, so subtract the
         // source tap and any intermediate bus inserts (the destination's own
         // inserts, and the master's, happen after all sends are summed).
-        for strip in 0..strips {
-            for bus in 0..buses {
-                if !active(bus) || send_gain(strip, bus) <= 0.0 {
-                    continue;
+        if enabled {
+            for strip in 0..strips {
+                for bus in 0..buses {
+                    if !active(bus) || send_gain(strip, bus) <= 0.0 {
+                        continue;
+                    }
+                    let manual = send_manual_frames(strip, bus).clamp(0.0, max);
+                    let tap = tap(strip, bus);
+                    let target = if reaches_master(bus) {
+                        compensation_target
+                    } else {
+                        self.local[bus]
+                    };
+                    let upstream = if reaches_master(bus) && bus != 0 {
+                        bus_chain.get(bus).copied().unwrap_or(0) as f32
+                    } else {
+                        0.0
+                    };
+                    let needed = target - tap - upstream;
+                    if needed < 0.0 {
+                        // The path is already slower than the target (its
+                        // inserts run before its own output); it cannot be
+                        // pulled back.
+                        limited = true;
+                    }
+                    let comp = (needed.max(0.0) - manual).max(0.0);
+                    let comp = comp.min((max - manual).max(0.0));
+                    if comp >= (max - manual).max(0.0) && needed > manual + comp {
+                        limited = true;
+                    }
+                    self.send_delay[strip][bus] = comp.ceil() as u32;
                 }
-                let manual = send_manual_frames(strip, bus).clamp(0.0, max);
-                let tap = tap(strip, bus);
-                let target = if reaches_master(bus) {
-                    master_target
-                } else {
-                    self.local[bus]
-                };
-                let upstream = if reaches_master(bus) && bus != 0 {
-                    bus_chain.get(bus).copied().unwrap_or(0) as f32
-                } else {
-                    0.0
-                };
-                let needed = target - tap - upstream;
-                if needed < 0.0 {
-                    // The path is already slower than the target (its inserts
-                    // run before its own output); it cannot be pulled back.
-                    limited = true;
-                }
-                let comp = (needed.max(0.0) - manual).max(0.0);
-                let comp = comp.min((max - manual).max(0.0));
-                if comp >= (max - manual).max(0.0) && needed > manual + comp {
-                    limited = true;
-                }
-                self.send_delay[strip][bus] = comp.ceil() as u32;
             }
         }
 
-        self.master_input = master_target.ceil() as u32;
+        self.master_input = if enabled {
+            compensation_target.ceil() as u32
+        } else {
+            0
+        };
         for bus in 0..buses {
             let value = if !active(bus) {
                 0.0
+            } else if !enabled {
+                // No compensation: report the real (slowest) path. Bus 0 is
+                // the master output, so it includes intermediate bus inserts.
+                if bus == 0 {
+                    master_target
+                } else {
+                    self.local[bus]
+                }
             } else if reaches_master(bus) {
                 // Sends are delayed to the master target before crossing their
                 // own inserts, so a bus with more insert latency needs less
@@ -169,7 +192,7 @@ impl PdcPlan {
                 } else {
                     0.0
                 };
-                (master_target - upstream).max(0.0)
+                (compensation_target - upstream).max(0.0)
             } else {
                 self.local[bus].min(max)
             };
@@ -243,6 +266,7 @@ mod tests {
                     .map(|send| send.4 as f32)
                     .unwrap_or(0.0)
             },
+            true,
             max,
         );
         plan
@@ -305,6 +329,37 @@ mod tests {
     }
 
     #[test]
+    fn disabled_plan_keeps_real_latency_but_adds_no_delay() {
+        let mut plan = PdcPlan::new(2, 3);
+        plan.update(
+            &[0, 0],
+            &[100, 0],
+            &[0, 50, 0],
+            &[true, true, true],
+            &[true, true, false],
+            |strip, bus| {
+                if strip == 0 && (bus == 0 || bus == 1) {
+                    1.0
+                } else {
+                    0.0
+                }
+            },
+            |_, _| false,
+            |_, _| 0.0,
+            false,
+            48_000,
+        );
+        assert_eq!(plan.master_input(), 0);
+        assert_eq!(plan.send_delay(0, 0), 0);
+        assert_eq!(plan.send_delay(0, 1), 0);
+        // JACK/recorder still see the actual paths.
+        assert_eq!(plan.bus_input(0), 150);
+        assert_eq!(plan.bus_input(1), 100);
+        assert_eq!(plan.bus_input(1) + 50, 150);
+        assert!(!plan.limited());
+    }
+
+    #[test]
     fn hardware_bus_is_aligned_locally_not_to_master() {
         // Bus 2 does not mix to master. Its sends align among themselves; the
         // global master path (1000 frames) must not delay it.
@@ -356,6 +411,7 @@ mod tests {
             |_, _| 1.0,
             |_, _| false,
             |_, _| 0.0,
+            true,
             48_000,
         );
         assert_eq!(plan.master_input(), 0);

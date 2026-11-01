@@ -64,6 +64,8 @@ pub struct SharedParams {
     clock_send_transport: AtomicBool,
     clock_receive_transport: AtomicBool,
     clock_restart: AtomicBool,
+    /// Whether automatic delay compensation is enabled.
+    pdc_enabled: AtomicBool,
     /// Automatic compensation applied to launcher playback (frames).
     pdc_frames: AtomicU32,
     /// Automatic compensation hit the send-delay capacity and is incomplete.
@@ -141,10 +143,19 @@ impl SharedParams {
             clock_send_transport: AtomicBool::new(true),
             clock_receive_transport: AtomicBool::new(true),
             clock_restart: AtomicBool::new(false),
+            pdc_enabled: AtomicBool::new(true),
             pdc_frames: AtomicU32::new(0),
             pdc_limited: AtomicBool::new(false),
             bus_out_latency: (0..bus_count).map(|_| AtomicU32::new(0)).collect(),
         }
+    }
+
+    pub fn pdc_enabled(&self) -> bool {
+        self.pdc_enabled.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pdc_enabled(&self, value: bool) {
+        self.pdc_enabled.store(value, Ordering::Relaxed);
     }
 
     pub fn pdc_frames(&self) -> u32 {

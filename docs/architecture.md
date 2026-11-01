@@ -169,7 +169,10 @@ loop stays aligned with compensated live sources. The plan is bounded by the
 logs a warning. The values are published to JACK with
 `jack_port_set_latency_range`, so each bus output port reports its actual
 latency (send compensation + bus inserts; the master also includes its own
-chain).
+chain). **Options → Automatic delay compensation** (stored as `pdc` in the
+session) disables the automatic part: sends then use only their manual
+`delay_ms`, launcher playback is not delayed, and JACK/recorder reporting
+switches to the real uncompensated path latency.
 
 Each bus sums its incoming sends, runs its own LV2 insert chain, applies
 gain/mute, and drives its JACK output ports (`{slug}_out_l/r`) — so a bus can be a
