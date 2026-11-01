@@ -7236,6 +7236,7 @@ ApplicationWindow {
                     property real pressViewStart: 0
                     property real pressViewEnd: 0
                     property int pressManual: 0
+                    property int pressExport: 0
                     property bool moved: false
 
                     ToolTip.visible: containsMouse && !pressed
