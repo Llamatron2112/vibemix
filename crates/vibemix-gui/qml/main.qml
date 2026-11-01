@@ -6416,11 +6416,19 @@ ApplicationWindow {
             var ms = slot && slot.sample_rate > 0 ? exportOffset * 1000 / slot.sample_rate : 0
             return exportOffset + " smp (" + (ms >= 0 ? "+" : "") + ms.toFixed(2) + " ms)"
         }
+        function restartPreview() {
+            if (!previewPlaying) return
+            stopPreview(true)
+            startPreview()
+        }
         function setExportOffset(value) {
             exportOffset = Math.round(value)
             requestWaveform(null)
             editorWave.requestPaint()
             ruler.requestPaint()
+            // The click is anchored to the export start; moving the offset
+            // changes where that start lands. Re-phase the preview at once.
+            restartPreview()
         }
         function displayTotalMod() {
             var slot = currentSlot()
@@ -6436,6 +6444,8 @@ ApplicationWindow {
             if (!slot) return
             var frame = cursorFrame >= 0 ? cursorFrame : viewStart
             selectionStart = Math.max(0, Math.min(selectionEnd - 1, Math.round(frame)))
+            storeExportSettings()
+            restartPreview()
             editorWave.requestPaint()
         }
         function selectEndAtCursor() {
@@ -6443,6 +6453,8 @@ ApplicationWindow {
             if (!slot) return
             var frame = cursorFrame >= 0 ? cursorFrame : viewEnd
             selectionEnd = Math.max(selectionStart + 1, Math.min(slot.frames, Math.round(frame)))
+            storeExportSettings()
+            restartPreview()
             editorWave.requestPaint()
         }
         function toggleOneShot() {
@@ -7154,6 +7166,11 @@ ApplicationWindow {
                                 ctx.moveTo(sx, 0); ctx.lineTo(sx, height)
                                 ctx.moveTo(sx + sw, 0); ctx.lineTo(sx + sw, height)
                                 ctx.stroke()
+                                // Small handles make the two markers easy to
+                                // grab without changing the start/end buttons.
+                                ctx.fillStyle = root.accentColor
+                                ctx.fillRect(sx - 3, 0, 7, 7)
+                                ctx.fillRect(sx + sw - 3, 0, 7, 7)
                             }
                         }
 
@@ -7233,7 +7250,8 @@ ApplicationWindow {
                     id: waveDrag
                     anchors.fill: parent
                     hoverEnabled: true
-                    cursorShape: pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor
+                    cursorShape: markerHover ? Qt.SizeHorCursor
+                        : (pressed ? Qt.ClosedHandCursor : Qt.OpenHandCursor)
                     property real pressX: 0
                     property real pressY: 0
                     property real pressViewStart: 0
@@ -7241,6 +7259,22 @@ ApplicationWindow {
                     property int pressManual: 0
                     property int pressExport: 0
                     property bool moved: false
+                    property string dragMarker: ""
+                    property bool markerHover: false
+                    readonly property int markerGrab: 7
+
+                    function markerX(frame) {
+                        var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
+                        return (frame - loopEditor.viewStart) / span * width
+                    }
+                    function markerAt(px) {
+                        if (!loopEditor.isOneShot()) return ""
+                        var startX = markerX(loopEditor.selectionStart)
+                        var endX = markerX(loopEditor.selectionEnd)
+                        if (Math.abs(px - startX) <= markerGrab) return "start"
+                        if (Math.abs(px - endX) <= markerGrab) return "end"
+                        return ""
+                    }
 
                     ToolTip.visible: containsMouse && !pressed
                     ToolTip.delay: 500
@@ -7252,6 +7286,14 @@ ApplicationWindow {
                         pressX = mouse.x
                         pressY = mouse.y
                         moved = false
+                        dragMarker = markerAt(mouse.x)
+                        if (dragMarker !== "") {
+                            loopEditor.navigating = false
+                            loopEditor.dragging = false
+                            loopEditor.applying = false
+                            pressExport = loopEditor.exportOffset
+                            return
+                        }
                         if (mouse.modifiers & Qt.AltModifier) {
                             pressManual = loopEditor.displayManual()
                             pressExport = loopEditor.exportOffset
@@ -7279,6 +7321,39 @@ ApplicationWindow {
                         var viewSpan = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                         loopEditor.cursorFrame = loopEditor.viewStart
                             + (mouse.x / Math.max(1, width)) * viewSpan
+                        var hitMarker = markerAt(mouse.x)
+                        markerHover = hitMarker !== ""
+                        if (!pressed && hitMarker !== "") {
+                            loopEditor.cursorFrame = hitMarker === "start"
+                                ? loopEditor.selectionStart : loopEditor.selectionEnd
+                        }
+                        if (pressed && dragMarker !== "") {
+                            var spanM = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
+                            var frameM = loopEditor.viewStart
+                                + (mouse.x / Math.max(1, width)) * spanM
+                            if (loopEditor.snapGrid) {
+                                var sm = loopEditor.currentSlot()
+                                if (sm) {
+                                    var fm = Math.max(1, sm.frames)
+                                    var bm = Math.max(1, sm.loop_beats || 1)
+                                    var sub = Math.max(1, loopEditor.gridSubdivision())
+                                    var stepM = fm / (bm * sub)
+                                    frameM = Math.round(frameM / stepM) * stepM
+                                }
+                            }
+                            if (dragMarker === "start") {
+                                loopEditor.selectionStart = Math.max(
+                                    0, Math.min(loopEditor.selectionEnd - 1, frameM))
+                            } else {
+                                loopEditor.selectionEnd = Math.max(
+                                    loopEditor.selectionStart + 1,
+                                    Math.min(frames, frameM))
+                            }
+                            loopEditor.cursorFrame = dragMarker === "start"
+                                ? loopEditor.selectionStart : loopEditor.selectionEnd
+                            editorWave.requestPaint()
+                            return
+                        }
                         if (loopEditor.snapGrid) {
                             var slotNow = loopEditor.currentSlot()
                             if (slotNow) {
@@ -7331,6 +7406,13 @@ ApplicationWindow {
                     onReleased: {
                         requestTimer.stop()
                         var slot = loopEditor.currentSlot()
+                        if (dragMarker !== "") {
+                            dragMarker = ""
+                            loopEditor.storeExportSettings()
+                            loopEditor.restartPreview()
+                            editorWave.requestPaint()
+                            return
+                        }
                         if (loopEditor.dragging) {
                             loopEditor.dragging = false
                             if (loopEditor.alignMode) {
@@ -7382,10 +7464,12 @@ ApplicationWindow {
                         settleTimer.stop()
                         loopEditor.dragging = false
                         loopEditor.navigating = false
+                        dragMarker = ""
                         loopEditor.applying = false
                         loopEditor.requestWaveform(null)
                     }
                     onExited: {
+                        markerHover = false
                         loopEditor.cursorFrame = -1
                         editorWave.requestPaint()
                     }
@@ -7689,7 +7773,7 @@ ApplicationWindow {
                     }
                     onActivated: {
                         loopEditor.referenceId = model[index].id
-                        loopEditor.stopPreview()
+                        loopEditor.restartPreview()
                     }
                 }
                 FlatButton {
@@ -7702,10 +7786,7 @@ ApplicationWindow {
                         var values = [1, 2, 4]
                         var at = values.indexOf(loopEditor.clickDiv)
                         loopEditor.clickDiv = values[(at + 1) % values.length]
-                        if (loopEditor.previewPlaying) {
-                            loopEditor.startPreview()
-                            loopEditor.startPreview()
-                        }
+                        loopEditor.restartPreview()
                     }
                 }
                 Label {
