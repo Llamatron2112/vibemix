@@ -6099,19 +6099,21 @@ ApplicationWindow {
                                     : (loopState.pending ? "#f9a825" : root.borderColor)
                                 border.width: loopState.playing || loopState.pending ? 2 : 1
 
-                                TapHandler {
-                                    acceptedButtons: Qt.LeftButton
-                                    onSingleTapped: {
+                                MouseArea {
+                                    anchors.fill: parent
+                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                    preventStealing: false
+                                    onClicked: (mouse) => {
+                                        if (mouse.button === Qt.RightButton) {
+                                            loopMenu.popup()
+                                            return
+                                        }
                                         if (loopState.playing || loopState.pending) {
                                             root.stopLoop(loopData)
                                         } else {
                                             root.startLoop(loopData, true)
                                         }
                                     }
-                                }
-                                TapHandler {
-                                    acceptedButtons: Qt.RightButton
-                                    onSingleTapped: loopMenu.popup()
                                 }
 
                                 Menu {
