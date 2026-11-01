@@ -20,7 +20,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   a non-modal popover on the top-bar record dot (length/unit, beats per bar, bit
   depth, save folder). Auto-fit counts the loops pane and captures the strip
   wrap without it, so showing loops does not wrap the strips into extra rows;
-  the pane scrolls within the mixer height. Latency correction is always
+  the pane scrolls within the mixer height. Starting or restarting the
+  transport relaunches playing loops on the bar, so a loop previewed while the
+  transport was stopped cannot stay out of phase. Latency correction is always
   applied and takes are no longer automatically nudged to their first transient
   (markers and manual snap remain in the editor).
 - **Trim learn.** A strip's trim right-click menu can start a continuous learn

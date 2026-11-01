@@ -610,6 +610,9 @@ struct MixerGraph {
     record_mix: [Vec<f32>; 2],
     /// Transport-only MIDI events, kept after `midi_sync` filtering.
     transport_midi: MidiBlock,
+    /// Previous block's transport state, used to relaunch loops when the
+    /// transport starts or restarts.
+    transport_playing: bool,
 }
 
 impl MixerGraph {
@@ -1462,6 +1465,27 @@ impl MixerGraph {
         self.process_one_bus(0, scope, frames);
     }
 
+    /// Whether the transport just started or was explicitly restarted. In
+    /// both cases a running launcher loop must be relaunched on the bar so it
+    /// cannot stay at an arbitrary phase from a preview started while stopped.
+    fn should_relaunch_loops(was_playing: bool, playing: bool, restart: bool) -> bool {
+        playing && (restart || !was_playing)
+    }
+
+    /// Re-queues playing launcher slots to start on the next bar. Stopped slots
+    /// stay stopped.
+    fn relaunch_loops(&mut self) {
+        for slot in self.loop_slots.iter_mut().flatten() {
+            if slot.pending || (slot.playing && !slot.stopping) {
+                slot.pending = true;
+                slot.quantized = true;
+                slot.playing = false;
+                slot.stopping = false;
+                slot.pos = 0;
+            }
+        }
+    }
+
     /// Mix launcher playback into the master input. Quantized slots start on
     /// the next bar boundary in this block; without a running clock they start
     /// immediately.
@@ -1956,6 +1980,11 @@ impl ProcessHandler for MixerGraph {
             accumulator[1][..frames].fill(0.0);
         }
 
+        if Self::should_relaunch_loops(self.transport_playing, playing, restart_requested) {
+            self.relaunch_loops();
+        }
+        self.transport_playing = playing;
+
         self.process_strips(scope, frames, paused);
         self.mix_loops(frames, beats_before, beats_per_bar, playing);
         self.process_buses(scope, frames);
@@ -2290,6 +2319,7 @@ impl JackEngine {
             master_active: false,
             slave_restart_pending: false,
             transport_midi: MidiBlock::default(),
+            transport_playing: false,
             clock: Clock::new(sample_rate as f32, 4.0),
             shared_clock: Arc::clone(&shared_clock),
             position: vibemix_lv2::TimePosition::default(),
@@ -4111,6 +4141,16 @@ mod tests {
             retired += 1;
         }
         assert_eq!(retired, 3);
+    }
+
+    #[test]
+    fn loops_relaunch_only_on_transport_start_or_restart() {
+        assert!(!MixerGraph::should_relaunch_loops(false, false, false));
+        assert!(MixerGraph::should_relaunch_loops(false, true, false));
+        assert!(!MixerGraph::should_relaunch_loops(true, true, false));
+        assert!(MixerGraph::should_relaunch_loops(true, true, true));
+        // A restart request while stopped is ignored until the transport runs.
+        assert!(!MixerGraph::should_relaunch_loops(false, false, true));
     }
 
     #[test]

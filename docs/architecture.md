@@ -690,8 +690,10 @@ exists.
   lightweight offset update, so a playing loop keeps running. Each loop is
   mixed into its own output bus (master by default), delayed by that bus's PDC
   target and faded on start/stop. Quantized playback starts on the next bar;
-  stop is immediate. Buffers are retired through a garbage queue, so no
-  allocation or free happens on the audio thread. The engine publishes each
+  stop is immediate. Starting or restarting the transport relaunches playing
+  loops on the bar, so a preview started while the transport was stopped cannot
+  stay at an arbitrary phase. Buffers are retired through a garbage queue, so
+  no allocation or free happens on the audio thread. The engine publishes each
   slot's progress/playing/queued state at meter rate.
 - WAV files are written by the I/O worker at 16-bit, 24-bit or 32-bit
   float to the path chosen in the GUI's save dialog (default
