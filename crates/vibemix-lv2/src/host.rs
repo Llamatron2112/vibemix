@@ -73,6 +73,9 @@ const PG_GROUP: &str = "http://lv2plug.in/ns/ext/port-groups#group";
 const PG_MAIN_INPUT: &str = "http://lv2plug.in/ns/ext/port-groups#mainInput";
 const PG_SIDE_CHAIN_OF: &str = "http://lv2plug.in/ns/ext/port-groups#sideChainOf";
 const LV2_TOGGLED: &str = "http://lv2plug.in/ns/lv2core#toggled";
+/// Control output port reporting the plugin's processing latency in frames.
+const LV2_LATENCY: &str = "http://lv2plug.in/ns/lv2core#latency";
+const LV2_DESIGNATION: &str = "http://lv2plug.in/ns/lv2core#designation";
 const LV2_INTEGER: &str = "http://lv2plug.in/ns/lv2core#integer";
 const LV2_PORT_PROPERTY: &str = "http://lv2plug.in/ns/lv2core#portProperty";
 const LV2_SCALE_POINT: &str = "http://lv2plug.in/ns/lv2core#scalePoint";
@@ -191,6 +194,14 @@ impl Host {
             .any(|node| node.as_uri() == Some(uri))
     }
 
+    /// Whether the port carries the given `lv2:designation`.
+    fn port_designated(&self, port: &lilv::port::Port, uri: &str) -> bool {
+        let predicate = self.world.new_uri(LV2_DESIGNATION);
+        port.value(&predicate)
+            .iter()
+            .any(|node| node.as_uri() == Some(uri))
+    }
+
     fn scale_points(&self, port: &lilv::port::Port) -> Vec<ScalePoint> {
         let predicate = self.world.new_uri(LV2_SCALE_POINT);
         let value_pred = self.world.new_uri(RDF_VALUE);
@@ -278,6 +289,9 @@ impl Host {
                 if port.is_a(&input) {
                     classified.controls.push(self.control_port(&port));
                 } else if port.is_a(&output) {
+                    if self.port_designated(&port, LV2_LATENCY) {
+                        classified.latency_output = Some(index);
+                    }
                     classified.control_outputs.push(index);
                 } else {
                     classified.hostable = false;
@@ -600,6 +614,9 @@ impl Host {
         let audio_outputs = classified.audio_outputs;
         let controls = classified.controls;
         let control_outputs = classified.control_outputs;
+        let latency_slot = classified
+            .latency_output
+            .and_then(|port| control_outputs.iter().position(|&index| index == port));
         let atom_inputs = classified.atom_inputs;
         let atom_outputs = classified.atom_outputs;
         let atom_min_sizes = classified.atom_min_sizes;
@@ -766,6 +783,7 @@ impl Host {
             main_input_count: classified.main_input_count,
             controls,
             control_outputs,
+            latency_slot,
             atom_inputs,
             atom_outputs,
             midi_buffers,
@@ -792,6 +810,8 @@ struct Classified {
     main_input_count: usize,
     controls: Vec<ControlPort>,
     control_outputs: Vec<usize>,
+    /// Index of the control output port designated `lv2:latency`, if any.
+    latency_output: Option<usize>,
     atom_inputs: Vec<usize>,
     atom_outputs: Vec<usize>,
     /// `(port index, resize-port:minimumSize)` for every atom port.
@@ -899,6 +919,8 @@ pub struct PluginInstance {
     main_input_count: usize,
     controls: Vec<ControlPort>,
     control_outputs: Vec<usize>,
+    /// Position in `control_output_buffers` of the `lv2:latency` port.
+    latency_slot: Option<usize>,
     atom_inputs: Vec<usize>,
     atom_outputs: Vec<usize>,
     midi_buffers: Vec<usize>,
@@ -1018,6 +1040,20 @@ impl PluginInstance {
 
     pub fn control_value(&self, param: usize) -> f32 {
         self.control_buffers.get(param).copied().unwrap_or(0.0)
+    }
+
+    /// Processing latency in frames, from the `lv2:latency` control output.
+    /// The plugin updates it while running; zero means no declared latency.
+    pub fn latency(&self) -> u32 {
+        let Some(slot) = self.latency_slot else {
+            return 0;
+        };
+        self.control_output_buffers
+            .get(slot)
+            .copied()
+            .unwrap_or(0.0)
+            .max(0.0)
+            .round() as u32
     }
 
     pub fn control_output_count(&self) -> usize {

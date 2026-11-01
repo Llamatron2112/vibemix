@@ -6,6 +6,27 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+### Added
+
+- **Automatic delay compensation (PDC) for sends and buses.** Each send now
+  receives the extra delay needed for every path into a bus (and into the
+  master) to arrive together, on top of its manual `delay_ms` alignment. Dry
+  paths are delayed to match latency-inducing FX buses, intermediate bus
+  inserts are included, and launcher playback is delayed by the same amount so
+  recorded loops stay aligned with live sources. The compensation is bounded by
+  the 500 ms send-delay capacity; a warning is logged if a path exceeds it.
+- **JACK output latency reporting.** Bus output ports report their actual
+  processing latency (`jack_port_set_latency_range`), including send PDC, bus
+  inserts and the master chain, so other JACK clients can compensate.
+- **Plugin latency changes are tracked while the engine runs.** Chain latency
+  is refreshed periodically (VST3/CLAP reported latency and the LV2
+  `lv2:latency` control output), and PDC, JACK reporting and the recorder's
+  automatic trim all follow the new value. Bypassed plugins no longer
+  contribute latency to the compensation.
+- **Recorder latency covers send and return paths.** Bus-output takes include
+  the send compensation and the bus inserts, and the trim is updated while a
+  take is armed or recording instead of being frozen at arm time.
+
 ### Fixed
 
 - **Real-time hardening.** LV2 URID lookups from the audio thread no longer

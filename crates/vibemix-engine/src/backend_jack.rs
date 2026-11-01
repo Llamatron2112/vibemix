@@ -3,7 +3,7 @@ use std::sync::Arc;
 
 use anyhow::{anyhow, Context, Result};
 use jack::{
-    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, MidiIn, MidiOut,
+    AudioIn, AudioOut, Client, ClientOptions, Control, Frames, LatencyType, MidiIn, MidiOut,
     NotificationHandler, Port, ProcessHandler, ProcessScope, RawMidi, Unowned,
 };
 use rtrb::{Consumer, Producer};
@@ -25,6 +25,7 @@ use crate::midi_map::SharedMidi;
 use crate::params::{
     SharedClock, SharedMeters, SharedParams, SharedRecorder, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
 };
+use crate::pdc::PdcPlan;
 
 const COMMAND_CAPACITY: usize = 64;
 
@@ -144,6 +145,7 @@ pub struct ScratchBuffers {
     bus_accum: Vec<[Vec<f32>; 2]>,
     bus_out: Vec<[Vec<f32>; 2]>,
     record_mix: [Vec<f32>; 2],
+    loop_scratch: [Vec<f32>; 2],
 }
 
 impl ScratchBuffers {
@@ -177,6 +179,7 @@ impl ScratchBuffers {
                 .map(|_| [vec![0.0; capacity], vec![0.0; capacity]])
                 .collect(),
             record_mix: [vec![0.0; capacity], vec![0.0; capacity]],
+            loop_scratch: [vec![0.0; capacity], vec![0.0; capacity]],
         }
     }
 }
@@ -399,6 +402,7 @@ pub enum EngineCommand {
     SetSampleRate {
         sample_rate: f32,
         delays: Vec<Vec<dsp::DelayLine>>,
+        loop_delay: dsp::DelayLine,
     },
     /// Swap in scratch buffers grown for a larger host period. The allocation
     /// happened on the control thread; the swap is applied at the top of the
@@ -491,6 +495,7 @@ struct MixerGraph {
     garbage_bus_chains: Producer<Vec<Vec<SlotPlugin>>>,
     garbage_nested: Producer<Vec<StripChains>>,
     garbage_delays: Producer<Vec<Vec<dsp::DelayLine>>>,
+    garbage_loop_delays: Producer<dsp::DelayLine>,
     strip_gain_smooth: Vec<f32>,
     strip_pan_smooth: Vec<f32>,
     strip_input_smooth: Vec<f32>,
@@ -498,6 +503,30 @@ struct MixerGraph {
     send_gain_smooth: Vec<Vec<f32>>,
     send_delay_smooth: Vec<Vec<f32>>,
     send_delays: Vec<Vec<dsp::DelayLine>>,
+    /// Automatic send/bus delay compensation, recomputed on the audio thread.
+    latency: PdcPlan,
+    /// Effective insert latency per strip chain and bus, cached and refreshed
+    /// periodically so plugin-initiated latency changes are picked up.
+    strip_pre_latency: Vec<u32>,
+    strip_post_latency: Vec<u32>,
+    bus_chain_latency: Vec<u32>,
+    /// Scratch copies of the bus routing flags, filled each block so the plan
+    /// never allocates.
+    pdc_bus_active: Vec<bool>,
+    pdc_bus_mix: Vec<bool>,
+    latency_accum: usize,
+    latency_dirty: bool,
+    /// Longest delay a send line can hold; also bounds the PDC plan.
+    max_pdc_frames: u32,
+    /// Launcher playback is delayed by this much to stay aligned with sends.
+    loop_delay: dsp::DelayLine,
+    loop_delay_smooth: f32,
+    loop_scratch: [Vec<f32>; 2],
+    /// Last values published to the control thread / JACK (avoids needless
+    /// port-latency updates and atomic stores every block).
+    published_pdc: u32,
+    published_pdc_limited: bool,
+    published_bus_latency: Vec<u32>,
     sample_rate: f32,
     /// Per-block smoothing coefficients, recomputed from the period each block.
     gain_coeff: f32,
@@ -597,6 +626,7 @@ impl MixerGraph {
                             }
                         }
                     }
+                    self.latency_dirty = true;
                 }
                 EngineCommand::RemovePlugin { strip, chain, slot } => {
                     if let Some(target) = self
@@ -611,6 +641,7 @@ impl MixerGraph {
                             }
                         }
                     }
+                    self.latency_dirty = true;
                 }
                 EngineCommand::MovePlugin {
                     strip,
@@ -628,6 +659,7 @@ impl MixerGraph {
                             target.insert(to, plugin);
                         }
                     }
+                    self.latency_dirty = true;
                 }
                 EngineCommand::ClearStrip { strip } => {
                     if let Some(chains) = self.plugin_chains.get_mut(strip) {
@@ -635,15 +667,19 @@ impl MixerGraph {
                             retire_plugins(chain, &mut self.garbage);
                         }
                     }
+                    self.latency_dirty = true;
                 }
-                EngineCommand::AddBusPlugin { bus, plugin } => match self.bus_chains.get_mut(bus) {
-                    Some(chain) if chain.len() < MAX_PLUGINS => chain.push(plugin),
-                    _ => {
-                        if let Err(plugin) = self.garbage.push(plugin) {
-                            std::mem::forget(plugin);
+                EngineCommand::AddBusPlugin { bus, plugin } => {
+                    match self.bus_chains.get_mut(bus) {
+                        Some(chain) if chain.len() < MAX_PLUGINS => chain.push(plugin),
+                        _ => {
+                            if let Err(plugin) = self.garbage.push(plugin) {
+                                std::mem::forget(plugin);
+                            }
                         }
                     }
-                },
+                    self.latency_dirty = true;
+                }
                 EngineCommand::RemoveBusPlugin { bus, slot } => {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
                         if slot < chain.len() {
@@ -653,6 +689,7 @@ impl MixerGraph {
                             }
                         }
                     }
+                    self.latency_dirty = true;
                 }
                 EngineCommand::MoveBusPlugin { bus, from, to } => {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
@@ -661,11 +698,13 @@ impl MixerGraph {
                             chain.insert(to, plugin);
                         }
                     }
+                    self.latency_dirty = true;
                 }
                 EngineCommand::ClearBus { bus } => {
                     if let Some(chain) = self.bus_chains.get_mut(bus) {
                         retire_plugins(chain, &mut self.garbage);
                     }
+                    self.latency_dirty = true;
                 }
                 EngineCommand::SetStripPorts { strip, in_l, in_r } => {
                     if let Some(slot) = self.strips.get_mut(strip) {
@@ -706,14 +745,20 @@ impl MixerGraph {
                     if let Err(old_bus) = self.garbage_bus_chains.push(old_bus) {
                         std::mem::forget(old_bus);
                     }
+                    self.latency_dirty = true;
                 }
                 EngineCommand::SetSampleRate {
                     sample_rate,
                     delays,
+                    loop_delay,
                 } => {
                     let old = std::mem::replace(&mut self.send_delays, delays);
                     if let Err(old) = self.garbage_delays.push(old) {
                         std::mem::forget(old);
+                    }
+                    let old_loop = std::mem::replace(&mut self.loop_delay, loop_delay);
+                    if let Err(old_loop) = self.garbage_loop_delays.push(old_loop) {
+                        std::mem::forget(old_loop);
                     }
                     let old_rate = self.sample_rate;
                     let ratio = if old_rate > 0.0 {
@@ -726,7 +771,15 @@ impl MixerGraph {
                             *value *= ratio;
                         }
                     }
+                    self.loop_delay_smooth *= ratio;
+                    self.max_pdc_frames = self
+                        .send_delays
+                        .first()
+                        .and_then(|row| row.first())
+                        .map(|line| line.max_samples() as u32)
+                        .unwrap_or(0);
                     self.sample_rate = sample_rate;
+                    self.latency_dirty = true;
                 }
                 EngineCommand::ResizeBuffers { capacity, buffers } => {
                     // Applied at the top of the block, before any borrow of
@@ -864,6 +917,7 @@ impl MixerGraph {
             bus_accum: std::mem::replace(&mut self.bus_accum, buffers.bus_accum),
             bus_out: std::mem::replace(&mut self.bus_out, buffers.bus_out),
             record_mix: std::mem::replace(&mut self.record_mix, buffers.record_mix),
+            loop_scratch: std::mem::replace(&mut self.loop_scratch, buffers.loop_scratch),
         };
         if let Err(old) = self.garbage_scratch.push(old) {
             // Ring sizes cover every queued command; overflow cannot happen,
@@ -888,20 +942,21 @@ impl MixerGraph {
             let latency = match kind {
                 RecorderSourceKind::Strip => match tap {
                     RecorderTap::Input | RecorderTap::Output => 0,
-                    RecorderTap::PreFader => self
-                        .plugin_chains
-                        .get(id)
-                        .map(|chains| chain_latency(&chains[0]))
-                        .unwrap_or(0),
+                    RecorderTap::PreFader => self.strip_pre_latency.get(id).copied().unwrap_or(0),
                     RecorderTap::PostFader => self
-                        .plugin_chains
+                        .strip_pre_latency
                         .get(id)
-                        .map(|chains| chain_latency(&chains[0]) + chain_latency(&chains[1]))
-                        .unwrap_or(0),
+                        .copied()
+                        .unwrap_or(0)
+                        .saturating_add(self.strip_post_latency.get(id).copied().unwrap_or(0)),
                 },
                 RecorderSourceKind::Bus => {
-                    if id != 0 && id < self.bus_chains.len() {
-                        chain_latency(&self.bus_chains[id])
+                    if id != 0 && id < self.bus_chain_latency.len() {
+                        // Bus output taps include everything the sends were
+                        // compensated for, then the bus's own inserts.
+                        self.latency
+                            .bus_input(id)
+                            .saturating_add(self.bus_chain_latency[id])
                     } else {
                         0
                     }
@@ -1071,6 +1126,82 @@ impl MixerGraph {
         }
     }
 
+    /// Recomputes the effective chain latencies and the automatic delay plan.
+    ///
+    /// Plugin latency can change at runtime (an oversampling switch, a
+    /// VST3 `kLatencyChanged`), so the chains are re-read periodically even
+    /// when the graph structure is unchanged. The plan itself is cheap and is
+    /// refreshed every block so enabling a send or moving a fader takes effect
+    /// immediately.
+    fn update_latency(&mut self, frames: usize) {
+        let refresh_every = ((self.sample_rate * 0.1) as usize).max(frames.max(1));
+        self.latency_accum = self.latency_accum.saturating_add(frames);
+        if self.latency_dirty || self.latency_accum >= refresh_every {
+            self.latency_accum = 0;
+            self.latency_dirty = false;
+            let params = &self.params;
+            for strip in 0..self.plugin_chains.len() {
+                self.strip_pre_latency[strip] =
+                    chain_latency(&self.plugin_chains[strip][0], |slot| {
+                        params.plugin_bypass(strip, 0, slot)
+                    });
+                self.strip_post_latency[strip] =
+                    chain_latency(&self.plugin_chains[strip][1], |slot| {
+                        params.plugin_bypass(strip, 1, slot)
+                    });
+            }
+            for bus in 0..self.bus_chains.len() {
+                self.bus_chain_latency[bus] = chain_latency(&self.bus_chains[bus], |slot| {
+                    params.bus_plugin_bypass(bus, slot)
+                });
+            }
+        }
+
+        for bus in 0..self.buses.len() {
+            self.pdc_bus_active[bus] = self.params.bus_active(bus);
+            self.pdc_bus_mix[bus] = self.params.bus_mix_master(bus);
+        }
+
+        let max_frames = self.max_pdc_frames;
+        let sample_rate = self.sample_rate;
+        let params = &self.params;
+        let plan = &mut self.latency;
+        plan.update(
+            &self.strip_pre_latency,
+            &self.strip_post_latency,
+            &self.bus_chain_latency,
+            &self.pdc_bus_active,
+            &self.pdc_bus_mix,
+            |strip, bus| params.send_gain(strip, bus),
+            |strip, bus| params.send_pre_fader(strip, bus),
+            |strip, bus| params.send_delay(strip, bus) * sample_rate / 1000.0,
+            max_frames,
+        );
+
+        let pdc = plan.master_input();
+        if pdc != self.published_pdc {
+            params.set_pdc_frames(pdc);
+            self.published_pdc = pdc;
+        }
+        let limited = plan.limited();
+        if limited != self.published_pdc_limited {
+            params.set_pdc_limited(limited);
+            self.published_pdc_limited = limited;
+        }
+        for bus in 0..self.bus_chain_latency.len() {
+            let latency = if params.bus_active(bus) {
+                plan.bus_input(bus)
+                    .saturating_add(self.bus_chain_latency[bus])
+            } else {
+                0
+            };
+            if self.published_bus_latency[bus] != latency {
+                params.set_bus_out_latency(bus, latency);
+                self.published_bus_latency[bus] = latency;
+            }
+        }
+    }
+
     fn process_strips(&mut self, scope: &ProcessScope, frames: usize, paused: bool) {
         let strip_count = self.strips.len();
         let bus_count = self.buses.len();
@@ -1214,7 +1345,8 @@ impl MixerGraph {
                     continue;
                 }
 
-                let delay_target = self.params.send_delay(index, bus) * self.sample_rate / 1000.0;
+                let delay_target = self.params.send_delay(index, bus) * self.sample_rate / 1000.0
+                    + self.latency.send_delay(index, bus) as f32;
                 let (delay_start, delay_end) = dsp::smooth_step(
                     &mut self.send_delay_smooth[index][bus],
                     delay_target,
@@ -1298,35 +1430,70 @@ impl MixerGraph {
     fn mix_loops(&mut self, frames: usize, beats_before: f64, beats_per_bar: f32, playing: bool) {
         let bar = bar_boundary_offset(self.transport_midi.as_slice(), beats_before, beats_per_bar);
         let gain_coeff = self.gain_coeff;
-        let (slots, [master_l, master_r]) = (&mut self.loop_slots, &mut self.bus_accum[0]);
-        for slot in slots.iter_mut() {
-            let Some(loop_slot) = slot.as_mut() else {
-                continue;
-            };
-            let start = if loop_slot.pending {
-                if loop_slot.quantized && playing {
-                    let Some(offset) = bar else {
-                        continue;
-                    };
-                    loop_slot.start();
-                    offset
-                } else {
-                    loop_slot.start();
+        self.loop_scratch[0][..frames].fill(0.0);
+        self.loop_scratch[1][..frames].fill(0.0);
+        let mut active = false;
+        {
+            let (slots, [loop_l, loop_r]) = (&mut self.loop_slots, &mut self.loop_scratch);
+            for slot in slots.iter_mut() {
+                let Some(loop_slot) = slot.as_mut() else {
+                    continue;
+                };
+                let start = if loop_slot.pending {
+                    if loop_slot.quantized && playing {
+                        let Some(offset) = bar else {
+                            continue;
+                        };
+                        loop_slot.start();
+                        offset
+                    } else {
+                        loop_slot.start();
+                        0
+                    }
+                } else if loop_slot.playing {
                     0
-                }
-            } else if loop_slot.playing {
-                0
-            } else {
-                continue;
-            };
-            loop_slot.mix(
-                &mut master_l[..frames],
-                &mut master_r[..frames],
-                start,
-                frames,
-                gain_coeff,
-            );
+                } else {
+                    continue;
+                };
+                loop_slot.mix(
+                    &mut loop_l[..frames],
+                    &mut loop_r[..frames],
+                    start,
+                    frames,
+                    gain_coeff,
+                );
+                active = true;
+            }
         }
+
+        // Launcher playback enters the master before the sends do, so it needs
+        // the same automatic delay as the slowest send path. Without this it
+        // would play early next to latency-compensated live sources.
+        let target = self.latency.master_input() as f32;
+        let (start, end) = dsp::smooth_step(&mut self.loop_delay_smooth, target, self.delay_coeff);
+        if !active && start == 0.0 && end == 0.0 {
+            self.loop_delay.invalidate();
+            return;
+        }
+        let [delayed_l, delayed_r] = &mut self.send_scratch;
+        self.loop_delay.process_ramp(
+            &self.loop_scratch[0][..frames],
+            &self.loop_scratch[1][..frames],
+            &mut delayed_l[..frames],
+            &mut delayed_r[..frames],
+            start,
+            end,
+        );
+        dsp::add_scaled(
+            &mut self.bus_accum[0][0][..frames],
+            &delayed_l[..frames],
+            1.0,
+        );
+        dsp::add_scaled(
+            &mut self.bus_accum[0][1][..frames],
+            &delayed_r[..frames],
+            1.0,
+        );
     }
 
     /// Sum the selected recorder sources for this block.
@@ -1495,6 +1662,7 @@ impl ProcessHandler for MixerGraph {
         let frames = raw_frames.min(self.capacity);
         self.gain_coeff = dsp::smoothing_coeff(frames, self.sample_rate, dsp::GAIN_SMOOTH_MS);
         self.delay_coeff = dsp::smoothing_coeff(frames, self.sample_rate, dsp::DELAY_SMOOTH_MS);
+        self.update_latency(frames);
 
         // MIDI: collect the block's events and advance clock/transport state.
         // `raw.time` is the frame offset within the block.
@@ -1739,6 +1907,11 @@ impl ProcessHandler for MixerGraph {
         self.mix_loops(frames, beats_before, beats_per_bar, playing);
         self.process_buses(scope, frames);
         self.build_record_mix(frames);
+        // Keep the take's automatic trim current if a plugin changes its
+        // latency while the recorder is armed or recording. Set it before the
+        // block is captured so a take that ends here uses this block's value.
+        self.recorder
+            .set_latency(self.buffer_size as u32 + self.source_latency_frames());
         self.recorder.process(
             frames,
             self.transport_midi.as_slice(),
@@ -1812,6 +1985,7 @@ pub struct JackEngine {
     garbage_scratch: Consumer<ScratchBuffers>,
     garbage_nested: Consumer<Vec<StripChains>>,
     garbage_delays: Consumer<Vec<Vec<dsp::DelayLine>>>,
+    garbage_loop_delays: Consumer<dsp::DelayLine>,
     garbage_order: Consumer<RetiredOrder>,
     take_rx: Consumer<RecordedTake>,
     loop_garbage_rx: Consumer<Box<[f32]>>,
@@ -1834,6 +2008,9 @@ pub struct JackEngine {
     strip_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
     strip_count: usize,
     bus_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
+    /// Last latency reported to JACK for each bus output, so the ports are
+    /// only touched when the value actually changes.
+    reported_bus_latency: Vec<u32>,
     bus_count: usize,
     bus_return_ports: Vec<Option<(Port<Unowned>, Port<Unowned>)>>,
     client_name: String,
@@ -1947,6 +2124,8 @@ impl JackEngine {
             rtrb::RingBuffer::<Vec<StripChains>>::new(garbage_nested_capacity);
         let (garbage_delays_producer, garbage_delays) =
             rtrb::RingBuffer::<Vec<Vec<dsp::DelayLine>>>::new(4);
+        let (garbage_loop_delays_producer, garbage_loop_delays) =
+            rtrb::RingBuffer::<dsp::DelayLine>::new(4);
         let (garbage_order_producer, garbage_order) = rtrb::RingBuffer::<RetiredOrder>::new(4);
         // Resizes are rare (a period growth) and synchronous per command, so
         // two pending slots cover any queue state.
@@ -1977,6 +2156,7 @@ impl JackEngine {
             garbage_bus_chains: garbage_bus_chains_producer,
             garbage_nested: garbage_nested_producer,
             garbage_delays: garbage_delays_producer,
+            garbage_loop_delays: garbage_loop_delays_producer,
             strip_gain_smooth: vec![0.0; strip_count],
             strip_pan_smooth: vec![0.0; strip_count],
             strip_input_smooth: vec![1.0; strip_count],
@@ -1990,6 +2170,20 @@ impl JackEngine {
                         .collect()
                 })
                 .collect(),
+            latency: PdcPlan::new(strip_count, bus_count),
+            strip_pre_latency: vec![0; strip_count],
+            strip_post_latency: vec![0; strip_count],
+            bus_chain_latency: vec![0; bus_count],
+            pdc_bus_active: vec![false; bus_count],
+            pdc_bus_mix: vec![false; bus_count],
+            latency_accum: 0,
+            latency_dirty: true,
+            max_pdc_frames: max_delay_samples as u32,
+            loop_delay: dsp::DelayLine::new(max_delay_samples),
+            loop_delay_smooth: 0.0,
+            published_pdc: u32::MAX,
+            published_pdc_limited: false,
+            published_bus_latency: vec![u32::MAX; bus_count],
             sample_rate: sample_rate as f32,
             gain_coeff: 1.0,
             paused: false,
@@ -2014,6 +2208,7 @@ impl JackEngine {
             bus_accum: scratch.bus_accum,
             bus_out: scratch.bus_out,
             record_mix: scratch.record_mix,
+            loop_scratch: scratch.loop_scratch,
             strip_order: (0..strip_count).collect(),
             strip_delayed: (0..strip_count)
                 .map(|_| {
@@ -2075,6 +2270,7 @@ impl JackEngine {
             garbage_scratch,
             garbage_nested,
             garbage_delays,
+            garbage_loop_delays,
             garbage_order,
             take_rx,
             loop_garbage_rx,
@@ -2094,6 +2290,7 @@ impl JackEngine {
             strip_ports,
             strip_count,
             bus_ports,
+            reported_bus_latency: vec![u32::MAX; bus_count],
             bus_count,
             bus_return_ports,
             client_name: client_name.to_string(),
@@ -2266,11 +2463,13 @@ impl JackEngine {
         &mut self,
         sample_rate: f32,
         delays: Vec<Vec<dsp::DelayLine>>,
+        loop_delay: dsp::DelayLine,
     ) -> Result<()> {
         self.commands
             .push(EngineCommand::SetSampleRate {
                 sample_rate,
                 delays,
+                loop_delay,
             })
             .map_err(|_| anyhow!("engine command queue full"))?;
         self.graph_sample_rate = sample_rate as u32;
@@ -2551,6 +2750,10 @@ impl JackEngine {
             return Err(anyhow!("engine command queue full"));
         }
         self.bus_ports[bus] = Some(handles);
+        // A freshly registered port starts at zero latency; force a report.
+        if let Some(slot) = self.reported_bus_latency.get_mut(bus) {
+            *slot = u32::MAX;
+        }
 
         if self.auto_connect && bus == 0 {
             let client = self.active.as_client();
@@ -2586,6 +2789,9 @@ impl JackEngine {
         let client = self.active.as_client();
         let _ = client.unregister_port(out_l);
         let _ = client.unregister_port(out_r);
+        if let Some(slot) = self.reported_bus_latency.get_mut(bus) {
+            *slot = u32::MAX;
+        }
         Ok(())
     }
 
@@ -3117,12 +3323,32 @@ impl JackEngine {
         Ok(())
     }
 
+    /// Publishes the graph's current output latency to JACK. Only changed
+    /// values reach the client; called from the control loop, never the audio
+    /// callback.
+    pub fn report_latency(&mut self, params: &SharedParams) {
+        for bus in 0..self.bus_ports.len() {
+            let latency = params.bus_out_latency(bus);
+            if self.reported_bus_latency.get(bus).copied() == Some(latency) {
+                continue;
+            }
+            if let Some((left, right)) = self.bus_ports[bus].as_ref() {
+                left.set_latency_range(LatencyType::Playback, (latency, latency));
+                right.set_latency_range(LatencyType::Playback, (latency, latency));
+            }
+            if let Some(slot) = self.reported_bus_latency.get_mut(bus) {
+                *slot = latency;
+            }
+        }
+    }
+
     pub fn drain_garbage(&mut self) {
         while self.garbage.pop().is_ok() {}
         while self.garbage_bus_chains.pop().is_ok() {}
         while self.garbage_scratch.pop().is_ok() {}
         while self.garbage_nested.pop().is_ok() {}
         while self.garbage_delays.pop().is_ok() {}
+        while self.garbage_loop_delays.pop().is_ok() {}
         while self.garbage_order.pop().is_ok() {}
         while self.loop_garbage_rx.pop().is_ok() {}
     }
@@ -3146,8 +3372,16 @@ fn chain_is_active(chain: &[SlotPlugin], bypassed: impl Fn(usize) -> bool) -> bo
         .any(|(slot, plugin)| !matches!(plugin, SlotPlugin::Missing) && !bypassed(slot))
 }
 
-fn chain_latency(chain: &[SlotPlugin]) -> u32 {
-    chain.iter().map(|plugin| plugin.latency()).sum()
+/// Sums the processing latency of the plugins that actually run. A fully
+/// bypassed plugin is skipped by the chain and contributes no delay.
+fn chain_latency(chain: &[SlotPlugin], bypassed: impl Fn(usize) -> bool) -> u32 {
+    chain
+        .iter()
+        .enumerate()
+        .filter(|(slot, plugin)| !matches!(plugin, SlotPlugin::Missing) && !bypassed(*slot))
+        .fold(0u32, |total, (_, plugin)| {
+            total.saturating_add(plugin.latency())
+        })
 }
 
 /// Which insert chain a plugin runs in.

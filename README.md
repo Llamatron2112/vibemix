@@ -16,7 +16,9 @@ small OSC control protocol.
   fader/pan/mute/solo, and per-bus sends.
 - Bus inserts, mix-to-master submixes, and **external aux returns** (insert
   semantics: a pre-fader `SEND`, a `RET` trim, and the bus fader post-device).
-- Per-send **alignment delay** (0–500 ms) to phase-align parallel paths.
+- Per-send **alignment delay** (0–500 ms) to phase-align parallel paths, plus
+  **automatic delay compensation** for bus inserts, parallel sends and the
+  master path. Bus output latency is reported to JACK.
 - **Plugin hosting: LV2, VST3 and CLAP** (audio effects; MIDI passthrough;
   sidechain where the plugin exposes it).
 - **Plugin browser** with a name filter, per-format/channel/sidechain/failed
@@ -31,7 +33,8 @@ small OSC control protocol.
   launch, and an unsaved-changes prompt.
 - Metering with selectable taps (strip IN/GAIN/OUT; bus IN/SEND/RET/OUT).
 - **Loop recorder** with bar-aligned capture from the MIDI clock, multi-source
-  strip/bus taps, automatic latency and transient alignment, circular nudge,
+  strip/bus taps, automatic latency (including send/bus paths and live plugin
+  changes) and transient alignment, circular nudge,
   a loop launcher, a native save dialog that remembers the last folder, optional
   -1 dBFS normalization, and 16/24-bit or 32-bit float export. The editor is a
   free pan/zoom waveform:

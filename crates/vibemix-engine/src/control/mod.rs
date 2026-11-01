@@ -229,6 +229,8 @@ pub struct Controller {
     recorder_dirty: bool,
     loops_dirty: bool,
     pending_waveform: Option<PendingWaveform>,
+    /// Last "PDC exceeded the delay capacity" state reported to the log.
+    pdc_limited_reported: bool,
 }
 
 /// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
@@ -472,6 +474,7 @@ impl Controller {
             recorder_dirty: false,
             loops_dirty: true,
             pending_waveform: None,
+            pdc_limited_reported: false,
         };
         controller.ensure_model_plugin_controls();
         controller
@@ -657,6 +660,20 @@ impl Controller {
                 }
             }
 
+            // Publish output latency to JACK so other clients can compensate.
+            self.engine.report_latency(&self.params);
+            let pdc_limited = self.params.pdc_limited();
+            if pdc_limited != self.pdc_limited_reported {
+                if pdc_limited {
+                    tracing::warn!(
+                        pdc_frames = self.params.pdc_frames(),
+                        limit_ms = vibemix_core::model::MAX_SEND_DELAY_MS,
+                        "automatic latency compensation exceeds the send-delay limit"
+                    );
+                }
+                self.pdc_limited_reported = pdc_limited;
+            }
+
             // A MIDI control-surface CC changed a parameter; push it to the UI
             // immediately instead of waiting for the next state query.
             if self.engine.midi_map().take_changed() {
@@ -835,7 +852,8 @@ impl Controller {
                     .collect()
             })
             .collect();
-        if let Err(error) = self.engine.set_sample_rate(sample_rate, delays) {
+        let loop_delay = dsp::DelayLine::new(max_delay_samples);
+        if let Err(error) = self.engine.set_sample_rate(sample_rate, delays, loop_delay) {
             tracing::warn!(%error, "failed to push sample-rate change");
         }
         self.sample_rate = rate;

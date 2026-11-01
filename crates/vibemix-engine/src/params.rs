@@ -64,6 +64,12 @@ pub struct SharedParams {
     clock_send_transport: AtomicBool,
     clock_receive_transport: AtomicBool,
     clock_restart: AtomicBool,
+    /// Automatic compensation applied to launcher playback (frames).
+    pdc_frames: AtomicU32,
+    /// Automatic compensation hit the send-delay capacity and is incomplete.
+    pdc_limited: AtomicBool,
+    /// Actual latency at each bus output port (frames), for JACK reporting.
+    bus_out_latency: Vec<AtomicU32>,
 }
 
 impl SharedParams {
@@ -135,6 +141,38 @@ impl SharedParams {
             clock_send_transport: AtomicBool::new(true),
             clock_receive_transport: AtomicBool::new(true),
             clock_restart: AtomicBool::new(false),
+            pdc_frames: AtomicU32::new(0),
+            pdc_limited: AtomicBool::new(false),
+            bus_out_latency: (0..bus_count).map(|_| AtomicU32::new(0)).collect(),
+        }
+    }
+
+    pub fn pdc_frames(&self) -> u32 {
+        self.pdc_frames.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pdc_frames(&self, frames: u32) {
+        self.pdc_frames.store(frames, Ordering::Relaxed);
+    }
+
+    pub fn pdc_limited(&self) -> bool {
+        self.pdc_limited.load(Ordering::Relaxed)
+    }
+
+    pub fn set_pdc_limited(&self, value: bool) {
+        self.pdc_limited.store(value, Ordering::Relaxed);
+    }
+
+    pub fn bus_out_latency(&self, bus: usize) -> u32 {
+        self.bus_out_latency
+            .get(bus)
+            .map(|value| value.load(Ordering::Relaxed))
+            .unwrap_or(0)
+    }
+
+    pub fn set_bus_out_latency(&self, bus: usize, frames: u32) {
+        if let Some(slot) = self.bus_out_latency.get(bus) {
+            slot.store(frames, Ordering::Relaxed);
         }
     }
 

@@ -156,6 +156,21 @@ bus) can be phase-aligned per send. The GUI entry accepts `ms`, seconds (`s`) or
 samples (`smp`/`samples`); a bare number is milliseconds, and the value is shown
 with 3-decimal ms plus a samples tooltip. Bus 0 is the master and is
 auto-connected to system playback.
+
+On top of the manual delay, the engine applies **automatic delay
+compensation**. Every block it computes the latency of each strip tap and bus
+insert chain and gives each send the extra delay needed for its path into the
+destination to match the slowest path. For buses that reach master the target
+is global, including intermediate bus inserts; for a hardware-only bus the
+sends are aligned locally so a separate monitor output does not inherit the
+master's latency. Launcher playback is delayed by the same master target, so a
+loop stays aligned with compensated live sources. The plan is bounded by the
+500 ms send-delay capacity; a path beyond it is clamped and the control thread
+logs a warning. The values are published to JACK with
+`jack_port_set_latency_range`, so each bus output port reports its actual
+latency (send compensation + bus inserts; the master also includes its own
+chain).
+
 Each bus sums its incoming sends, runs its own LV2 insert chain, applies
 gain/mute, and drives its JACK output ports (`{slug}_out_l/r`) — so a bus can be a
 hardware tap (sampling) or a monitor out. A bus can also **mix to master**
@@ -246,7 +261,7 @@ available again.
 Audio path per strip:
 
 ```
-input -> input trim -> pre-fader inserts (stereo) -> gain/pan -> post-fader inserts -> sends (x gain, + delay) -> bus accumulators
+input -> input trim -> pre-fader inserts (stereo) -> gain/pan -> post-fader inserts -> sends (x gain, + manual delay + PDC) -> bus accumulators
 ```
 
 Bus path:
@@ -254,6 +269,12 @@ Bus path:
 ```
 sum of sends -> bus inserts (stereo) -> bus gain/mute -> output ports + optional mix to master
 ```
+
+The master input also receives launcher playback through a delay line set to
+the same master PDC target. A fully bypassed insert is not run and contributes
+no latency; chain latency is re-read periodically so a plugin that changes its
+reported latency (VST3/CLAP, or an LV2 port designated `lv2:latency`) updates
+the compensation without a restart.
 
 A bus with an external return (`return_inputs`, non-master only) is an insert:
 the post-insert signal leaves `{slug}_out_l/r` pre-fader for the device (scaled
@@ -386,8 +407,9 @@ button. Host-driven parameter edits reach the editor through
 back into the shared parameter state via an `IComponentHandler::performEdit`
 queue (mirroring the LV2 `ui:portEvent` write-back), so they survive session
 saves and are pushed to the DSP. `restartComponent` is observed as well:
-`kParamValuesChanged` resyncs the shared values, and latency/IO/reload requests
-are logged. Opening an editor is gated by a headless child smoke test
+`kParamValuesChanged` resyncs the shared values; latency changes are picked up
+by the periodic chain-latency refresh (no graph restart needed), while IO and
+reload requests are logged. Opening an editor is gated by a headless child smoke test
 (`--smoke-vst3-ui`), and the editor button is only shown when the plugin
 reports an X11-editable view.
 
@@ -623,8 +645,11 @@ through a separate launcher window.
   frames rather than a rounded BPM calculation.
 - A finished take is handed back through an `rtrb` queue. The control thread
   trims it, applies the automatic offset (JACK buffer + plugin latency up to
-  the tap), optionally refines it with transient detection, and applies the
-  manual offset. All offsets are a circular rotation:
+  the tap; for a bus output this includes the send compensation and the bus
+  inserts), optionally refines it with transient detection, and applies the
+  manual offset. The audio thread keeps the automatic offset current while the
+  recorder is armed, so a plugin latency change mid-take is reflected in the
+  finished take. All offsets are a circular rotation:
   `out[i] = in[(i + nudge) mod frames]`.
 - The launcher installs the raw buffer through the command queue and keeps the
   rotation as a playback offset (`(pos + offset) mod frames`); nudging sends a

@@ -132,6 +132,14 @@ impl Recorder {
         shared.set_state(RecorderState::Armed);
     }
 
+    /// Updates the latency trimmed from the finished take. Plugin latencies can
+    /// change while a take is running, so the latest value is used when it ends.
+    pub fn set_latency(&mut self, latency_frames: u32) {
+        if self.state != State::Idle {
+            self.latency_frames = latency_frames;
+        }
+    }
+
     pub fn cancel(&mut self, garbage: &mut Producer<Box<[f32]>>, shared: &SharedRecorder) {
         if let Some(buffer) = self.buffer.take() {
             if let Err(buffer) = garbage.push(buffer) {
@@ -608,6 +616,48 @@ mod tests {
         // The undelivered buffer went to the garbage queue (and was not lost).
         assert!(garbage_rx.pop().is_ok());
         assert!(garbage_rx.pop().is_err());
+    }
+
+    #[test]
+    fn latency_change_before_the_take_finishes_is_applied() {
+        let shared = SharedRecorder::new();
+        let (mut take_tx, mut take_rx) = rtrb::RingBuffer::<RecordedTake>::new(2);
+        let (mut garbage_tx, _garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(2);
+        let mut recorder = Recorder::new();
+        recorder.arm(
+            vec![0.0; 8 * 2].into_boxed_slice(),
+            8,
+            4,
+            2,
+            0,
+            1.0,
+            &shared,
+        );
+        // A plugin latency change while armed must reach the finished take.
+        recorder.set_latency(1_234);
+
+        let left = [0.1, 0.2, 0.3, 0.4];
+        let right = [1.0, 2.0, 3.0, 4.0];
+        let events = [
+            MidiEvent::new(0, &[START]),
+            MidiEvent::new(2, &[CLOCK]),
+            MidiEvent::new(3, &[CLOCK]),
+        ];
+        recorder.process(
+            4,
+            &events,
+            0.0,
+            4.0,
+            &left,
+            &right,
+            48_000,
+            &shared,
+            &mut take_tx,
+            &mut garbage_tx,
+        );
+
+        let take = take_rx.pop().expect("take");
+        assert_eq!(take.latency_frames, 1_234);
     }
 
     #[test]

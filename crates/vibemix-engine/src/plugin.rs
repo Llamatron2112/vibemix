@@ -110,6 +110,10 @@ impl PluginNode for vibemix_lv2::PluginInstance {
     fn write_sidechain(&mut self, left: &[f32], right: &[f32]) {
         vibemix_lv2::PluginInstance::write_sidechain(self, left, right);
     }
+
+    fn latency(&self) -> u32 {
+        vibemix_lv2::PluginInstance::latency(self)
+    }
 }
 
 impl PluginNode for vibemix_vst3::PluginInstance {
