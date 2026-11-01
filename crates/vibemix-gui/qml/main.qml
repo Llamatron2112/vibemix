@@ -5018,10 +5018,6 @@ ApplicationWindow {
         modality: Qt.NonModal
         flags: Qt.Window
         transientParent: root
-        onClosing: {
-            if (loopEditor.alignMode) loopEditor.storeExportSettings()
-            loopEditor.stopPreview()
-        }
         visible: false
         width: 560
         height: 720
@@ -6604,8 +6600,8 @@ ApplicationWindow {
             })
             previewPlaying = true
         }
-        function stopPreview() {
-            if (!previewPlaying) return
+        function stopPreview(force) {
+            if (!previewPlaying && force !== true) return
             root.sendRecorderAction({ action: "loop_preview_stop" })
             previewPlaying = false
         }
@@ -6816,7 +6812,7 @@ ApplicationWindow {
             })
         }
         function openFor(id) {
-            stopPreview()
+            stopPreview(true)
             slotId = id
             waveNudge = displayTotalMod()
             editorPeaks = []
@@ -6898,6 +6894,13 @@ ApplicationWindow {
         modality: Qt.NonModal
         flags: Qt.Window
         transientParent: root
+        onClosing: {
+            if (loopEditor.alignMode) loopEditor.storeExportSettings()
+            loopEditor.stopPreview(true)
+        }
+        onVisibleChanged: {
+            if (!visible) loopEditor.stopPreview(true)
+        }
         visible: false
         width: 620
         height: 620
