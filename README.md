@@ -100,8 +100,8 @@ small OSC control protocol.
   starts/stops the internal 24 PPQN clock; stop resets to zero, so play always
   sends `START`. The generated clock is sample-accurate and drift-free.
   While playing, click the loop indicator to restart at the next bar; a
-  `START` is sent in the gap after the last clock pulse and both the internal
-  and external transport reset on the new bar.
+  `START` is sent on that bar's first clock pulse and both the internal and
+  external transport reset on the new bar.
 - **MIDI bindings…**: right-click a mute/solo cell → Learn (MIDI CC) or
   **Learn key** (press a key or combo; Esc cancels, Backspace clears).
 

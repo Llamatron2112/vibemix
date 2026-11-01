@@ -818,8 +818,8 @@ slave mode it is silent for clock but can forward start/stop.
   menu, which also toggles the beats:bars and minutes:seconds counters.
   In master mode the BPM readout opens a tempo dialog and the transport button
   starts/stops the internal clock. Clicking the loop indicator while playing
-  schedules a START in the gap after the current bar's last clock pulse and
-  resets the transport at the next bar, in both master and slave modes.
+  schedules a START on the next bar's first clock pulse and resets the transport
+  on that bar, in both master and slave modes.
   Right-clicking the record dot opens a non-modal popover with loop length and
   unit, beats per bar, bit depth and the save folder; left-click arms/disarms.
   `Options → MIDI sync…` is a non-modal page

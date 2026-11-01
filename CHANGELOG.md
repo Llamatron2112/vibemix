@@ -70,6 +70,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Restart at the next bar now starts on the bar itself.** The engine used to
+  emit `START` just after the previous bar's last clock pulse, one 24th note
+  before the new bar; recorder takes and launcher loops therefore began one
+  pulse early. `START` now shares the new bar's first clock pulse in both
+  master and slave modes, so every bar-based consumer starts on the same
+  downbeat.
 - **Real-time hardening.** LV2 URID lookups from the audio thread no longer
   lock or allocate; the JACK period-change warning moved off the callback;
   VST3 event and parameter queues are preallocated; CLAP host logging from the
