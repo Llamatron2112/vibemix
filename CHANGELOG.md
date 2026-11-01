@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Real-time hardening.** LV2 URID lookups from the audio thread no longer
+  lock or allocate; the JACK period-change warning moved off the callback;
+  VST3 event and parameter queues are preallocated; CLAP host logging from the
+  audio thread is suppressed. Session/WAV/recorder/period sizes are capped,
+  empty sessions keep their loops and settings, oversized UI atoms are counted
+  instead of truncated, and saved MIDI peers are bounded.
 - **A finished loop take can no longer be lost silently.** The take queue
   between the audio and control threads now reports a dedicated discard reason
   (with a recorder status message) when it fills, is deeper (8), and the

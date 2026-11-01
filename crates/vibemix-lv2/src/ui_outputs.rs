@@ -15,6 +15,8 @@ pub struct SharedOutputs {
     control_values: Box<[AtomicU32]>,
     atom_ports: Box<[u32]>,
     atoms: Box<[AtomSlot]>,
+    /// Output atoms skipped because they exceeded the port's buffer.
+    dropped: AtomicU64,
 }
 
 struct AtomSlot {
@@ -50,6 +52,7 @@ impl SharedOutputs {
                     }
                 })
                 .collect(),
+            dropped: AtomicU64::new(0),
         }
     }
 
@@ -133,17 +136,28 @@ impl SharedOutputs {
         let Some(slot) = self.atoms.get(index) else {
             return;
         };
+        if bytes.len() > slot_buffer_len(slot) {
+            // A truncated atom is invalid for the UI; keep the previous one
+            // and surface the loss instead.
+            self.dropped.fetch_add(1, Ordering::Relaxed);
+            return;
+        }
         let seq = slot.seq.load(Ordering::Relaxed);
         slot.seq.store(seq.wrapping_add(1), Ordering::Release);
         // SAFETY: single writer (audio thread); readers use the seqlock.
         unsafe {
             let buffer = &mut *slot.buffer.get();
-            let len = bytes.len().min(buffer.len());
+            let len = bytes.len();
             buffer[..len].copy_from_slice(&bytes[..len]);
             slot.len.store(len, Ordering::Relaxed);
             slot.format.store(format, Ordering::Relaxed);
         }
         slot.seq.store(seq.wrapping_add(2), Ordering::Release);
+    }
+
+    /// Output atoms skipped because they exceeded the destination buffer.
+    pub fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
     }
 }
 
@@ -318,5 +332,18 @@ mod tests {
             assert_eq!(bytes, &[9, 9]);
         });
         assert_eq!(inputs.dropped(), 8);
+    }
+
+    #[test]
+    fn oversize_output_atom_is_skipped_and_counted() {
+        let outputs = SharedOutputs::new(&[], &[0], &[4]);
+        outputs.set_active(true);
+        outputs.publish_atom(0, &[1, 2, 3, 4, 5], 0x1234);
+        assert_eq!(outputs.dropped(), 1);
+        outputs.publish_atom(0, &[9, 8], 0xbeef);
+        let (bytes, format) = outputs.read_atom(0).expect("atom");
+        assert_eq!(&bytes[..], &[9, 8]);
+        assert_eq!(format, 0xbeef);
+        assert_eq!(outputs.dropped(), 1);
     }
 }

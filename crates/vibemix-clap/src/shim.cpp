@@ -251,6 +251,9 @@ static Hosted* self(const clap_host_t* host) {
 // ---------------------------------------------------------------------------
 
 static void host_log(const clap_host_t*, clap_log_severity severity, const char* msg) {
+  // Never touch stderr from the audio callback: a plugin can log during
+  // process, where stdio may allocate or block.
+  if (tls_audio_thread) return;
   if (severity >= CLAP_LOG_WARNING && msg) std::fprintf(stderr, "[clap] %s\n", msg);
 }
 

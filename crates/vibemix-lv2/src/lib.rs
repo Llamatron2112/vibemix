@@ -2,6 +2,7 @@ mod atom;
 #[cfg(test)]
 mod fuzz_tests;
 pub mod host;
+pub mod rt;
 mod state;
 pub mod ui;
 pub mod ui_ipc;

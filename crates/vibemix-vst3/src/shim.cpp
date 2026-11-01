@@ -432,6 +432,12 @@ void* vst3_open(const char* bundle, const char* class_id, double sample_rate, in
     }
 
     auto* hosted = new Hosted(module, factory);
+    // Preallocate the audio-thread event/parameter containers. The VST3
+    // defaults (50 events, no parameter queues) can allocate on the first
+    // `process`.
+    hosted->events.setMaxSize(512);
+    hosted->changes.setMaxParameters(64);
+    hosted->out_changes.setMaxParameters(64);
     PluginContextFactory::instance().setPluginContext(&hosted->host_app);
     hosted->provider = std::make_unique<PlugProvider>(factory, chosen);
     if (!hosted->provider->initialize()) {
@@ -684,10 +690,12 @@ void vst3_set_param(void* handle, int index, float normalized) {
     if (!hosted || index < 0 || index >= static_cast<int>(hosted->param_ids.size())) return;
     const ParamID id = hosted->param_ids[index];
     if (id == kNoParamId || hosted->last_param[index] == normalized) return;
-    hosted->last_param[index] = normalized;
     int32 queue_index = 0;
-    if (auto* queue = hosted->changes.addParameterData(id, queue_index))
-        queue->addPoint(0, normalized, queue_index);
+    if (auto* queue = hosted->changes.addParameterData(id, queue_index)) {
+        int32 point_index = 0;
+        if (queue->addPoint(0, normalized, point_index) == kResultTrue)
+            hosted->last_param[index] = normalized;
+    }
 }
 
 float vst3_get_param(void* handle, int index) {

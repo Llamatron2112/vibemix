@@ -29,6 +29,7 @@ impl AudioScope {
     #[inline]
     pub fn enter() -> Self {
         IN_AUDIO.with(|flag| flag.set(true));
+        vibemix_lv2::rt::set_audio_thread(true);
         AudioScope
     }
 }
@@ -37,6 +38,7 @@ impl Drop for AudioScope {
     #[inline]
     fn drop(&mut self) {
         IN_AUDIO.with(|flag| flag.set(false));
+        vibemix_lv2::rt::set_audio_thread(false);
     }
 }
 

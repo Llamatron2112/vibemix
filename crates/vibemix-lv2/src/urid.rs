@@ -125,6 +125,15 @@ impl UridMap {
     }
 
     fn intern(&self, uri: &str) -> u32 {
+        // The map feature can be called by a plugin from the audio callback.
+        // Never block or allocate there: return only an already-mapped URID
+        // (0 when it is new or the map is being updated by the control thread).
+        if crate::rt::in_audio_thread() {
+            let Ok(guard) = self.inner.try_lock() else {
+                return 0;
+            };
+            return guard.by_uri.get(uri).copied().unwrap_or(0);
+        }
         let mut guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         if let Some(id) = guard.by_uri.get(uri) {
             return *id;
@@ -138,6 +147,15 @@ impl UridMap {
     fn lookup(&self, urid: u32) -> *const c_char {
         if urid == 0 {
             return ptr::null();
+        }
+        if crate::rt::in_audio_thread() {
+            let Ok(guard) = self.inner.try_lock() else {
+                return ptr::null();
+            };
+            return guard
+                .by_id
+                .get((urid - 1) as usize)
+                .map_or(ptr::null(), |value| value.as_ptr());
         }
         let guard = self.inner.lock().unwrap_or_else(|error| error.into_inner());
         match guard.by_id.get((urid - 1) as usize) {
@@ -164,4 +182,33 @@ extern "C" fn urid_unmap(handle: LV2UridMapHandle, urid: LV2Urid) -> *const c_ch
     }
     let host = unsafe { &*(handle as *const UridMap) };
     host.lookup(urid)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn audio_thread_map_never_blocks_or_allocates() {
+        let map = UridMap::shared();
+        let uri = "urn:vibemix:test:urid:audio";
+        let id = map.map(uri);
+        assert_ne!(id, 0);
+
+        crate::rt::set_audio_thread(true);
+        // Cached lookups are fine and allocation-free.
+        assert_eq!(map.map(uri), id);
+        assert!(!map.lookup(id).is_null());
+        // A new URI cannot be inserted from the audio thread.
+        assert_eq!(map.map("urn:vibemix:test:urid:new-in-audio"), 0);
+
+        // If the control thread holds the map, the audio path does not block.
+        let guard = map.inner.lock().unwrap();
+        assert_eq!(map.map(uri), 0);
+        assert!(map.lookup(id).is_null());
+        drop(guard);
+
+        crate::rt::set_audio_thread(false);
+        assert_eq!(map.map(uri), id);
+    }
 }

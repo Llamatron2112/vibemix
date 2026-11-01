@@ -648,6 +648,10 @@ impl Controller {
             // buffers; resize through the command queue (the allocation is
             // done here, the audio thread only swaps pointers).
             if let Some(size) = self.engine.take_pending_buffer_size() {
+                tracing::warn!(
+                    size,
+                    "host period exceeds scratch capacity; resizing scratch buffers"
+                );
                 if let Err(error) = self.engine.resize_buffers(size) {
                     tracing::warn!(%error, size, "failed to resize engine scratch buffers");
                 }

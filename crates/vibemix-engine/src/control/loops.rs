@@ -121,6 +121,11 @@ pub(super) fn read_loop_wav(path: &Path, expected_rate: u32) -> anyhow::Result<(
             expected_rate
         );
     }
+    const MAX_LOOP_SECONDS: u64 = 300;
+    let max_frames = expected_rate as u64 * MAX_LOOP_SECONDS;
+    if reader.len() as u64 > max_frames {
+        anyhow::bail!("loop is longer than {} minutes", MAX_LOOP_SECONDS / 60);
+    }
 
     let mut out = Vec::new();
     match (spec.sample_format, spec.bits_per_sample) {
@@ -465,7 +470,14 @@ impl Controller {
             return;
         }
         let capacity = (capacity_frames + sample_rate).min(cap);
-        let buffer = vec![0.0f32; capacity * 2].into_boxed_slice();
+        let mut buffer = Vec::new();
+        if buffer.try_reserve_exact(capacity * 2).is_err() {
+            self.recorder_status.message = "not enough memory for the loop buffer".to_string();
+            self.recorder_dirty = true;
+            return;
+        }
+        buffer.resize(capacity * 2, 0.0f32);
+        let buffer = buffer.into_boxed_slice();
         let loop_pulses = (loop_beats * 24.0).round().max(1.0) as u32;
 
         match self

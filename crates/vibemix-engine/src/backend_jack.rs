@@ -28,6 +28,10 @@ use crate::params::{
 
 const COMMAND_CAPACITY: usize = 64;
 
+/// Refuse pathological host periods that would allocate gigabytes of scratch
+/// buffers. A million frames is already far beyond any musical period.
+const MAX_PERIOD_FRAMES: usize = 1 << 20;
+
 /// How many finished takes can wait for the control thread. Depth covers
 /// back-to-back loop captures even while a previous take is being analyzed.
 const TAKE_RING_DEPTH: usize = 8;
@@ -1792,15 +1796,9 @@ impl ProcessHandler for MixerGraph {
         if size > self.capacity {
             // The control thread will allocate larger scratch buffers and
             // swap them in; until then frames beyond the capacity are
-            // zero-filled rather than replaying stale samples.
+            // zero-filled rather than replaying stale samples. Logging stays
+            // on the control thread.
             self.pending_period.store(size as u32, Ordering::SeqCst);
-            tracing::warn!(
-                size,
-                capacity = self.capacity,
-                "host period exceeds buffer capacity; resizing scratch buffers"
-            );
-        } else {
-            tracing::debug!(size, "host period changed");
         }
         Control::Continue
     }
@@ -1861,6 +1859,9 @@ impl JackEngine {
         let bus_count = params.bus_count();
         let sample_rate = client.sample_rate() as f64;
         let buffer_size = client.buffer_size() as usize;
+        if buffer_size > MAX_PERIOD_FRAMES {
+            anyhow::bail!("host period {buffer_size} exceeds the {MAX_PERIOD_FRAMES}-frame limit");
+        }
         // Buffer capacity is fixed for the client's lifetime so the audio
         // callback never allocates; periods larger than this are truncated.
         let capacity = buffer_size.max(PluginInstance::max_frames());
@@ -2227,6 +2228,9 @@ impl JackEngine {
     /// `capacity`. Applied on the audio thread at the top of the next block:
     /// the swap is pointer moves, the allocation happened here.
     pub fn resize_buffers(&mut self, capacity: usize) -> Result<()> {
+        if capacity > MAX_PERIOD_FRAMES {
+            anyhow::bail!("host period {capacity} exceeds the {MAX_PERIOD_FRAMES}-frame limit");
+        }
         self.commands
             .push(EngineCommand::ResizeBuffers {
                 capacity,
@@ -3589,15 +3593,21 @@ fn rename_port(client: *mut jack::jack_sys::jack_client_t, port: &mut Port<Unown
 
 /// Keep saved MIDI peers whose JACK port is currently absent, so a device that
 /// enumerates late is not dropped from the session by the next save. A peer
-/// that exists but is disconnected is intentionally omitted.
+/// that exists but is disconnected is intentionally omitted. The list is
+/// bounded so a long history of vanished ports cannot grow the session without
+/// limit.
 fn merge_missing_connections(
     current: Vec<String>,
     saved: Option<&[String]>,
     exists: &dyn Fn(&str) -> bool,
 ) -> Vec<String> {
+    const MAX_MIDI_PEERS: usize = 64;
     let mut out = current;
     if let Some(saved) = saved {
         for name in saved {
+            if out.len() >= MAX_MIDI_PEERS {
+                break;
+            }
             if !out.iter().any(|entry| entry == name) && !exists(name) {
                 out.push(name.clone());
             }

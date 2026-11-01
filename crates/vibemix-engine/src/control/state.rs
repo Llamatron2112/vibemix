@@ -330,15 +330,39 @@ pub fn clamp_to_capacity(model: &mut MixerModel, strips: usize, buses: usize) {
     }
 
     if model.strips.is_empty() || model.buses.is_empty() {
-        *model = MixerModel::default_minimal();
+        // Preserve loops, clock, recorder and MIDI settings; only supply the
+        // missing strip/bus skeleton.
+        let default = MixerModel::default_minimal();
+        if model.strips.is_empty() {
+            model.strips = default.strips;
+        }
+        if model.buses.is_empty() {
+            model.buses = default.buses;
+        }
     }
     model.normalize_buses();
+}
+
+/// Refuse absurdly large session files instead of reading them into memory.
+const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+
+fn check_session_size(path: &str) -> Result<(), String> {
+    if fs::metadata(path)
+        .map(|meta| meta.len() > MAX_SESSION_BYTES)
+        .unwrap_or(false)
+    {
+        return Err(format!(
+            "session file is larger than {MAX_SESSION_BYTES} bytes"
+        ));
+    }
+    Ok(())
 }
 
 /// The control socket is open to every local process, so a save path is
 /// untrusted: refuse to replace an existing file that is not already a vibemix
 /// session (empty files are fine), e.g. a shell config.
 fn check_overwrite_session(path: &str) -> Result<(), String> {
+    check_session_size(path)?;
     match fs::read_to_string(path) {
         Ok(existing) if !existing.trim().is_empty() => toml::from_str::<MixerModel>(&existing)
             .map(|_| ())
@@ -363,6 +387,7 @@ pub(super) fn save_session(model: &MixerModel, path: &str) -> Result<(), String>
 }
 
 pub(super) fn load_session(path: &str) -> Result<MixerModel, String> {
+    check_session_size(path)?;
     let text = fs::read_to_string(path).map_err(|error| {
         tracing::warn!(%error, %path, "session read failed");
         error.to_string()
@@ -800,5 +825,26 @@ impl Controller {
         self.undo_bytes = 0;
         self.undo_coalesce = None;
         self.edit_dirty = true;
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn clamping_keeps_non_strip_session_state() {
+        let mut model = MixerModel::new("test");
+        model.clock.master = true;
+        model.recorder.bit_depth = 32;
+        model
+            .loops
+            .push(vibemix_core::recorder::LoopSlot::default());
+        clamp_to_capacity(&mut model, 8, 4);
+        assert!(model.clock.master);
+        assert_eq!(model.recorder.bit_depth, 32);
+        assert_eq!(model.loops.len(), 1);
+        assert!(!model.strips.is_empty());
+        assert!(!model.buses.is_empty());
     }
 }
