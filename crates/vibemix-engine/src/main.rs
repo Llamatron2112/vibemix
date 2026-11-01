@@ -10,6 +10,7 @@ mod pdc;
 mod plugin;
 mod recorder;
 mod rt_guard;
+#[allow(dead_code, clippy::cast_slice_from_raw_parts)]
 mod rt_pool;
 mod smoke;
 mod ui_service;
