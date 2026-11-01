@@ -6368,6 +6368,10 @@ ApplicationWindow {
         property bool snapGrid: false
         property int exportOffset: 0
         property int clickDiv: 1
+        property int ghostOffset: 0
+        property bool ghostVisible: false
+        property real snapTarget: -1
+        property real anchorDisplay: -1
         property var editorPeaks: []
         property var basePeaks: []
         property var waveSamples: []
@@ -7047,10 +7051,10 @@ ApplicationWindow {
                             return loopEditor.peakMax(windowPeaks, j0,
                                 Math.min(windowPeaks.length, j1))
                         }
-                        function basePeak(f0, f1) {
+                        function basePeakAt(f0, f1, ph) {
                             if (base.length === 0) return 0
-                            var p0 = (((f0 / frames) + phase) % 1 + 1) % 1
-                            var p1 = (((f1 / frames) + phase) % 1 + 1) % 1
+                            var p0 = (((f0 / frames) + ph) % 1 + 1) % 1
+                            var p1 = (((f1 / frames) + ph) % 1 + 1) % 1
                             var i0 = Math.floor(p0 * base.length)
                             var i1 = Math.floor(p1 * base.length)
                             if (i1 <= i0) i1 = i0 + 1
@@ -7061,6 +7065,9 @@ ApplicationWindow {
                                 loopEditor.peakMax(base, i0, base.length),
                                 loopEditor.peakMax(base, 0, Math.min(base.length, i1))
                             )
+                        }
+                        function basePeak(f0, f1) {
+                            return basePeakAt(f0, f1, phase)
                         }
 
                         if (haveSamples) {
@@ -7101,6 +7108,25 @@ ApplicationWindow {
                                 var amp = a * height * 0.45
                                 ctx.moveTo(x, height * 0.5 - amp)
                                 ctx.lineTo(x, height * 0.5 + amp)
+                            }
+                            ctx.stroke()
+                        }
+
+                        // Ghost of the snapped release position while an
+                        // Alt-drag is in progress.
+                        if (loopEditor.ghostVisible && base.length > 0) {
+                            var ghostPhase =
+                                (((loopEditor.ghostOffset % frames) + frames) % frames) / frames
+                            ctx.strokeStyle = Qt.rgba(
+                                root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.38)
+                            ctx.beginPath()
+                            for (var gx = 0; gx < width; gx++) {
+                                var gf0 = viewStart + (gx / Math.max(1, width)) * span
+                                var gf1 = viewStart + ((gx + 1) / Math.max(1, width)) * span
+                                var ga = basePeakAt(gf0, gf1, ghostPhase)
+                                var gamp = ga * height * 0.45
+                                ctx.moveTo(gx, height * 0.5 - gamp)
+                                ctx.lineTo(gx, height * 0.5 + gamp)
                             }
                             ctx.stroke()
                         }
@@ -7151,6 +7177,29 @@ ApplicationWindow {
                                 ctx.lineTo(bx, height)
                             }
                             ctx.stroke()
+                        }
+
+                        if (loopEditor.ghostVisible) {
+                            var ax0 = loopEditor.anchorDisplay
+                            var tx0 = loopEditor.snapTarget
+                            if (ax0 >= viewStart - 0.5 && ax0 <= viewEnd + 0.5) {
+                                var axp = (ax0 - viewStart) / span * width
+                                ctx.strokeStyle = root.textColor
+                                ctx.globalAlpha = 0.55
+                                ctx.beginPath()
+                                ctx.moveTo(axp, 0)
+                                ctx.lineTo(axp, height)
+                                ctx.stroke()
+                                ctx.globalAlpha = 1.0
+                            }
+                            if (tx0 >= viewStart - 0.5 && tx0 <= viewEnd + 0.5) {
+                                var txp = (tx0 - viewStart) / span * width
+                                ctx.strokeStyle = root.accentColor
+                                ctx.beginPath()
+                                ctx.moveTo(txp, 0)
+                                ctx.lineTo(txp, height)
+                                ctx.stroke()
+                            }
                         }
 
                         if (slot.one_shot === true) {
@@ -7258,6 +7307,9 @@ ApplicationWindow {
                     property real pressViewEnd: 0
                     property int pressManual: 0
                     property int pressExport: 0
+                    property int pressTotal: 0
+                    property int pressAnchorRaw: 0
+                    property int snapDelta: 0
                     property bool moved: false
                     property string dragMarker: ""
                     property bool markerHover: false
@@ -7297,10 +7349,22 @@ ApplicationWindow {
                         if (mouse.modifiers & Qt.AltModifier) {
                             pressManual = loopEditor.displayManual()
                             pressExport = loopEditor.exportOffset
+                            pressTotal = loopEditor.alignMode
+                                ? loopEditor.exportOffset
+                                : Math.round(loopEditor.displayTotal())
+                            var framesAtPress = Math.max(1, slot.frames)
+                            var spanAtPress = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
+                            var displayAtPress = loopEditor.viewStart
+                                + (mouse.x / Math.max(1, width)) * spanAtPress
+                            pressAnchorRaw = ((Math.round(displayAtPress) + pressTotal)
+                                % framesAtPress + framesAtPress) % framesAtPress
                             loopEditor.dragManual = pressManual
                             loopEditor.dragging = true
                             loopEditor.navigating = false
                             loopEditor.applying = false
+                            loopEditor.ghostVisible = false
+                            loopEditor.snapTarget = -1
+                            loopEditor.anchorDisplay = displayAtPress
                             loopEditor.requestWaveform(
                                 loopEditor.alignMode
                                     ? loopEditor.exportOffset
@@ -7331,16 +7395,6 @@ ApplicationWindow {
                             var spanM = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                             var frameM = loopEditor.viewStart
                                 + (mouse.x / Math.max(1, width)) * spanM
-                            if (loopEditor.snapGrid) {
-                                var sm = loopEditor.currentSlot()
-                                if (sm) {
-                                    var fm = Math.max(1, sm.frames)
-                                    var bm = Math.max(1, sm.loop_beats || 1)
-                                    var sub = Math.max(1, loopEditor.gridSubdivision())
-                                    var stepM = fm / (bm * sub)
-                                    frameM = Math.round(frameM / stepM) * stepM
-                                }
-                            }
                             if (dragMarker === "start") {
                                 loopEditor.selectionStart = Math.max(
                                     0, Math.min(loopEditor.selectionEnd - 1, frameM))
@@ -7354,17 +7408,6 @@ ApplicationWindow {
                             editorWave.requestPaint()
                             return
                         }
-                        if (loopEditor.snapGrid) {
-                            var slotNow = loopEditor.currentSlot()
-                            if (slotNow) {
-                                var framesNow = Math.max(1, slotNow.frames)
-                                var beatsNow = Math.max(1, slotNow.loop_beats || 1)
-                                var subNow = Math.max(1, loopEditor.gridSubdivision())
-                                var stepNow = framesNow / (beatsNow * subNow)
-                                loopEditor.cursorFrame =
-                                    Math.round(loopEditor.cursorFrame / stepNow) * stepNow
-                            }
-                        }
                         if (pressed) {
                             var dx = mouse.x - pressX
                             var dy = mouse.y - pressY
@@ -7374,10 +7417,35 @@ ApplicationWindow {
                                 var delta = (mouse.modifiers & Qt.ShiftModifier)
                                     ? -Math.round(dx)
                                     : -Math.round(dx * span / Math.max(1, width))
+                                var freeTotal
                                 if (loopEditor.alignMode) {
                                     loopEditor.exportOffset = pressExport + delta
+                                    freeTotal = loopEditor.exportOffset
                                 } else {
                                     loopEditor.dragManual = pressManual + delta
+                                    freeTotal = Math.round(loopEditor.displayTotal())
+                                }
+                                var framesD = Math.max(1, slot.frames)
+                                var freeMod = ((freeTotal % framesD) + framesD) % framesD
+                                var anchorFree = ((pressAnchorRaw - freeMod)
+                                    % framesD + framesD) % framesD
+                                loopEditor.anchorDisplay = anchorFree
+                                snapDelta = 0
+                                loopEditor.ghostVisible = false
+                                if (loopEditor.snapGrid) {
+                                    var beatsD = Math.max(1, slot.loop_beats || 1)
+                                    var subD = Math.max(1, loopEditor.gridSubdivision())
+                                    var stepD = framesD / (beatsD * subD)
+                                    var target = Math.round(anchorFree / stepD) * stepD
+                                    target = ((target % framesD) + framesD) % framesD
+                                    var d = anchorFree - target
+                                    if (d > framesD * 0.5) d -= framesD
+                                    if (d < -framesD * 0.5) d += framesD
+                                    snapDelta = Math.round(d)
+                                    loopEditor.snapTarget = target
+                                    loopEditor.ghostOffset = ((freeMod + snapDelta)
+                                        % framesD + framesD) % framesD
+                                    loopEditor.ghostVisible = true
                                 }
                                 requestTimer.start()
                             } else if (loopEditor.navigating
@@ -7416,9 +7484,13 @@ ApplicationWindow {
                         if (loopEditor.dragging) {
                             loopEditor.dragging = false
                             if (loopEditor.alignMode) {
+                                if (loopEditor.snapGrid && loopEditor.ghostVisible)
+                                    loopEditor.exportOffset += snapDelta
                                 loopEditor.setExportOffset(loopEditor.exportOffset)
                                 loopEditor.storeExportSettings()
                             } else {
+                                if (loopEditor.snapGrid && loopEditor.ghostVisible)
+                                    loopEditor.dragManual += snapDelta
                                 if (slot && loopEditor.dragManual !== slot.manual_nudge) {
                                     loopEditor.applying = true
                                     root.sendRecorderAction({
@@ -7466,6 +7538,8 @@ ApplicationWindow {
                         loopEditor.navigating = false
                         dragMarker = ""
                         loopEditor.applying = false
+                        loopEditor.ghostVisible = false
+                        loopEditor.snapTarget = -1
                         loopEditor.requestWaveform(null)
                     }
                     onExited: {

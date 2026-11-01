@@ -10,6 +10,7 @@ mod pdc;
 mod plugin;
 mod recorder;
 mod rt_guard;
+mod rt_pool;
 mod smoke;
 mod ui_service;
 
