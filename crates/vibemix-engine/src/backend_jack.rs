@@ -1575,7 +1575,6 @@ impl MixerGraph {
             preview,
             loop_slots,
             loop_scratch,
-            bus_out,
             sample_rate,
             ..
         } = self;
@@ -1701,9 +1700,27 @@ impl MixerGraph {
                 preview.frames_to_click -= 1.0;
             }
         }
+    }
 
-        dsp::add_scaled(&mut bus_out[0][0][..frames], &left[..frames], 1.0);
-        dsp::add_scaled(&mut bus_out[0][1][..frames], &right[..frames], 1.0);
+    /// Add the dry preview buffer to the master output after the mixer and
+    /// recorder, so it is audible but never captured.
+    fn add_preview_to_output(&mut self, scope: &ProcessScope, frames: usize) {
+        let Self {
+            preview,
+            loop_scratch,
+            buses,
+            ..
+        } = self;
+        if preview.is_none() {
+            return;
+        }
+        let Some(ports) = buses[0].as_mut() else {
+            return;
+        };
+        let out_l = ports.out_l.as_mut_slice(scope);
+        let out_r = ports.out_r.as_mut_slice(scope);
+        dsp::add_scaled(&mut out_l[..frames], &loop_scratch[0][..frames], 1.0);
+        dsp::add_scaled(&mut out_r[..frames], &loop_scratch[1][..frames], 1.0);
     }
 
     /// Mix launcher playback into the master input. Quantized slots start on
@@ -2228,6 +2245,7 @@ impl ProcessHandler for MixerGraph {
         );
 
         self.mix_preview(frames);
+        self.add_preview_to_output(scope, frames);
 
         if raw_frames > frames {
             // Period beyond the fixed buffer capacity: silence the tail of the
