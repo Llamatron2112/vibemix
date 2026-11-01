@@ -11,15 +11,15 @@ use vibemix_core::params::{linear_to_db, TRIM_MAX_DB, TRIM_MIN_DB};
 use crate::params::{TRIM_LEARN_MAX, TRIM_LEARN_MIN, TRIM_LEARN_NONE};
 
 /// How often the control thread consumes the peak hold.
-pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(50);
+pub(super) const POLL_INTERVAL: Duration = Duration::from_millis(25);
 /// Peak target. A little below full scale so rounding cannot trip a clip.
 pub(super) const TARGET_DB: f32 = -0.1;
 /// Below this the input is treated as silence; learn never boosts into noise.
 const SIGNAL_FLOOR_DB: f32 = -60.0;
 /// Do not boost while the held peak is within this band of the target.
-const HYSTERESIS_DB: f32 = 0.5;
+const HYSTERESIS_DB: f32 = 0.25;
 /// How long the signal must stay below the target before boosting.
-const BOOST_HOLD: Duration = Duration::from_millis(400);
+const BOOST_HOLD: Duration = Duration::from_millis(200);
 /// Peak-hold release rate: loud material keeps the boost limit conservative.
 const RELEASE_DB_PER_SEC: f32 = 12.0;
 const EPS: f32 = 0.005;
@@ -98,13 +98,9 @@ impl TrimLearn {
             if self.below_for >= BOOST_HOLD {
                 let headroom = TARGET_DB - self.held_peak_db;
                 let allowed = (current_db + headroom).min(TRIM_MAX_DB);
-                let step = if headroom >= 6.0 {
-                    3.0
-                } else if headroom >= 2.0 {
-                    1.0
-                } else {
-                    0.25
-                };
+                // Proportional approach: fast when far away, gentle near the
+                // target, and always capped by the detected headroom.
+                let step = (headroom * 0.5).clamp(0.25, 6.0);
                 let next = (current_db + step)
                     .min(allowed)
                     .clamp(TRIM_MIN_DB, TRIM_MAX_DB);
@@ -187,10 +183,20 @@ mod tests {
     #[test]
     fn quiet_signal_waits_for_the_hold() {
         let mut controller = TrimLearn::default();
-        for _ in 0..4 {
-            assert!(update(&mut controller, -20.0, 0.0, 90).trim_db.is_none());
+        for _ in 0..3 {
+            assert!(update(&mut controller, -20.0, 0.0, 60).trim_db.is_none());
         }
-        assert!(update(&mut controller, -20.0, 0.0, 90).trim_db.is_some());
+        assert!(update(&mut controller, -20.0, 0.0, 60).trim_db.is_some());
+    }
+
+    #[test]
+    fn boost_uses_half_the_headroom() {
+        let mut controller = TrimLearn::default();
+        let next = update(&mut controller, -20.0, 0.0, 1000)
+            .trim_db
+            .expect("boost");
+        // 19.9 dB of headroom would be a 9.95 dB step, capped at 6 dB.
+        assert!((next - 6.0).abs() < 1.0e-3, "{next}");
     }
 
     #[test]
@@ -215,10 +221,10 @@ mod tests {
     #[test]
     fn within_hysteresis_does_not_boost() {
         let mut controller = TrimLearn::default();
-        let mut decision = update(&mut controller, TARGET_DB - 0.5, 0.0, 1000);
+        let mut decision = update(&mut controller, TARGET_DB - 0.2, 0.0, 1000);
         assert!(decision.trim_db.is_none());
         assert_eq!(decision.limit, TRIM_LEARN_NONE);
-        decision = update(&mut controller, TARGET_DB - 2.0, 0.0, 1000);
+        decision = update(&mut controller, TARGET_DB - 1.0, 0.0, 1000);
         assert!(decision.trim_db.is_some());
     }
 }

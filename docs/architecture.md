@@ -152,10 +152,11 @@ and `out` (post-fader/pan) — and the GUI can select which one each strip's met
 shows. The numeric readout and the meter's dB scale use `-60..+6 dBFS`.
 
 The trim's right-click menu can enable **Learn trim**. While enabled, the audio
-thread peak-holds the post-trim signal; every 50 ms the control thread cuts
-immediately if the held peak is above −0.1 dBFS, or boosts gradually when the
-signal has real level and the held peak has enough headroom. A boost never
-exceeds the point where the held peak would hit the target, and the held peak
+thread peak-holds the post-trim signal; every 25 ms the control thread cuts
+immediately if the held peak is above −0.1 dBFS, or boosts progressively (half
+the measured headroom, up to 6 dB) when the signal has real level and the held
+peak has enough headroom. A boost never exceeds the point where the held peak
+would hit the target, and the held peak
 releases slowly so a quiet passage cannot immediately undo the safety margin.
 The final trim is just the normal input-gain value and saves with the session;
 the learn-active state and its limit warning are transient. One undo entry is
