@@ -6353,13 +6353,14 @@ ApplicationWindow {
             viewEnd = Math.round(view.end)
             waveSeq += 1
             var full = view.start === 0 && view.end === slot.frames
-            var total = (nudge === undefined || nudge === null) ? loopEditor.displayTotal() : nudge
             root.sendRecorderAction({
                 action: "waveform",
                 slot: slot.id,
                 start: view.start,
                 end: view.end,
-                nudge: total,
+                // `null` asks the engine for its actual playback rotation;
+                // a numeric value is an editor preview (audio unchanged).
+                nudge: (nudge === undefined || nudge === null) ? null : nudge,
                 seq: waveSeq,
                 buckets: full ? 16384 : 8192,
                 base: false
@@ -6551,7 +6552,6 @@ ApplicationWindow {
                     if (Math.abs(wave.start - loopEditor.viewStart) > 0.5
                         || Math.abs(wave.end - loopEditor.viewEnd) > 0.5) return
                     var wall = ((wave.nudge % frames) + frames) % frames
-                    if (wall !== loopEditor.displayTotalMod()) return
                     loopEditor.acceptedSeq = wave.seq
                     loopEditor.waveNudge = wall
                     loopEditor.editorPeaks = peaks
@@ -6675,16 +6675,7 @@ ApplicationWindow {
                         var base = loopEditor.basePeaks.length > 0
                             ? loopEditor.basePeaks : (slot.peaks || [])
                         var haveWindowPeaks = haveWindow && windowPeaks.length > 0
-                        var total = loopEditor.displayTotal()
-                        var totalMod = loopEditor.displayTotalMod()
-                        // Only draw the loaded window when it was rotated with
-                        // the nudge that is current now; otherwise fall back to
-                        // the base peaks rotated by `total`. This keeps the
-                        // picture on the same phase as playback while a new
-                        // window is in flight.
-                        var windowMatches = loopEditor.waveNudge === totalMod
-                        haveWindowPeaks = haveWindowPeaks && windowMatches
-                        var haveSamples = samples.length > 1 && haveWindow && windowMatches
+                        var haveSamples = samples.length > 1 && haveWindow
                             && viewStart >= dataStart - 1 && viewEnd <= dataEnd + 1
                         if (!haveWindowPeaks && base.length === 0 && !haveSamples) return
 
@@ -6694,7 +6685,14 @@ ApplicationWindow {
                         ctx.lineTo(width, height * 0.5)
                         ctx.stroke()
 
-                        var phase = totalMod / frames
+                        // A loaded window is already rotated by the nudge the
+                        // engine used for that image. Use the same value for
+                        // the markers and the fallback peaks so the picture is
+                        // internally consistent; without a window, use the
+                        // model's current total.
+                        var total = (haveWindowPeaks || haveSamples)
+                            ? loopEditor.waveNudge : loopEditor.displayTotal()
+                        var phase = ((total % frames) + frames) % frames / frames
                         var dataSpan = Math.max(1, dataEnd - dataStart)
 
                         function windowPeak(f0, f1) {
