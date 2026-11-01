@@ -151,6 +151,16 @@ the strip has three meter taps — `in` (raw input), `gain` (post-trim, pre-plug
 and `out` (post-fader/pan) — and the GUI can select which one each strip's meter
 shows. The numeric readout and the meter's dB scale use `-60..+6 dBFS`.
 
+The trim's right-click menu can enable **Learn trim**. While enabled, the audio
+thread peak-holds the post-trim signal; every 50 ms the control thread cuts
+immediately if the held peak is above −0.1 dBFS, or boosts gradually when the
+signal has real level and the held peak has enough headroom. A boost never
+exceeds the point where the held peak would hit the target, and the held peak
+releases slowly so a quiet passage cannot immediately undo the safety margin.
+The final trim is just the normal input-gain value and saves with the session;
+the learn-active state and its limit warning are transient. One undo entry is
+created when learn starts.
+
 The GUI lays the strips and buses out in two independently scrollable panes,
 side by side; each pane wraps its cards into rows and scrolls vertically. The
 per-row counts (`layout.strips_per_row` / `layout.buses_per_row`, `0` = auto) are
@@ -555,6 +565,7 @@ OSC over a Unix datagram socket (see below). Addresses are in
 | `/vibemix/strip/solo` | `int strip, int solo` |
 | `/vibemix/strip/pan` | `int strip, float pan` |
 | `/vibemix/strip/input_gain` | `int strip, float db` (input trim, `-24..+24 dB`) |
+| `/vibemix/strip/trim_learn` | `int strip, int enabled` (continuous trim learn) |
 | `/vibemix/strip/name` | `int strip, string name` |
 | `/vibemix/strip/add` | none |
 | `/vibemix/strip/remove` | `int strip` |

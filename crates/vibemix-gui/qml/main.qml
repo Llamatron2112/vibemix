@@ -221,6 +221,14 @@ ApplicationWindow {
     function stripGain(id) { return root.val(values.strips, id, "gain", 1) }
     function stripPan(id) { return root.val(values.strips, id, "pan", 0) }
     function stripInputGain(id) { return root.val(values.strips, id, "input_gain_db", 0) }
+    function stripTrimLearn(id) {
+        var i = root.stripIndex(id)
+        return i >= 0 && mix.strips[i].trim_learn === true
+    }
+    function stripTrimLearnLimit(id) {
+        var i = root.stripIndex(id)
+        return i >= 0 ? (mix.strips[i].trim_learn_limit || 0) : 0
+    }
     function stripMute(id) { return root.val(values.strips, id, "mute", false) }
     function stripSolo(id) { return root.val(values.strips, id, "solo", false) }
     function busGain(id) { return root.val(values.buses, id, "gain", 1) }
@@ -3284,6 +3292,9 @@ ApplicationWindow {
         property bool dragging: false
         property string valueText: ""
         property string entryUnit: "linear"
+        property bool learnable: false
+        property bool learnActive: false
+        property int learnLimit: 0
         readonly property bool interacting: mini.dragging || valueTimer.running
         readonly property real displayValue: mini.interacting ? mini.liveValue : mini.value
         readonly property string shownValueText: {
@@ -3294,6 +3305,7 @@ ApplicationWindow {
             return Number(mini.liveValue).toFixed(3)
         }
         signal moved(real value)
+        signal learnToggled(bool enabled)
 
         implicitWidth: 60
         implicitHeight: 14
@@ -3443,6 +3455,16 @@ ApplicationWindow {
                     mini.moved(mini.resetValue)
                     mini.bump()
                 }
+            }
+            MenuSeparator { visible: mini.learnable }
+            MenuItem {
+                visible: mini.learnable
+                checkable: true
+                checked: mini.learnActive
+                text: mini.learnLimit === 1
+                    ? "Learn trim (at minimum)"
+                    : (mini.learnLimit === 2 ? "Learn trim (at maximum)" : "Learn trim")
+                onTriggered: mini.learnToggled(checked)
             }
         }
 
@@ -5297,8 +5319,15 @@ ApplicationWindow {
                             }
 
                             Label {
-                                text: "trim"
-                                color: root.mutedText
+                                text: {
+                                    if (!root.stripTrimLearn(stripCard.stripData.id)) return "trim"
+                                    var limit = root.stripTrimLearnLimit(stripCard.stripData.id)
+                                    if (limit === 1) return "trim · learn (min)"
+                                    if (limit === 2) return "trim · learn (max)"
+                                    return "trim · learn"
+                                }
+                                color: root.stripTrimLearn(stripCard.stripData.id)
+                                    ? root.accentColor : root.mutedText
                                 font.pixelSize: 8
                                 Layout.alignment: Qt.AlignLeft
                             }
@@ -5309,9 +5338,13 @@ ApplicationWindow {
                                 to: 24
                                 resetValue: 0
                                 entryUnit: "db"
+                                learnable: true
+                                learnActive: root.stripTrimLearn(stripCard.stripData.id)
+                                learnLimit: root.stripTrimLearnLimit(stripCard.stripData.id)
                                 value: root.stripInputGain(stripCard.stripData.id)
                                 valueText: root.trimText(root.stripInputGain(stripCard.stripData.id))
                                 onMoved: (value) => backend.setStripInputGain(stripCard.stripData.id, value)
+                                onLearnToggled: (on) => backend.setStripTrimLearn(stripCard.stripData.id, on)
                             }
 
                             PluginList {

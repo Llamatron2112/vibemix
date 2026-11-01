@@ -10,6 +10,11 @@ pub const PLUGIN_CHAINS: usize = 2;
 /// `O(plugins)` instead of `O(plugins × strips)`.
 pub const MAX_SIDECHAIN_SOURCES: usize = 16;
 
+/// Trim-learn status codes exposed to the GUI.
+pub const TRIM_LEARN_NONE: u32 = 0;
+pub const TRIM_LEARN_MIN: u32 = 1;
+pub const TRIM_LEARN_MAX: u32 = 2;
+
 /// One sidechain send: the source strip (`source + 1`, 0 = empty) with its
 /// gain and pre/post tap.
 #[derive(Debug)]
@@ -34,6 +39,8 @@ pub struct SharedParams {
     strip_gain: Vec<AtomicU32>,
     strip_pan: Vec<AtomicU32>,
     strip_input_gain: Vec<AtomicU32>,
+    strip_trim_learn: Vec<AtomicBool>,
+    strip_trim_learn_limit: Vec<AtomicU32>,
     strip_mute: Vec<AtomicBool>,
     strip_solo: Vec<AtomicBool>,
     strip_active: Vec<AtomicBool>,
@@ -80,6 +87,8 @@ impl SharedParams {
             strip_gain: gain_vec(strip_count),
             strip_pan: gain_vec(strip_count),
             strip_input_gain: gain_vec(strip_count),
+            strip_trim_learn: bool_vec(strip_count),
+            strip_trim_learn_limit: zero_vec(strip_count),
             strip_mute: bool_vec(strip_count),
             strip_solo: bool_vec(strip_count),
             strip_active: bool_vec(strip_count),
@@ -300,6 +309,29 @@ impl SharedParams {
             strip,
             db_to_linear(clamp_trim_db(db)),
         );
+    }
+
+    /// Whether the strip trim is in continuous learn mode.
+    pub fn trim_learn(&self, strip: usize) -> bool {
+        get_bool(&self.strip_trim_learn, strip)
+    }
+
+    pub fn set_trim_learn(&self, strip: usize, value: bool) {
+        set_bool(&self.strip_trim_learn, strip, value);
+    }
+
+    /// `TRIM_LEARN_NONE`, `TRIM_LEARN_MIN` or `TRIM_LEARN_MAX`.
+    pub fn trim_learn_limit(&self, strip: usize) -> u32 {
+        self.strip_trim_learn_limit
+            .get(strip)
+            .map(|value| value.load(Ordering::Relaxed))
+            .unwrap_or(TRIM_LEARN_NONE)
+    }
+
+    pub fn set_trim_learn_limit(&self, strip: usize, value: u32) {
+        if let Some(slot) = self.strip_trim_learn_limit.get(strip) {
+            slot.store(value, Ordering::Relaxed);
+        }
     }
 
     pub fn strip_mute(&self, strip: usize) -> bool {
@@ -714,6 +746,8 @@ pub struct SharedMeters {
     strip_in_r: Vec<AtomicU32>,
     strip_gain_l: Vec<AtomicU32>,
     strip_gain_r: Vec<AtomicU32>,
+    /// Peak hold (linear) of the post-trim signal while trim learn is active.
+    strip_trim_peak: Vec<AtomicU32>,
     strip_out_l: Vec<AtomicU32>,
     strip_out_r: Vec<AtomicU32>,
     bus_in_l: Vec<AtomicU32>,
@@ -757,6 +791,7 @@ impl SharedMeters {
             strip_in_r: zero_vec(strip_count),
             strip_gain_l: zero_vec(strip_count),
             strip_gain_r: zero_vec(strip_count),
+            strip_trim_peak: zero_vec(strip_count),
             strip_out_l: zero_vec(strip_count),
             strip_out_r: zero_vec(strip_count),
             bus_in_l: zero_vec(bus_count),
@@ -791,6 +826,26 @@ impl SharedMeters {
 
     pub fn store_strip_gain(&self, strip: usize, left: f32, right: f32) {
         store_pair(&self.strip_gain_l, &self.strip_gain_r, strip, left, right);
+    }
+
+    /// Accumulates the maximum post-trim peak since the control thread last
+    /// consumed it. Peaks are non-negative, so their bit patterns order the
+    /// same way as the floats.
+    pub fn hold_strip_trim_peak(&self, strip: usize, peak: f32) {
+        if !peak.is_finite() || peak <= 0.0 {
+            return;
+        }
+        if let Some(slot) = self.strip_trim_peak.get(strip) {
+            slot.fetch_max(peak.to_bits(), Ordering::Relaxed);
+        }
+    }
+
+    /// Returns and clears the held trim-learn peak.
+    pub fn take_strip_trim_peak(&self, strip: usize) -> f32 {
+        self.strip_trim_peak
+            .get(strip)
+            .map(|slot| f32::from_bits(slot.swap(0.0f32.to_bits(), Ordering::Relaxed)))
+            .unwrap_or(0.0)
     }
 
     pub fn store_strip_out(&self, strip: usize, left: f32, right: f32) {
@@ -976,7 +1031,7 @@ fn set_bool(values: &[AtomicBool], index: usize, value: bool) {
 
 #[cfg(test)]
 mod tests {
-    use super::SharedParams;
+    use super::{SharedMeters, SharedParams};
 
     fn fill(params: &SharedParams, chain: usize, slots: usize, params_per_slot: usize) {
         for slot in 0..slots {
@@ -984,6 +1039,16 @@ mod tests {
                 params.set_plugin_param(0, chain, slot, param, (slot * 10 + param) as f32);
             }
         }
+    }
+
+    #[test]
+    fn trim_peak_hold_keeps_the_maximum_until_taken() {
+        let meters = SharedMeters::new(1, 1);
+        meters.hold_strip_trim_peak(0, 0.25);
+        meters.hold_strip_trim_peak(0, 0.75);
+        meters.hold_strip_trim_peak(0, 0.5);
+        assert_eq!(meters.take_strip_trim_peak(0), 0.75);
+        assert_eq!(meters.take_strip_trim_peak(0), 0.0);
     }
 
     #[test]

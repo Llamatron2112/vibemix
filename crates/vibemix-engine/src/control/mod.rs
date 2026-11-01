@@ -17,7 +17,7 @@ use vibemix_core::model::{
     Bus, MidiBinding, MidiTarget, MixerModel, PluginSlot, Send, SidechainSource, Strip,
     WindowGeometry, MAX_SEND_DELAY_MS,
 };
-use vibemix_core::params::{clamp_trim_db, Gain, Pan};
+use vibemix_core::params::{clamp_trim_db, linear_to_db, Gain, Pan};
 use vibemix_core::recorder::{
     rotate_interleaved, snap_seam, LoopSlot, RecorderAction, RecorderSettings, RecorderSource,
     RecorderStatus, Transient,
@@ -33,6 +33,7 @@ use crate::dsp;
 use crate::health::{HealthStore, Scan, ScanEvent, Status, VerdictMeta};
 use crate::params::{
     MeterLevels, SharedMeters, SharedParams, MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
+    TRIM_LEARN_NONE,
 };
 use crate::recorder::MAX_LOOPS;
 
@@ -41,6 +42,7 @@ mod loops;
 mod plugins;
 mod smoke;
 mod state;
+mod trim_learn;
 mod ui;
 mod workers;
 
@@ -50,6 +52,7 @@ pub use state::{apply_model, clamp_to_capacity, sync_model_from_params};
 use catalog::*;
 use plugins::*;
 use state::*;
+use trim_learn::*;
 use workers::*;
 
 const PLUGIN_LOC_STRIP_PRE: u32 = 0;
@@ -265,6 +268,10 @@ pub struct Controller {
     pending_loop_loads: Vec<PendingLoopLoad>,
     /// Throttles repeated restart requests from the same VST3 slot.
     vst3_restart_throttle: HashMap<(u32, u32, u32), Instant>,
+    /// Per-strip trim-learn detector state.
+    trim_learn: Vec<TrimLearn>,
+    trim_learn_ids: Vec<u32>,
+    last_trim_learn: Instant,
 }
 
 /// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
@@ -452,6 +459,7 @@ impl Controller {
         // Track the rate the graph was built with, so a startup rate correction
         // from PipeWire (e.g. 48000 -> 44100) triggers a resync in the loop.
         let sample_rate = engine.graph_sample_rate();
+        let strip_count = params.strip_count();
 
         let (smoke_tx, smoke_rx) = mpsc::channel();
         let mut controller = Self {
@@ -518,6 +526,9 @@ impl Controller {
             plugin_state_dirty: std::cell::Cell::new(true),
             pending_loop_loads: Vec::new(),
             vst3_restart_throttle: HashMap::new(),
+            trim_learn: (0..strip_count).map(|_| TrimLearn::default()).collect(),
+            trim_learn_ids: Vec::with_capacity(strip_count),
+            last_trim_learn: Instant::now() - POLL_INTERVAL,
         };
         controller.ensure_model_plugin_controls();
         controller
@@ -637,6 +648,9 @@ impl Controller {
             self.engine.drain_garbage();
             self.poll_recorder();
             self.poll_workers();
+            if self.poll_trim_learn() {
+                actions.snapshot = true;
+            }
             self.pump_uis();
             let vst3_edits = self.drain_vst3_param_edits();
             let clap_edits = self.drain_clap_param_edits();
@@ -884,6 +898,57 @@ impl Controller {
         }
     }
 
+    fn stop_trim_learn(&mut self, strip: usize) {
+        self.params.set_trim_learn(strip, false);
+        self.params.set_trim_learn_limit(strip, TRIM_LEARN_NONE);
+        self.meters.take_strip_trim_peak(strip);
+        if let Some(state) = self.trim_learn.get_mut(strip) {
+            state.reset();
+        }
+    }
+
+    /// Runs the continuous trim-learn controller. Returns true when a trim or
+    /// its limit changed, so the GUI snapshot is refreshed.
+    fn poll_trim_learn(&mut self) -> bool {
+        let now = Instant::now();
+        let dt = now.duration_since(self.last_trim_learn);
+        if dt < POLL_INTERVAL {
+            return false;
+        }
+        self.last_trim_learn = now;
+
+        self.trim_learn_ids.clear();
+        self.trim_learn_ids
+            .extend(self.model.strips.iter().map(|strip| strip.id.0));
+        let mut changed = false;
+        for position in 0..self.trim_learn_ids.len() {
+            let id = self.trim_learn_ids[position];
+            let index = id as usize;
+            if !self.params.trim_learn(index) {
+                continue;
+            }
+            let Some(state) = self.trim_learn.get_mut(index) else {
+                continue;
+            };
+            let peak = self.meters.take_strip_trim_peak(index);
+            let current = self.params.strip_input_gain(index);
+            let decision = state.update(peak, current, dt);
+            if let Some(next) = decision.trim_db {
+                self.params.set_strip_input_gain_db(index, next);
+                if let Some(strip) = self.model.strip_mut(StripId(id)) {
+                    // Keep the session readable; the engine keeps full precision.
+                    strip.input_gain_db = (next * 100.0).round() / 100.0;
+                }
+                changed = true;
+            }
+            if self.params.trim_learn_limit(index) != decision.limit {
+                self.params.set_trim_learn_limit(index, decision.limit);
+                changed = true;
+            }
+        }
+        changed
+    }
+
     /// Rebuilds everything that depends on the sample rate (delay-line buffers
     /// and plugin instances) after a JACK rate change.
     fn handle_sample_rate(&mut self, rate: u32) {
@@ -970,9 +1035,36 @@ impl Controller {
             }
             ControlMessage::SetStripInputGain { strip, db } => {
                 let db = clamp_trim_db(db);
+                // A manual trim move takes over from the learner.
+                self.stop_trim_learn(strip as usize);
                 self.params.set_strip_input_gain_db(strip as usize, db);
                 if let Some(target) = self.model.strip_mut(StripId(strip)) {
                     target.input_gain_db = db;
+                }
+                Actions {
+                    snapshot: true,
+                    catalog: false,
+                }
+            }
+            ControlMessage::SetStripTrimLearn { strip, enabled } => {
+                let index = strip as usize;
+                if self.model.strip(StripId(strip)).is_none() {
+                    return Actions::default();
+                }
+                if enabled {
+                    if !self.params.trim_learn(index) {
+                        // One undo entry covers the whole learn session.
+                        self.push_undo("Learn trim", None);
+                        self.meters.take_strip_trim_peak(index);
+                        if let Some(state) = self.trim_learn.get_mut(index) {
+                            state.reset();
+                        }
+                        self.params.set_trim_learn_limit(index, TRIM_LEARN_NONE);
+                        self.params.set_trim_learn(index, true);
+                        self.last_trim_learn = Instant::now();
+                    }
+                } else {
+                    self.stop_trim_learn(index);
                 }
                 Actions {
                     snapshot: true,

@@ -24,6 +24,10 @@ pub enum ControlMessage {
         strip: u32,
         db: f32,
     },
+    SetStripTrimLearn {
+        strip: u32,
+        enabled: bool,
+    },
     SetStripName {
         strip: u32,
         name: String,
@@ -407,6 +411,13 @@ impl ControlMessage {
             SetStripInputGain { strip, db } => OscMessage {
                 addr: addr::STRIP_INPUT_GAIN.to_string(),
                 args: vec![OscType::Int(*strip as i32), OscType::Float(*db)],
+            },
+            SetStripTrimLearn { strip, enabled } => OscMessage {
+                addr: addr::STRIP_TRIM_LEARN.to_string(),
+                args: vec![
+                    OscType::Int(*strip as i32),
+                    OscType::Int(if *enabled { 1 } else { 0 }),
+                ],
             },
             SetStripName { strip, name } => OscMessage {
                 addr: addr::STRIP_NAME.to_string(),
@@ -1086,6 +1097,10 @@ impl ControlMessage {
                 strip: int(args, 0)? as u32,
                 db: float(args, 1)?,
             }),
+            addr::STRIP_TRIM_LEARN => Some(ControlMessage::SetStripTrimLearn {
+                strip: int(args, 0)? as u32,
+                enabled: int(args, 1)? != 0,
+            }),
             addr::STRIP_NAME => Some(ControlMessage::SetStripName {
                 strip: int(args, 0)? as u32,
                 name: string(args, 1)?,
@@ -1754,6 +1769,10 @@ mod tests {
             pan: -0.25,
         });
         roundtrip(ControlMessage::SetStripInputGain { strip: 2, db: 6.5 });
+        roundtrip(ControlMessage::SetStripTrimLearn {
+            strip: 2,
+            enabled: true,
+        });
         roundtrip(ControlMessage::SetBusGain { bus: 0, gain: 1.5 });
         roundtrip(ControlMessage::SetBusMute { bus: 1, mute: true });
         roundtrip(ControlMessage::SetStripMidiChannel {

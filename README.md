@@ -12,8 +12,9 @@ small OSC control protocol.
 
 ## Features
 
-- Strips and buses with input trim, pre- and post-fader insert chains,
-  fader/pan/mute/solo, and per-bus sends.
+- Strips and buses with input trim (including a continuous **trim learn**
+  mode), pre- and post-fader insert chains, fader/pan/mute/solo, and per-bus
+  sends.
 - Bus inserts, mix-to-master submixes, and **external aux returns** (insert
   semantics: a pre-fader `SEND`, a `RET` trim, and the bus fader post-device).
 - Per-send **alignment delay** (0–500 ms) to phase-align parallel paths, plus

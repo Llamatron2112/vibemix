@@ -746,6 +746,8 @@ fn split_state(value: &serde_json::Value) -> (String, String) {
                 "id": id,
                 "name": strip.get("name").cloned().unwrap_or(serde_json::json!("")),
                 "midi_channel": strip.get("midi_channel").cloned().unwrap_or(serde_json::Value::Null),
+                "trim_learn": strip.get("trim_learn").cloned().unwrap_or(serde_json::json!(false)),
+                "trim_learn_limit": strip.get("trim_learn_limit").cloned().unwrap_or(serde_json::json!(0)),
                 "plugins": plugins_structure,
                 "plugins_post": plugins_post_structure,
             }));
@@ -932,6 +934,10 @@ pub mod qobject {
         #[qinvokable]
         #[cxx_name = "setStripInputGain"]
         fn update_strip_input_gain(&self, strip: i32, db: f32);
+
+        #[qinvokable]
+        #[cxx_name = "setStripTrimLearn"]
+        fn update_strip_trim_learn(&self, strip: i32, enabled: bool);
 
         #[qinvokable]
         #[cxx_name = "setStripName"]
@@ -1601,6 +1607,14 @@ impl qobject::Backend {
         send(ControlMessage::SetStripInputGain {
             strip: strip as u32,
             db,
+        });
+    }
+
+    pub fn update_strip_trim_learn(&self, strip: i32, enabled: bool) {
+        note_action("strip trim learn");
+        send(ControlMessage::SetStripTrimLearn {
+            strip: strip as u32,
+            enabled,
         });
     }
 

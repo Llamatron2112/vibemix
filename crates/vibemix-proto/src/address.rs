@@ -3,6 +3,7 @@ pub const STRIP_MUTE: &str = "/vibemix/strip/mute";
 pub const STRIP_SOLO: &str = "/vibemix/strip/solo";
 pub const STRIP_PAN: &str = "/vibemix/strip/pan";
 pub const STRIP_INPUT_GAIN: &str = "/vibemix/strip/input_gain";
+pub const STRIP_TRIM_LEARN: &str = "/vibemix/strip/trim_learn";
 pub const STRIP_ADD: &str = "/vibemix/strip/add";
 pub const STRIP_REMOVE: &str = "/vibemix/strip/remove";
 pub const STRIP_NAME: &str = "/vibemix/strip/name";

@@ -101,6 +101,8 @@ pub(super) fn build_state_json(
                 "gain": params.strip_gain(strip_index),
                 "pan": params.strip_pan(strip_index),
                 "input_gain_db": strip.input_gain_db,
+                "trim_learn": params.trim_learn(strip_index),
+                "trim_learn_limit": params.trim_learn_limit(strip_index),
                 "mute": params.strip_mute(strip_index),
                 "solo": params.strip_solo(strip_index),
                 "plugins": plugin_list_json(&strip.plugins, plugins, |slot, param| {
@@ -224,6 +226,9 @@ pub fn apply_model(params: &SharedParams, model: &MixerModel) {
         params.set_strip_gain(index, strip.gain.0);
         params.set_strip_pan(index, strip.pan.0);
         params.set_strip_input_gain_db(index, strip.input_gain_db);
+        // Learn mode is a transient tool, never part of a loaded session.
+        params.set_trim_learn(index, false);
+        params.set_trim_learn_limit(index, TRIM_LEARN_NONE);
         params.set_strip_mute(index, strip.mute);
         params.set_strip_solo(index, strip.solo);
 
@@ -283,6 +288,8 @@ pub fn sync_model_from_params(params: &SharedParams, model: &mut MixerModel) {
         let index = strip.id.0 as usize;
         strip.gain = Gain(params.strip_gain(index));
         strip.pan = Pan(params.strip_pan(index));
+        strip.input_gain_db =
+            (linear_to_db(params.strip_input_gain(index)) * 100.0).round() / 100.0;
         strip.mute = params.strip_mute(index);
         strip.solo = params.strip_solo(index);
         for send in &mut strip.sends {

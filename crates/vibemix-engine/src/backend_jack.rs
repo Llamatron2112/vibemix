@@ -1271,6 +1271,12 @@ impl MixerGraph {
             );
             self.meters
                 .store_strip_gain(index, in_peak_l * input_gain, in_peak_r * input_gain);
+            if self.params.trim_learn(index) {
+                // The ramp may start above the block's final gain when cutting;
+                // use the larger one so the detector never under-reads a peak.
+                let trim_peak = in_peak_l.max(in_peak_r) * input_start.max(input_gain);
+                self.meters.hold_strip_trim_peak(index, trim_peak);
+            }
 
             // Input tap (after input gain, before the pre-fader insert chain).
             self.strip_input[index][0][..frames].copy_from_slice(&self.strip_scratch[0][..frames]);
