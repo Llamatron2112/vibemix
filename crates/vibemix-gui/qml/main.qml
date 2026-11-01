@@ -6761,6 +6761,12 @@ ApplicationWindow {
         function snapTransient(raw) {
             var slot = currentSlot()
             if (!slot) return
+            if (alignMode) {
+                var frames = Math.max(1, slot.frames)
+                setExportOffset(((raw % frames) + frames) % frames)
+                storeExportSettings()
+                return
+            }
             dragManual = raw - slot.base_nudge - slot.transient_nudge
             applying = true
             root.sendRecorderAction({ action: "snap_transient", slot: slot.id, frame: raw })
@@ -7168,7 +7174,9 @@ ApplicationWindow {
                     onTriggered: {
                         if (!loopEditor.visible) return
                         if (loopEditor.dragging) {
-                            loopEditor.requestWaveform(loopEditor.displayTotal())
+                            loopEditor.requestWaveform(loopEditor.alignMode
+                                ? loopEditor.exportOffset
+                                : loopEditor.displayTotal())
                         }
                     }
                 }
@@ -7217,13 +7225,17 @@ ApplicationWindow {
                         pressX = mouse.x
                         pressY = mouse.y
                         moved = false
-                        if ((mouse.modifiers & Qt.AltModifier) && !loopEditor.alignMode) {
+                        if (mouse.modifiers & Qt.AltModifier) {
                             pressManual = loopEditor.displayManual()
+                            pressExport = loopEditor.exportOffset
                             loopEditor.dragManual = pressManual
                             loopEditor.dragging = true
                             loopEditor.navigating = false
                             loopEditor.applying = false
-                            loopEditor.requestWaveform(loopEditor.displayTotal())
+                            loopEditor.requestWaveform(
+                                loopEditor.alignMode
+                                    ? loopEditor.exportOffset
+                                    : loopEditor.displayTotal())
                             requestTimer.start()
                         } else {
                             loopEditor.navigating = true
@@ -7260,7 +7272,11 @@ ApplicationWindow {
                                 var delta = (mouse.modifiers & Qt.ShiftModifier)
                                     ? -Math.round(dx)
                                     : -Math.round(dx * span / Math.max(1, width))
-                                loopEditor.dragManual = pressManual + delta
+                                if (loopEditor.alignMode) {
+                                    loopEditor.exportOffset = pressExport + delta
+                                } else {
+                                    loopEditor.dragManual = pressManual + delta
+                                }
                                 requestTimer.start()
                             } else if (loopEditor.navigating) {
                                 var span0 = Math.max(1, pressViewEnd - pressViewStart)
@@ -7289,22 +7305,27 @@ ApplicationWindow {
                         var slot = loopEditor.currentSlot()
                         if (loopEditor.dragging) {
                             loopEditor.dragging = false
-                            if (slot && loopEditor.dragManual !== slot.manual_nudge) {
-                                loopEditor.applying = true
-                                root.sendRecorderAction({
-                                    action: "set_nudge",
-                                    slot: slot.id,
-                                    manual: loopEditor.dragManual
-                                })
+                            if (loopEditor.alignMode) {
+                                loopEditor.setExportOffset(loopEditor.exportOffset)
+                                loopEditor.storeExportSettings()
                             } else {
-                                loopEditor.applying = false
+                                if (slot && loopEditor.dragManual !== slot.manual_nudge) {
+                                    loopEditor.applying = true
+                                    root.sendRecorderAction({
+                                        action: "set_nudge",
+                                        slot: slot.id,
+                                        manual: loopEditor.dragManual
+                                    })
+                                } else {
+                                    loopEditor.applying = false
+                                }
+                                loopEditor.requestWaveform(null)
                             }
-                            loopEditor.requestWaveform(null)
                         } else if (loopEditor.navigating) {
                             settleTimer.stop()
                             loopEditor.navigating = false
                             if (!moved && (mouse.modifiers & Qt.ControlModifier)) {
-                                var total = loopEditor.displayTotal()
+                                var total = loopEditor.waveNudge
                                 var frames = Math.max(1, slot ? slot.frames : 1)
                                 var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                                 var best = -1
