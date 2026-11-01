@@ -5440,9 +5440,10 @@ ApplicationWindow {
                             reorderEnabled: stripCard.reorderable
                             onDropped: (index) => backend.moveStrip(stripCard.stripData.id, index)
                         }
-                        TapHandler {
+                        MouseArea {
+                            anchors.fill: parent
                             acceptedButtons: Qt.RightButton
-                            onSingleTapped: stripMenu.popup()
+                            onClicked: stripMenu.popup()
                         }
 
                         ColumnLayout {
@@ -5884,9 +5885,10 @@ ApplicationWindow {
                             reorderEnabled: busCard.reorderable
                             onDropped: (index) => backend.moveBus(busCard.busData.id, index)
                         }
-                        TapHandler {
+                        MouseArea {
+                            anchors.fill: parent
                             acceptedButtons: Qt.RightButton
-                            onSingleTapped: busMenu.popup()
+                            onClicked: busMenu.popup()
                         }
 
                         ColumnLayout {
