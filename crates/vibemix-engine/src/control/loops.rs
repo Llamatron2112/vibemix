@@ -284,9 +284,8 @@ impl Controller {
                     }
                     runtime.transients = result.transients;
                     runtime.slot.peaks = result.peaks;
-                    if self.model.recorder.transient {
-                        runtime.slot.transient_nudge = result.transient;
-                    }
+                    // Automatic transient nudging is intentionally disabled.
+                    runtime.slot.transient_nudge = 0;
                     let total = runtime.slot.base_nudge
                         + runtime.slot.transient_nudge
                         + runtime.slot.manual_nudge;
@@ -357,6 +356,7 @@ impl Controller {
                                 raw.to_vec().into_boxed_slice(),
                                 loaded.frames,
                                 pending.slot.nudge_samples,
+                                pending.slot.output_bus.0 as usize,
                             ) {
                                 tracing::warn!(%error, "failed to install loaded loop");
                             } else {
@@ -527,15 +527,13 @@ impl Controller {
             self.recorder_dirty = true;
             return;
         };
-        let base = if self.model.recorder.auto_latency {
-            latency_frames as i64
-        } else {
-            0
-        };
+        // Latency compensation is always applied. Automatic first-transient
+        // snapping is not: transients are still detected for the editor, but
+        // the take starts at the latency-corrected bar position.
+        let base = latency_frames as i64;
         let manual = self.model.recorder.nudge_samples;
         let total = base + manual;
         let sensitivity = self.model.recorder.transient_sensitivity;
-        let auto_transient = self.model.recorder.transient;
         let generation = self.next_loop_generation;
         self.next_loop_generation = self.next_loop_generation.wrapping_add(1);
         let raw: Arc<[f32]> = Arc::from(&buffer[..frames * 2]);
@@ -560,11 +558,18 @@ impl Controller {
             normalize: false,
             peaks: Vec::new(),
             gain: 1.0,
+            output_bus: BusId(0),
             mute: false,
             playing: false,
             saved: false,
         };
-        if let Err(error) = self.engine.set_loop(slot_index, buffer, frames, total) {
+        if let Err(error) = self.engine.set_loop(
+            slot_index,
+            buffer,
+            frames,
+            total,
+            slot.output_bus.0 as usize,
+        ) {
             tracing::warn!(%error, "failed to install recorded loop");
             self.recorder_status.message = error.to_string();
             self.recorder_dirty = true;
@@ -586,8 +591,6 @@ impl Controller {
                 frames,
                 sample_rate,
                 sensitivity,
-                auto_transient,
-                base,
             }));
         self.rebuild_model_loops();
         self.loops_dirty = true;
@@ -694,6 +697,26 @@ impl Controller {
                 if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
                     runtime.slot.mute = mute;
                     let _ = self.engine.loop_mute(slot as usize, mute);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
+            }
+            RecorderAction::SetLoopBus { slot, bus } => {
+                if !self.model.buses.iter().any(|entry| entry.id.0 == bus) {
+                    return snapshot;
+                }
+                let index = slot as usize;
+                if let Some(runtime) = self.loops.get_mut(index).and_then(Option::as_mut) {
+                    runtime.slot.output_bus = BusId(bus);
+                    let _ = self.engine.loop_bus(index, bus as usize);
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                } else if let Some(pending) = self
+                    .pending_loop_loads
+                    .iter_mut()
+                    .find(|pending| pending.index == index)
+                {
+                    pending.slot.output_bus = BusId(bus);
                     self.rebuild_model_loops();
                     self.loops_dirty = true;
                 }
@@ -943,6 +966,53 @@ impl Controller {
             .collect();
         loops.sort_by_key(|slot| slot.id);
         self.model.loops = loops;
+    }
+
+    /// Drops recorder sources and loop outputs that referenced a removed bus.
+    pub(super) fn removed_bus(&mut self, bus: u32) {
+        let mut changed = false;
+        for (index, runtime) in self.loops.iter_mut().enumerate() {
+            if let Some(runtime) = runtime {
+                if runtime.slot.output_bus.0 == bus {
+                    runtime.slot.output_bus = BusId(0);
+                    let _ = self.engine.loop_bus(index, 0);
+                    changed = true;
+                }
+            }
+        }
+        for pending in &mut self.pending_loop_loads {
+            if pending.slot.output_bus.0 == bus {
+                pending.slot.output_bus = BusId(0);
+                changed = true;
+            }
+        }
+        if changed {
+            self.rebuild_model_loops();
+            self.loops_dirty = true;
+        }
+        let before = self.model.recorder.sources.len();
+        self.model.recorder.sources.retain(|source| {
+            !(source.kind == vibemix_core::recorder::RecorderSourceKind::Bus && source.id == bus)
+        });
+        if before != self.model.recorder.sources.len() {
+            self.engine
+                .recorder()
+                .set_sources(&self.model.recorder.sources);
+        }
+    }
+
+    /// Drops recorder sources that referenced a removed strip.
+    pub(super) fn removed_strip(&mut self, strip: u32) {
+        let before = self.model.recorder.sources.len();
+        self.model.recorder.sources.retain(|source| {
+            !(source.kind == vibemix_core::recorder::RecorderSourceKind::Strip
+                && source.id == strip)
+        });
+        if before != self.model.recorder.sources.len() {
+            self.engine
+                .recorder()
+                .set_sources(&self.model.recorder.sources);
+        }
     }
 
     pub(super) fn clear_loops(&mut self) {

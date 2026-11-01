@@ -245,6 +245,9 @@ pub enum ControlMessage {
     LoopList {
         json: String,
     },
+    LoopProgress {
+        json: String,
+    },
     LoopWaveform {
         json: String,
     },
@@ -823,6 +826,10 @@ impl ControlMessage {
                 addr: addr::LOOP_LIST.to_string(),
                 args: vec![OscType::String(json.clone())],
             },
+            LoopProgress { json } => OscMessage {
+                addr: addr::LOOP_PROGRESS.to_string(),
+                args: vec![OscType::String(json.clone())],
+            },
             LoopWaveform { json } => OscMessage {
                 addr: addr::LOOP_WAVEFORM.to_string(),
                 args: vec![OscType::String(json.clone())],
@@ -1315,6 +1322,9 @@ impl ControlMessage {
                 json: string(args, 0)?,
             }),
             addr::LOOP_LIST => Some(ControlMessage::LoopList {
+                json: string(args, 0)?,
+            }),
+            addr::LOOP_PROGRESS => Some(ControlMessage::LoopProgress {
                 json: string(args, 0)?,
             }),
             addr::LOOP_WAVEFORM => Some(ControlMessage::LoopWaveform {
@@ -1918,6 +1928,13 @@ mod tests {
             has: true,
             location: 1,
             name: "Compressor".to_string(),
+        });
+    }
+
+    #[test]
+    fn roundtrip_loop_progress() {
+        roundtrip(ControlMessage::LoopProgress {
+            json: "[{\"id\":0,\"progress\":0.25,\"playing\":true,\"pending\":false}]".to_string(),
         });
     }
 

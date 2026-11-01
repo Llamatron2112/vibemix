@@ -860,6 +860,30 @@ impl Controller {
             if let Ok(bytes) = message.encode() {
                 self.send_datagram(&bytes, address);
             }
+
+            if !self.model.loops.is_empty() {
+                let progress: Vec<serde_json::Value> = self
+                    .model
+                    .loops
+                    .iter()
+                    .map(|slot| {
+                        let (progress, playing, pending) =
+                            self.engine.loop_status(slot.id as usize);
+                        serde_json::json!({
+                            "id": slot.id,
+                            "progress": progress,
+                            "playing": playing,
+                            "pending": pending,
+                        })
+                    })
+                    .collect();
+                if let Ok(json) = serde_json::to_string(&progress) {
+                    let message = ControlMessage::LoopProgress { json };
+                    if let Ok(bytes) = message.encode() {
+                        self.send_datagram(&bytes, address);
+                    }
+                }
+            }
         }
 
         // Third-party plugin teardown can hang; never let that leave editor
@@ -973,8 +997,13 @@ impl Controller {
                     .collect()
             })
             .collect();
-        let loop_delay = dsp::DelayLine::new(max_delay_samples);
-        if let Err(error) = self.engine.set_sample_rate(sample_rate, delays, loop_delay) {
+        let loop_delays = (0..MAX_LOOPS)
+            .map(|_| dsp::DelayLine::new(max_delay_samples))
+            .collect();
+        if let Err(error) = self
+            .engine
+            .set_sample_rate(sample_rate, delays, loop_delays)
+        {
             tracing::warn!(%error, "failed to push sample-rate change");
         }
         self.sample_rate = rate;
@@ -1264,6 +1293,7 @@ impl Controller {
                     tracing::warn!(%error, strip, "failed to unregister strip ports");
                 }
                 self.engine.sync_port_names(&self.model);
+                self.removed_strip(strip);
                 // Close the editors of every plugin on the removed strip, on
                 // both the pre- and post-fader chains.
                 self.close_uis_where(|location, target, _| {
@@ -1286,6 +1316,7 @@ impl Controller {
                     tracing::warn!(%error, bus, "failed to unregister bus return ports");
                 }
                 self.engine.sync_port_names(&self.model);
+                self.removed_bus(bus);
                 // Close the editors of every plugin on the removed bus.
                 self.close_uis_where(|location, target, _| {
                     location == PLUGIN_LOC_BUS && target == bus
@@ -1843,6 +1874,7 @@ impl Controller {
             }
             ControlMessage::RecorderStatus { .. }
             | ControlMessage::LoopList { .. }
+            | ControlMessage::LoopProgress { .. }
             | ControlMessage::LoopWaveform { .. } => Actions::default(),
             ControlMessage::SetLayout {
                 strips_per_row,

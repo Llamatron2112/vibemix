@@ -1282,6 +1282,54 @@ pub struct RecorderSnapshot {
     pub loop_beats: f32,
 }
 
+/// Per-loop playback status shared with the GUI.
+pub struct SharedLoops {
+    progress: Vec<AtomicU32>,
+    playing: Vec<AtomicBool>,
+    pending: Vec<AtomicBool>,
+}
+
+impl SharedLoops {
+    pub fn new(slots: usize) -> Self {
+        Self {
+            progress: (0..slots)
+                .map(|_| AtomicU32::new(0.0f32.to_bits()))
+                .collect(),
+            playing: (0..slots).map(|_| AtomicBool::new(false)).collect(),
+            pending: (0..slots).map(|_| AtomicBool::new(false)).collect(),
+        }
+    }
+
+    pub fn publish(&self, slot: usize, progress: f32, playing: bool, pending: bool) {
+        if let Some(value) = self.progress.get(slot) {
+            value.store(progress.clamp(0.0, 1.0).to_bits(), Ordering::Relaxed);
+        }
+        if let Some(value) = self.playing.get(slot) {
+            value.store(playing, Ordering::Relaxed);
+        }
+        if let Some(value) = self.pending.get(slot) {
+            value.store(pending, Ordering::Relaxed);
+        }
+    }
+
+    pub fn status(&self, slot: usize) -> (f32, bool, bool) {
+        (
+            self.progress
+                .get(slot)
+                .map(|value| f32::from_bits(value.load(Ordering::Relaxed)))
+                .unwrap_or(0.0),
+            self.playing
+                .get(slot)
+                .map(|value| value.load(Ordering::Relaxed))
+                .unwrap_or(false),
+            self.pending
+                .get(slot)
+                .map(|value| value.load(Ordering::Relaxed))
+                .unwrap_or(false),
+        )
+    }
+}
+
 /// Recorder state shared between the audio thread and the control thread.
 pub struct SharedRecorder {
     state: AtomicU32,

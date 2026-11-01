@@ -529,14 +529,20 @@ impl MixerModel {
     /// Ensures the master (bus 0) sits last in display order. Called after
     /// loading a session so the GUI always shows it rightmost.
     pub fn normalize_buses(&mut self) {
-        let Some(current) = self.buses.iter().position(|bus| bus.id == BusId(0)) else {
-            return;
-        };
-        if current == self.buses.len() - 1 {
-            return;
+        if let Some(current) = self.buses.iter().position(|bus| bus.id == BusId(0)) {
+            if current != self.buses.len() - 1 {
+                let master = self.buses.remove(current);
+                self.buses.push(master);
+            }
         }
-        let master = self.buses.remove(current);
-        self.buses.push(master);
+        // A loop cannot play into a bus that no longer exists; fall back to
+        // master instead of silently going quiet.
+        let valid: Vec<BusId> = self.buses.iter().map(|bus| bus.id).collect();
+        for slot in &mut self.loops {
+            if !valid.contains(&slot.output_bus) {
+                slot.output_bus = BusId(0);
+            }
+        }
     }
 }
 
@@ -676,6 +682,30 @@ mod tests {
         assert!(parsed.sidechain.is_empty());
         assert!(!parsed.sidechain_enabled);
         assert_eq!(parsed.midi_channel, None);
+    }
+
+    #[test]
+    fn loops_fall_back_to_master_when_their_bus_is_gone() {
+        let mut model = MixerModel::default_minimal();
+        model.buses.push(Bus::new(BusId(1), "aux"));
+        model.buses.push(Bus::new(BusId(2), "aux2"));
+        let keep = crate::recorder::LoopSlot {
+            id: 0,
+            output_bus: BusId(1),
+            ..Default::default()
+        };
+        let gone = crate::recorder::LoopSlot {
+            id: 1,
+            output_bus: BusId(2),
+            ..Default::default()
+        };
+        model.loops = vec![keep, gone];
+
+        model.buses.retain(|bus| bus.id != BusId(2));
+        model.normalize_buses();
+
+        assert_eq!(model.loops[0].output_bus, BusId(1));
+        assert_eq!(model.loops[1].output_bus, BusId(0));
     }
 
     #[test]

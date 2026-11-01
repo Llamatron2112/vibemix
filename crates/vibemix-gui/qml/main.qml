@@ -208,7 +208,9 @@ ApplicationWindow {
     }
     property var levels: ({ strips: {}, buses: {} })
     property var catalog: []
-    property var recorderRows: []
+    property int loopSaveTargetId: -1
+    property int loopSaveDepth: 24
+    property bool loopSaveNormalize: false
     property var meterSource: ({})
     property var busMeterSource: ({})
     property bool sliderHovered: false
@@ -878,6 +880,68 @@ ApplicationWindow {
     function recorderInfo() {
         try { return JSON.parse(backend.recorder) } catch (e) { return ({ state: "idle", progress: 0 }) }
     }
+    function recorderSourceTap(kind, id) {
+        var sources = root.recorderSettings().sources || []
+        for (var i = 0; i < sources.length; i++) {
+            if (sources[i].kind === kind && sources[i].id === id) return sources[i].tap
+        }
+        return ""
+    }
+    function cycleRecorderSource(kind, id) {
+        if (root.recorderInfo().state !== "idle") return
+        var settings = root.recorderSettings()
+        var sources = (settings.sources || []).slice()
+        var index = -1
+        for (var i = 0; i < sources.length; i++) {
+            if (sources[i].kind === kind && sources[i].id === id) {
+                index = i
+                break
+            }
+        }
+        if (kind === "strip") {
+            if (index < 0) {
+                if (sources.length >= 16) return
+                sources.push({ kind: kind, id: id, tap: "post_fader" })
+            } else if (sources[index].tap === "post_fader") {
+                sources[index].tap = "pre_fader"
+            } else if (sources[index].tap === "pre_fader") {
+                sources[index].tap = "input"
+            } else {
+                sources.splice(index, 1)
+            }
+        } else {
+            if (index < 0) {
+                if (sources.length >= 16) return
+                sources.push({ kind: kind, id: id, tap: "output" })
+            } else {
+                sources.splice(index, 1)
+            }
+        }
+        settings.sources = sources
+        backend.setRecorderSettings(JSON.stringify(settings))
+    }
+    readonly property var loopStatuses: {
+        try {
+            var value = JSON.parse(backend.loop_progress)
+            return Array.isArray(value) ? value : []
+        } catch (e) {
+            return []
+        }
+    }
+    function loopStatus(id) {
+        var list = root.loopStatuses
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].id === id) return list[i]
+        }
+        return ({ id: id, progress: 0, playing: false, pending: false })
+    }
+    function busName(id) {
+        var buses = mix.buses || []
+        for (var i = 0; i < buses.length; i++) {
+            if (buses[i].id === id) return buses[i].name || ("bus " + id)
+        }
+        return "Master"
+    }
     function loopList() {
         try {
             var value = JSON.parse(backend.loops)
@@ -919,52 +983,6 @@ ApplicationWindow {
         var folder = root.loopFolder()
         return folder.length > 0 ? "file://" + encodeURI(folder) : "file:///"
     }
-    function openRecorder() {
-        var selected = root.recorderSettings().sources
-        var rows = []
-        function selectedTap(kind, id) {
-            for (var i = 0; i < selected.length; i++) {
-                if (selected[i].kind === kind && selected[i].id === id) return selected[i].tap
-            }
-            return null
-        }
-        var strips = mix.strips || []
-        for (var s = 0; s < strips.length; s++) {
-            var stripTap = selectedTap("strip", strips[s].id)
-            rows.push({
-                kind: "strip", id: strips[s].id, name: strips[s].name || ("strip " + strips[s].id),
-                checked: stripTap !== null, tap: stripTap || "post_fader",
-                taps: ["input", "pre_fader", "post_fader"]
-            })
-        }
-        var buses = mix.buses || []
-        for (var b = 0; b < buses.length; b++) {
-            if (buses[b].id === 0) continue
-            var busTap = selectedTap("bus", buses[b].id)
-            rows.push({
-                kind: "bus", id: buses[b].id, name: buses[b].name || ("bus " + buses[b].id),
-                checked: busTap !== null, tap: "output", taps: ["output"]
-            })
-        }
-        root.recorderRows = rows
-        recorderDialog.open()
-    }
-    function applyRecorderRows() {
-        var sources = []
-        for (var i = 0; i < root.recorderRows.length; i++) {
-            var row = root.recorderRows[i]
-            if (row.checked) sources.push({ kind: row.kind, id: row.id, tap: row.tap })
-        }
-        var settings = root.recorderSettings()
-        settings.sources = sources
-        backend.setRecorderSettings(JSON.stringify(settings))
-    }
-    function setRecorderRow(index, key, value) {
-        var rows = root.recorderRows.slice()
-        rows[index][key] = value
-        root.recorderRows = rows
-        root.applyRecorderRows()
-    }
     function loopDescription(slot) {
         var seconds = slot.sample_rate > 0 ? slot.frames / slot.sample_rate : 0
         var length = slot.loop_beats > 0 ? (slot.loop_beats + " beats") : (seconds.toFixed(2) + " s")
@@ -994,8 +1012,9 @@ ApplicationWindow {
     }
     function saveLoop(slot, bitDepth, normalize) {
         if (!slot) return
-        loopEditor.saveDepth = bitDepth
-        loopEditor.saveNormalize = normalize
+        root.loopSaveTargetId = slot.id
+        root.loopSaveDepth = bitDepth
+        root.loopSaveNormalize = normalize
         var folder = root.loopFolder()
         var base = String(slot.name || "loop").replace(/[^A-Za-z0-9_-]+/g, "-")
         if (base.length === 0) base = "loop"
@@ -1004,15 +1023,15 @@ ApplicationWindow {
         loopSaveDialog.open()
     }
     function commitLoopSave(url) {
-        var slot = loopEditor.currentSlot()
+        var slot = root.loopById(root.loopSaveTargetId)
         if (!slot) return
         var path = root.localPath(url)
         root.sendRecorderAction({
             action: "loop_save",
             slot: slot.id,
             path: path,
-            bit_depth: loopEditor.saveDepth,
-            normalize: loopEditor.saveNormalize
+            bit_depth: root.loopSaveDepth,
+            normalize: root.loopSaveNormalize
         })
     }
     function renameLoop(slot, name) {
@@ -1441,17 +1460,6 @@ ApplicationWindow {
             }
             MenuSeparator { }
             MenuItem {
-                text: "Recorder…"
-                enabled: backend.connected
-                onTriggered: root.openRecorder()
-            }
-            MenuItem {
-                text: "Loops…"
-                enabled: backend.connected
-                onTriggered: loopsWindow.show()
-            }
-            MenuSeparator { }
-            MenuItem {
                 text: "About vibemix…"
                 onTriggered: aboutWindow.show()
             }
@@ -1568,14 +1576,130 @@ ApplicationWindow {
                             if (r.message) return r.message
                             if (r.state === "recording") return "recording " + Math.round((r.progress || 0) * 100) + "%"
                             if (r.state === "armed") return "armed: waiting for bar 1"
-                            return "record a loop"
+                            return "click to record a loop · right-click for settings"
                         }
 
                         MouseArea {
                             anchors.fill: parent
-                            onClicked: {
+                            acceptedButtons: Qt.LeftButton | Qt.RightButton
+                            onClicked: (mouse) => {
+                                if (mouse.button === Qt.RightButton) {
+                                    recordSettingsPopup.open()
+                                    return
+                                }
                                 var r = root.recorderInfo()
                                 root.sendRecorderAction({ action: r.state === "idle" ? "arm" : "cancel" })
+                            }
+                        }
+
+                        Popup {
+                            id: recordSettingsPopup
+                            parent: recordDot
+                            x: -width + recordDot.width
+                            y: recordDot.height + 4
+                            width: 250
+                            padding: 8
+                            modal: false
+                            closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
+                            background: Rectangle {
+                                color: root.palette.window
+                                border.color: root.borderColor
+                                border.width: 1
+                            }
+
+                            contentItem: ColumnLayout {
+                                width: recordSettingsPopup.availableWidth
+                                spacing: 6
+
+                                Label {
+                                    text: "record settings"
+                                    color: root.textColor
+                                    font.pixelSize: 11
+                                    font.bold: true
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: "length"
+                                        color: root.textColor
+                                        font.pixelSize: 11
+                                    }
+                                    SpinBox {
+                                        from: 1
+                                        to: 64
+                                        value: root.transportUi().loop_length
+                                        onValueModified: root.setTransportUi({ loop_length: value })
+                                    }
+                                    FlatButton {
+                                        text: root.transportUi().loop_bars ? "bars" : "beats"
+                                        onClicked: root.setTransportUi({ loop_bars: !root.transportUi().loop_bars })
+                                    }
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: "beats per bar"
+                                        color: root.textColor
+                                        font.pixelSize: 11
+                                    }
+                                    SpinBox {
+                                        from: 1
+                                        to: 16
+                                        value: Math.round(root.beatsPerBar())
+                                        onValueModified: backend.setBeatsPerBar(value)
+                                    }
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: "bit depth"
+                                        color: root.textColor
+                                        font.pixelSize: 11
+                                    }
+                                    ComboBox {
+                                        Layout.preferredWidth: 130
+                                        font.pixelSize: 11
+                                        model: ["16-bit", "24-bit", "32-bit float"]
+                                        currentIndex: {
+                                            var depth = root.recorderSettings().bit_depth
+                                            return depth === 16 ? 0 : (depth === 32 ? 2 : 1)
+                                        }
+                                        onActivated: {
+                                            var depths = [16, 24, 32]
+                                            root.updateRecorderSetting("bit_depth", depths[index])
+                                        }
+                                    }
+                                }
+
+                                ColumnLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 1
+                                    Label {
+                                        text: "save folder"
+                                        color: root.textColor
+                                        font.pixelSize: 11
+                                    }
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: root.loopFolder()
+                                        color: root.mutedText
+                                        font.pixelSize: 9
+                                        elide: Text.ElideMiddle
+                                        ToolTip.visible: folderHover.hovered
+                                        ToolTip.delay: 300
+                                        ToolTip.text: root.loopFolder()
+                                        HoverHandler { id: folderHover }
+                                    }
+                                }
                             }
                         }
                     }
@@ -1734,19 +1858,6 @@ ApplicationWindow {
                         checked: root.transportUi().loop_indicator
                         onTriggered: root.setTransportUi({ loop_indicator: !root.transportUi().loop_indicator })
                     }
-                    MenuSeparator { }
-                    MenuItem {
-                        text: "Loop settings…"
-                        onTriggered: loopDialog.open()
-                    }
-                    MenuItem {
-                        text: "Recorder…"
-                        onTriggered: root.openRecorder()
-                    }
-                    MenuItem {
-                        text: "Loops…"
-                        onTriggered: loopsWindow.show()
-                    }
                 }
             }
         }
@@ -1803,6 +1914,49 @@ ApplicationWindow {
         nameFilters: ["WAV (*.wav)", "All files (*)"]
         currentFolder: root.loopFolderUrl()
         onAccepted: root.commitLoopSave(selectedFile)
+    }
+
+    Dialog {
+        id: deleteLoopDialog
+        property int slot: -1
+        title: "Delete loop"
+        modal: true
+        anchors.centerIn: parent
+        width: 280
+        padding: 10
+
+        contentItem: ColumnLayout {
+            width: deleteLoopDialog.availableWidth
+            spacing: 10
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.textColor
+                font.pixelSize: 11
+                text: "Delete this loop? This cannot be undone."
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                Item { Layout.fillWidth: true }
+                FlatButton {
+                    text: "cancel"
+                    onClicked: deleteLoopDialog.close()
+                }
+                FlatButton {
+                    text: "delete"
+                    onClicked: {
+                        root.sendRecorderAction({
+                            action: "loop_delete",
+                            slot: deleteLoopDialog.slot
+                        })
+                        deleteLoopDialog.close()
+                    }
+                }
+            }
+        }
     }
 
     Dialog {
@@ -2249,65 +2403,100 @@ ApplicationWindow {
         }
     }
 
-    component ReorderGrip: Rectangle {
-        id: grip
+    component RecordFlag: Rectangle {
+        id: flag
+        property string kind: ""
+        property int target: 0
+        property string tap: ""
+        property bool recordable: true
+        property bool interactive: true
+        signal toggled()
+
+        implicitHeight: 12
+        radius: 2
+        color: flag.tap.length > 0
+            ? (flag.interactive ? "#e53935" : "#7a3a3a")
+            : (flagHover.hovered && flag.recordable && flag.interactive
+                ? root.controlColor : "transparent")
+        border.color: flag.tap.length > 0 ? "#e53935" : root.borderColor
+        border.width: 1
+
+        Label {
+            anchors.centerIn: parent
+            text: {
+                if (!flag.recordable) return "MASTER"
+                if (flag.tap === "input") return "IN"
+                if (flag.tap === "pre_fader") return "PRE"
+                if (flag.tap === "post_fader") return "POST"
+                if (flag.tap === "output") return "OUT"
+                return "REC"
+            }
+            color: flag.tap.length > 0 ? "white" : root.mutedText
+            font.pixelSize: 7
+            font.bold: flag.tap.length > 0
+        }
+
+        HoverHandler {
+            id: flagHover
+            cursorShape: flag.recordable && flag.interactive
+                ? Qt.PointingHandCursor : Qt.ArrowCursor
+        }
+        ToolTip.visible: flagHover.hovered && flag.recordable
+        ToolTip.delay: 350
+        ToolTip.text: !flag.interactive
+            ? "Stop recording to change sources"
+            : (flag.kind === "strip"
+                ? "Record source: click for post → pre → input → off"
+                : "Record source: click to toggle bus output")
+
+        TapHandler {
+            enabled: flag.recordable && flag.interactive
+            onSingleTapped: flag.toggled()
+        }
+    }
+
+    component CardDrag: DragHandler {
+        id: drag
         property var card
         property var row
         property string kind: ""
         property bool reorderEnabled: true
         signal dropped(int index)
-        signal menuRequested()
 
-        implicitHeight: 10
-        radius: 2
-        color: gripHover.hovered || gripDrag.active ? root.accentColor : root.borderColor
-        z: 1
+        target: null
+        enabled: drag.reorderEnabled
+        cursorShape: Qt.ClosedHandCursor
+        grabPermissions: Qt.ApprovesTakeOverByAnything
 
         function currentIndex() {
-            var kids = grip.row.children
+            var kids = drag.row.children
             var index = 0
             for (var i = 0; i < kids.length; i++) {
-                if (kids[i].reorderKind !== grip.kind) continue
-                if (kids[i] === grip.card) return index
+                if (kids[i].reorderKind !== drag.kind) continue
+                if (kids[i] === drag.card) return index
                 index++
             }
             return -1
         }
 
-        HoverHandler {
-            id: gripHover
-            cursorShape: Qt.OpenHandCursor
+        onTranslationChanged: {
+            drag.card.dragOffset = drag.translation.x
+            drag.card.dragOffsetY = drag.translation.y
         }
-
-        TapHandler {
-            acceptedButtons: Qt.RightButton
-            onSingleTapped: grip.menuRequested()
-        }
-
-        DragHandler {
-            id: gripDrag
-            target: null
-            enabled: grip.reorderEnabled
-            cursorShape: Qt.ClosedHandCursor
-            onTranslationChanged: {
-                grip.card.dragOffset = gripDrag.translation.x
-                grip.card.dragOffsetY = gripDrag.translation.y
-            }
-            onActiveChanged: {
-                if (!grip.card) return
-                if (gripDrag.active) {
-                    grip.card.dragging = true
-                    root.gripDragging = true
-                } else {
-                    var index = root.dropIndexFor(
-                        grip.row, grip.card, grip.card.dragOffset,
-                        grip.card.dragOffsetY, grip.kind)
-                    grip.card.dragging = false
-                    grip.card.dragOffset = 0
-                    grip.card.dragOffsetY = 0
-                    root.gripDragging = false
-                    if (index !== grip.currentIndex()) grip.dropped(index)
-                }
+        onActiveChanged: {
+            if (!drag.card) return
+            if (drag.active) {
+                drag.card.dragging = true
+                root.gripDragging = true
+            } else {
+                var index = root.dropIndexFor(
+                    drag.row, drag.card, drag.card.dragOffset,
+                    drag.card.dragOffsetY, drag.kind)
+                drag.card.dragging = false
+                drag.card.dragOffset = 0
+                drag.card.dragOffsetY = 0
+                root.gripDragging = false
+                if (index !== drag.currentIndex()) drag.dropped(index)
             }
         }
     }
@@ -5057,71 +5246,6 @@ ApplicationWindow {
     }
 
     Dialog {
-        id: loopDialog
-        title: "loop settings"
-        modal: true
-        width: 320
-        anchors.centerIn: parent
-        padding: 10
-
-        contentItem: ColumnLayout {
-            width: loopDialog.availableWidth
-            spacing: 8
-
-            RowLayout {
-                Layout.fillWidth: true
-                Label {
-                    Layout.fillWidth: true
-                    text: "beats per bar"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                SpinBox {
-                    from: 1
-                    to: 16
-                    value: Math.round(root.beatsPerBar())
-                    onValueModified: backend.setBeatsPerBar(value)
-                }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                Label {
-                    Layout.fillWidth: true
-                    text: "loop unit"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                FlatButton {
-                    text: root.transportUi().loop_bars ? "bars" : "beats"
-                    onClicked: root.setTransportUi({ loop_bars: !root.transportUi().loop_bars })
-                }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                Label {
-                    Layout.fillWidth: true
-                    text: root.transportUi().loop_bars ? "loop bars" : "loop beats"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                SpinBox {
-                    from: 1
-                    to: 64
-                    value: root.transportUi().loop_length
-                    onValueModified: root.setTransportUi({ loop_length: value })
-                }
-            }
-
-            FlatButton {
-                text: "close"
-                onClicked: loopDialog.close()
-            }
-        }
-    }
-
-    Dialog {
         id: missingDialog
         property var items: []
         title: "connections not restored"
@@ -5250,6 +5374,7 @@ ApplicationWindow {
                         id: stripCard
                         property var stripData: root.stripAt(model.sid)
                         property string reorderKind: "strip"
+                        readonly property bool reorderable: true
                         property bool dragging: false
                         property real dragOffset: 0
                         property real dragOffsetY: 0
@@ -5297,19 +5422,31 @@ ApplicationWindow {
                             }
                         }
 
+                        CardDrag {
+                            card: stripCard
+                            row: stripsGrid
+                            kind: "strip"
+                            reorderEnabled: stripCard.reorderable
+                            onDropped: (index) => backend.moveStrip(stripCard.stripData.id, index)
+                        }
+                        TapHandler {
+                            acceptedButtons: Qt.RightButton
+                            onSingleTapped: stripMenu.popup()
+                        }
+
                         ColumnLayout {
                             id: stripContent
                             anchors.fill: parent
                             anchors.margins: 6
                             spacing: 4
 
-                            ReorderGrip {
+                            RecordFlag {
                                 Layout.fillWidth: true
-                                card: stripCard
-                                row: stripsGrid
                                 kind: "strip"
-                                onDropped: (index) => backend.moveStrip(stripCard.stripData.id, index)
-                                onMenuRequested: stripMenu.popup()
+                                target: stripCard.stripData.id
+                                tap: root.recorderSourceTap("strip", stripCard.stripData.id)
+                                interactive: root.recorderInfo().state === "idle"
+                                onToggled: root.cycleRecorderSource("strip", stripCard.stripData.id)
                             }
 
                             NameEdit {
@@ -5729,20 +5866,32 @@ ApplicationWindow {
                             }
                         }
 
+                        CardDrag {
+                            card: busCard
+                            row: busesGrid
+                            kind: "bus"
+                            reorderEnabled: busCard.reorderable
+                            onDropped: (index) => backend.moveBus(busCard.busData.id, index)
+                        }
+                        TapHandler {
+                            acceptedButtons: Qt.RightButton
+                            onSingleTapped: busMenu.popup()
+                        }
+
                         ColumnLayout {
                             id: busContent
                             anchors.fill: parent
                             anchors.margins: 6
                             spacing: 4
 
-                            ReorderGrip {
+                            RecordFlag {
                                 Layout.fillWidth: true
-                                card: busCard
-                                row: busesGrid
                                 kind: "bus"
-                                reorderEnabled: busCard.reorderable
-                                onDropped: (index) => backend.moveBus(busCard.busData.id, index)
-                                onMenuRequested: busMenu.popup()
+                                target: busCard.busData.id
+                                recordable: busCard.busData.id !== 0
+                                tap: root.recorderSourceTap("bus", busCard.busData.id)
+                                interactive: root.recorderInfo().state === "idle"
+                                onToggled: root.cycleRecorderSource("bus", busCard.busData.id)
                             }
 
                             NameEdit {
@@ -5868,300 +6017,253 @@ ApplicationWindow {
                 }
             }
         }
-    }
 
-    Dialog {
-        id: recorderDialog
-        title: "recorder"
-        modal: true
-        anchors.centerIn: parent
-        width: 480
-        padding: 10
+        // ---- Loops ----
+        Item {
+            id: loopsPane
+            visible: root.loopList().length > 0
+            SplitView.preferredWidth: visible ? 184 : 0
+            SplitView.minimumWidth: visible ? 164 : 0
 
-        contentItem: ColumnLayout {
-            width: recorderDialog.availableWidth
-            spacing: 8
+            ColumnLayout {
+                anchors.fill: parent
+                spacing: 0
 
-            RowLayout {
-                Layout.fillWidth: true
-                Label {
-                    text: "length"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                Label {
+                Rectangle {
                     Layout.fillWidth: true
-                    text: root.transportUi().loop_length
-                        + (root.transportUi().loop_bars ? " bars" : " beats")
-                    color: root.mutedText
-                    font.pixelSize: 11
-                }
-                FlatButton {
-                    text: "loop settings…"
-                    onClicked: {
-                        recorderDialog.close()
-                        loopDialog.open()
-                    }
-                }
-            }
+                    implicitHeight: 24
+                    color: palette.button
 
-            Label {
-                text: "sources (summed)"
-                color: root.textColor
-                font.pixelSize: 11
-            }
-
-            Flickable {
-                Layout.fillWidth: true
-                Layout.preferredHeight: Math.min(220, recorderRowsColumn.implicitHeight)
-                clip: true
-                contentHeight: recorderRowsColumn.implicitHeight
-                ScrollBar.vertical: ScrollBar { }
-
-                ColumnLayout {
-                    id: recorderRowsColumn
-                    width: parent.width
-                    spacing: 1
-
-                    Repeater {
-                        model: root.recorderRows
-
-                        delegate: RowLayout {
-                            Layout.fillWidth: true
-                            spacing: 6
-                            property int rowIndex: index
-
-                            CheckBox {
-                                checked: modelData.checked
-                                onToggled: root.setRecorderRow(rowIndex, "checked", checked)
-                            }
-                            Label {
-                                Layout.fillWidth: true
-                                text: modelData.name
-                                color: root.textColor
-                                font.pixelSize: 11
-                                elide: Text.ElideRight
-                            }
-                            ComboBox {
-                                Layout.preferredWidth: 110
-                                font.pixelSize: 11
-                                model: modelData.taps
-                                currentIndex: Math.max(0, modelData.taps.indexOf(modelData.tap))
-                                enabled: modelData.checked
-                                onActivated: root.setRecorderRow(rowIndex, "tap", modelData.taps[index])
-                            }
-                        }
-                    }
-                }
-            }
-
-            RowLayout {
-                spacing: 12
-                CheckBox {
-                    text: "auto latency"
-                    checked: root.recorderSettings().auto_latency
-                    onToggled: root.updateRecorderSetting("auto_latency", checked)
-                }
-                CheckBox {
-                    text: "transient"
-                    checked: root.recorderSettings().transient
-                    onToggled: root.updateRecorderSetting("transient", checked)
-                }
-            }
-
-            RowLayout {
-                Label {
-                    text: "bit depth"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                ComboBox {
-                    Layout.preferredWidth: 130
-                    font.pixelSize: 11
-                    model: ["16-bit", "24-bit", "32-bit float"]
-                    currentIndex: {
-                        var depth = root.recorderSettings().bit_depth
-                        return depth === 16 ? 0 : (depth === 32 ? 2 : 1)
-                    }
-                    onActivated: {
-                        var depths = [16, 24, 32]
-                        root.updateRecorderSetting("bit_depth", depths[index])
-                    }
-                }
-                Item { Layout.fillWidth: true }
-                Label {
-                    text: root.recorderInfo().state + (root.recorderInfo().message ? " · " + root.recorderInfo().message : "")
-                    color: root.mutedText
-                    font.pixelSize: 10
-                    elide: Text.ElideRight
-                }
-            }
-
-            ProgressBar {
-                Layout.fillWidth: true
-                from: 0
-                to: 1
-                value: root.recorderInfo().progress || 0
-                visible: root.recorderInfo().state === "recording"
-            }
-
-            RowLayout {
-                FlatButton {
-                    text: root.recorderInfo().state === "idle" ? "arm" : "cancel"
-                    onClicked: {
-                        var state = root.recorderInfo().state
-                        root.sendRecorderAction({ action: state === "idle" ? "arm" : "cancel" })
-                    }
-                }
-                FlatButton {
-                    text: "loops…"
-                    onClicked: loopsWindow.show()
-                }
-                Item { Layout.fillWidth: true }
-                FlatButton {
-                    text: "close"
-                    onClicked: recorderDialog.close()
-                }
-            }
-        }
-    }
-
-    Window {
-        id: loopsWindow
-        modality: Qt.NonModal
-        flags: Qt.Window
-        transientParent: root
-        visible: false
-        width: 760
-        height: 430
-        minimumWidth: 420
-        minimumHeight: 260
-        title: "loops"
-        color: root.palette.window
-
-        ColumnLayout {
-            anchors.fill: parent
-            anchors.margins: 8
-            spacing: 6
-
-            RowLayout {
-                Label {
-                    Layout.fillWidth: true
-                    text: "loop launcher"
-                    color: root.textColor
-                    font.pixelSize: 12
-                    font.bold: true
-                }
-                FlatButton {
-                    text: "record…"
-                    onClicked: root.openRecorder()
-                }
-                FlatButton {
-                    text: "close"
-                    onClicked: loopsWindow.close()
-                }
-            }
-
-            GridView {
-                id: loopGrid
-                Layout.fillWidth: true
-                Layout.fillHeight: true
-                cellWidth: 156
-                cellHeight: 190
-                clip: true
-                model: root.loopList()
-
-                delegate: Rectangle {
-                    width: 146
-                    height: 180
-                    color: root.panelColor
-                    border.color: root.borderColor
-                    border.width: 1
-
-                    ColumnLayout {
+                    RowLayout {
                         anchors.fill: parent
-                        anchors.margins: 6
-                        spacing: 4
+                        anchors.leftMargin: 8
+                        anchors.rightMargin: 4
+                        spacing: 6
 
                         Label {
-                            Layout.fillWidth: true
-                            text: modelData.name
+                            text: "Loops"
                             color: root.textColor
                             font.pixelSize: 11
                             font.bold: true
-                            elide: Text.ElideRight
                         }
                         Label {
-                            Layout.fillWidth: true
-                            text: root.loopDescription(modelData)
+                            text: root.loopList().length
                             color: root.mutedText
                             font.pixelSize: 10
-                            elide: Text.ElideRight
                         }
+                        Item { Layout.fillWidth: true }
+                    }
+                }
 
-                        Canvas {
-                            Layout.fillWidth: true
-                            Layout.preferredHeight: 32
-                            property var peaks: modelData.peaks || []
-                            onPeaksChanged: requestPaint()
-                            onWidthChanged: requestPaint()
-                            onHeightChanged: requestPaint()
-                            onPaint: {
-                                var ctx = getContext("2d")
-                                ctx.clearRect(0, 0, width, height)
-                                if (!peaks || peaks.length === 0) return
-                                ctx.strokeStyle = root.mutedText
-                                ctx.beginPath()
-                                for (var i = 0; i < peaks.length; i++) {
-                                    var x = i / Math.max(1, peaks.length - 1) * width
-                                    var a = peaks[i] * height * 0.5
-                                    ctx.moveTo(x, height * 0.5 - a)
-                                    ctx.lineTo(x, height * 0.5 + a)
+                Flickable {
+                    id: loopsFlick
+                    Layout.fillWidth: true
+                    Layout.fillHeight: true
+                    contentWidth: width
+                    contentHeight: loopsColumn.implicitHeight + 8
+                    clip: true
+                    interactive: !root.sliderHovered
+                    ScrollBar.vertical: ScrollBar { }
+
+                    ColumnLayout {
+                        id: loopsColumn
+                        x: 4
+                        y: 4
+                        width: loopsFlick.width - 8
+                        spacing: 4
+
+                        Repeater {
+                            model: root.loopList()
+
+                            delegate: Rectangle {
+                                property var loopData: modelData
+                                property var loopState: root.loopStatus(modelData.id)
+                                Layout.fillWidth: true
+                                Layout.preferredHeight: loopContent.implicitHeight + 12
+                                color: root.panelColor
+                                border.color: loopState.playing
+                                    ? root.accentColor
+                                    : (loopState.pending ? "#f9a825" : root.borderColor)
+                                border.width: loopState.playing || loopState.pending ? 2 : 1
+
+                                TapHandler {
+                                    acceptedButtons: Qt.LeftButton
+                                    onSingleTapped: {
+                                        if (loopState.playing || loopState.pending) {
+                                            root.stopLoop(loopData)
+                                        } else {
+                                            root.startLoop(loopData, true)
+                                        }
+                                    }
                                 }
-                                ctx.stroke()
-                            }
-                        }
+                                TapHandler {
+                                    acceptedButtons: Qt.RightButton
+                                    onSingleTapped: loopMenu.popup()
+                                }
 
-                        RowLayout {
-                            spacing: 3
-                            FlatButton {
-                                text: modelData.playing ? "stop" : "play"
-                                implicitWidth: 44
-                                onClicked: modelData.playing
-                                    ? root.stopLoop(modelData)
-                                    : root.startLoop(modelData, true)
-                            }
-                            FlatButton {
-                                text: modelData.mute ? "unmute" : "mute"
-                                implicitWidth: 50
-                                onClicked: root.toggleLoopMute(modelData)
-                            }
-                            FlatButton {
-                                text: "edit"
-                                implicitWidth: 40
-                                onClicked: loopEditor.openFor(modelData.id)
-                            }
-                        }
+                                Menu {
+                                    id: loopMenu
+                                    MenuItem {
+                                        text: loopState.playing || loopState.pending ? "Stop" : "Play"
+                                        onTriggered: {
+                                            if (loopState.playing || loopState.pending) {
+                                                root.stopLoop(loopData)
+                                            } else {
+                                                root.startLoop(loopData, true)
+                                            }
+                                        }
+                                    }
+                                    MenuItem {
+                                        text: "Edit"
+                                        onTriggered: loopEditor.openFor(loopData.id)
+                                    }
+                                    MenuItem {
+                                        text: "Save…"
+                                        onTriggered: root.saveLoop(
+                                            loopData,
+                                            root.recorderSettings().bit_depth,
+                                            loopData.normalize)
+                                    }
+                                    MenuItem {
+                                        text: loopData.mute ? "Unmute" : "Mute"
+                                        onTriggered: root.toggleLoopMute(loopData)
+                                    }
+                                    MenuSeparator { }
+                                    Menu {
+                                        id: outputBusMenu
+                                        title: "Output bus"
+                                        Instantiator {
+                                            model: mix.buses
+                                            delegate: MenuItem {
+                                                required property var modelData
+                                                required property int index
+                                                text: modelData.name || ("bus " + modelData.id)
+                                                checkable: true
+                                                checked: (loopData.output_bus || 0) === modelData.id
+                                                onTriggered: root.sendRecorderAction({
+                                                    action: "set_loop_bus",
+                                                    slot: loopData.id,
+                                                    bus: modelData.id
+                                                })
+                                            }
+                                            onObjectAdded: (index, object) =>
+                                                outputBusMenu.insertItem(index, object)
+                                            onObjectRemoved: (index, object) =>
+                                                outputBusMenu.removeItem(object)
+                                        }
+                                    }
+                                    MenuSeparator { }
+                                    MenuItem {
+                                        text: "Delete"
+                                        onTriggered: {
+                                            deleteLoopDialog.slot = loopData.id
+                                            deleteLoopDialog.open()
+                                        }
+                                    }
+                                }
 
-                        Slider {
-                            Layout.fillWidth: true
-                            implicitHeight: 18
-                            from: 0
-                            to: 2
-                            value: modelData.gain
-                            onMoved: {
-                                if (!pressed) root.sendRecorderAction({
-                                    action: "set_loop_gain",
-                                    slot: modelData.id,
-                                    gain: value
-                                })
-                            }
-                            onPressedChanged: {
-                                if (!pressed) root.sendRecorderAction({
-                                    action: "set_loop_gain",
-                                    slot: modelData.id,
-                                    gain: value
-                                })
+                                ColumnLayout {
+                                    id: loopContent
+                                    anchors.fill: parent
+                                    anchors.margins: 6
+                                    spacing: 3
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 4
+
+                                        Label {
+                                            Layout.fillWidth: true
+                                            text: loopData.name
+                                            color: root.textColor
+                                            font.pixelSize: 10
+                                            font.bold: true
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+
+                                    Rectangle {
+                                        Layout.fillWidth: true
+                                        Layout.preferredHeight: 34
+                                        color: root.meterBack
+                                        border.color: root.borderColor
+                                        border.width: 1
+                                        clip: true
+
+                                        Canvas {
+                                            anchors.fill: parent
+                                            property var peaks: loopData.peaks || []
+                                            onPeaksChanged: requestPaint()
+                                            onWidthChanged: requestPaint()
+                                            onHeightChanged: requestPaint()
+                                            onPaint: {
+                                                var ctx = getContext("2d")
+                                                ctx.clearRect(0, 0, width, height)
+                                                if (!peaks || peaks.length === 0) return
+                                                ctx.strokeStyle = root.mutedText
+                                                ctx.beginPath()
+                                                for (var i = 0; i < peaks.length; i++) {
+                                                    var x = i / Math.max(1, peaks.length - 1) * width
+                                                    var a = peaks[i] * height * 0.45
+                                                    ctx.moveTo(x, height * 0.5 - a)
+                                                    ctx.lineTo(x, height * 0.5 + a)
+                                                }
+                                                ctx.stroke()
+                                            }
+                                        }
+                                        Rectangle {
+                                            anchors.left: parent.left
+                                            anchors.top: parent.top
+                                            anchors.bottom: parent.bottom
+                                            width: Math.max(0, Math.min(1, loopState.progress || 0))
+                                                * parent.width
+                                            color: root.accentColor
+                                            opacity: 0.22
+                                        }
+                                        Label {
+                                            visible: loopState.pending
+                                            anchors.centerIn: parent
+                                            text: "queued"
+                                            color: "#f9a825"
+                                            font.pixelSize: 9
+                                            font.bold: true
+                                        }
+                                    }
+
+                                    RowLayout {
+                                        Layout.fillWidth: true
+                                        spacing: 4
+
+                                        Label {
+                                            Layout.fillWidth: true
+                                            text: "→ " + root.busName(loopData.output_bus || 0)
+                                            color: root.mutedText
+                                            font.pixelSize: 9
+                                            elide: Text.ElideRight
+                                        }
+                                        Label {
+                                            text: root.loopDescription(loopData)
+                                            color: root.mutedText
+                                            font.pixelSize: 8
+                                            elide: Text.ElideRight
+                                        }
+                                    }
+
+                                    MiniSlider {
+                                        Layout.fillWidth: true
+                                        from: 0
+                                        to: 2
+                                        resetValue: 1
+                                        entryUnit: "gain-db"
+                                        value: loopData.gain
+                                        valueText: root.gainText(loopData.gain)
+                                        onMoved: (value) => root.sendRecorderAction({
+                                            action: "set_loop_gain",
+                                            slot: loopData.id,
+                                            gain: value
+                                        })
+                                    }
+                                }
                             }
                         }
                     }

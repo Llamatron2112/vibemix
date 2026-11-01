@@ -186,8 +186,9 @@ insert chain and gives each send the extra delay needed for its path into the
 destination to match the slowest path. For buses that reach master the target
 is global, including intermediate bus inserts; for a hardware-only bus the
 sends are aligned locally so a separate monitor output does not inherit the
-master's latency. Launcher playback is delayed by the same master target, so a
-loop stays aligned with compensated live sources. The plan is bounded by the
+master's latency. Launcher playback follows the compensation of the bus each
+loop is routed to, so a loop stays aligned with compensated live sources on
+that bus. The plan is bounded by the
 500 ms send-delay capacity; a path beyond it is clamped and the control thread
 logs a warning. The values are published to JACK with
 `jack_port_set_latency_range`, so each bus output port reports its actual
@@ -661,37 +662,50 @@ post-fader, `2` bus insert — and `target` (the strip or bus id).
 ## Loop recorder
 
 The recorder captures bar-aligned loops from the MIDI clock and plays them
-through a separate launcher window.
+through a loops pane beside the buses, shown only while at least one loop
+exists.
 
-- **Sources** are a sum of selected strip taps (input, pre-fader, post-fader) or
-  bus outputs. Master (bus 0) is excluded so a playing launcher cannot record
-  itself.
+- **Sources** are chosen directly on strip and bus cards. A strip's record flag
+  cycles off → post-fader → pre-fader → input; a bus flag toggles its output.
+  The selected sources are summed. Master (bus 0) is excluded so a playing
+  launcher cannot record itself. Source changes are refused while the recorder
+  is armed or recording. Removing a strip or bus drops the matching source.
 - The control thread allocates the capture buffer and sends it through the
   engine command queue. The audio thread fills it from the first bar boundary
   (the `START` event or a `CLOCK` landing on a multiple of `beats_per_bar`) to
   the pulse `loop_beats × 24` later, so the loop length comes from the clock's
   frames rather than a rounded BPM calculation.
 - A finished take is handed back through an `rtrb` queue. The control thread
-  trims it, applies the automatic offset (JACK buffer + plugin latency up to
-  the tap; for a bus output this includes the send compensation and the bus
-  inserts), and applies the manual offset. Transient detection runs on the
-  analysis worker: the take is installed with the base/manual rotation right
-  away, then the worker result updates its markers and transient nudge. The
-  audio thread keeps the automatic offset current while the recorder is armed,
-  so a plugin latency change mid-take is reflected in the finished take. All
-  offsets are a circular rotation: `out[i] = in[(i + nudge) mod frames]`.
+  trims it and always applies the automatic offset (JACK buffer + plugin
+  latency up to the tap; for a bus output this includes the send compensation
+  and the bus inserts), then the manual offset. Transient detection runs on the
+  analysis worker for the editor's markers, but its result never nudges the
+  take automatically: there is no automatic first-transient snap, and the take
+  starts at the latency-corrected bar position. The audio thread keeps the
+  automatic offset current while the recorder is armed, so a plugin latency
+  change mid-take is reflected in the finished take. All offsets are a circular
+  rotation: `out[i] = in[(i + nudge) mod frames]`.
 - The launcher installs the raw buffer through the command queue and keeps the
   rotation as a playback offset (`(pos + offset) mod frames`); nudging sends a
-  lightweight offset update, so a playing loop keeps running. Playback is mixed
-  into the master input and starts on the next bar when quantized. Buffers are
-  retired through a garbage queue, so no allocation or free happens on the
-  audio thread.
+  lightweight offset update, so a playing loop keeps running. Each loop is
+  mixed into its own output bus (master by default), delayed by that bus's PDC
+  target and faded on start/stop. Quantized playback starts on the next bar;
+  stop is immediate. Buffers are retired through a garbage queue, so no
+  allocation or free happens on the audio thread. The engine publishes each
+  slot's progress/playing/queued state at meter rate.
 - WAV files are written by the I/O worker at 16-bit, 24-bit or 32-bit
   float to the path chosen in the GUI's save dialog (default
   `VIBEMIX_CONFIG_DIR/loops/`). The chosen directory is remembered in the
   session, and the export can be normalized to -1 dBFS. The session stores loop
-  metadata and paths. Saved loops are read and analysed on the I/O worker; a
-  pending slot keeps its saved metadata visible until the file is installed.
+  metadata, output bus and paths. Saved loops are read and analysed on the I/O
+  worker; a pending slot keeps its saved metadata visible until the file is
+  installed. Removing a loop's output bus retargets it to master.
+- Loop cards start/stop playback on left click and expose edit, save, mute and
+  output-bus selection on right click; delete asks for confirmation. Each card
+  shows a whole-loop envelope, playback progress or queued state, a compact
+  volume slider and its output bus.
+- The record settings live in a non-modal popover on the top-bar record dot:
+  loop length and unit, beats per bar, bit depth and the save folder.
 - The editor requests an envelope for the visible window on demand; the scan
   runs on the analysis worker and stale replies are dropped by sequence number.
   The launcher cards keep a smaller whole-loop envelope. The view is free pan/zoom
@@ -799,12 +813,13 @@ slave mode it is silent for clock but can forward start/stop.
 - **UI:** the top status bar shows an always-on host-BPM readout (dimmed until
   the clock locks) and a colour-coded clock-stability readout (tempo jitter in
   ±BPM plus a count of glitchy pulses); both are toggled from a right-click
-  menu, which also toggles the beats:bars and minutes:seconds counters and
-  opens a small loop-settings popup (unit beats/bars, value, beats-per-bar).
+  menu, which also toggles the beats:bars and minutes:seconds counters.
   In master mode the BPM readout opens a tempo dialog and the transport button
   starts/stops the internal clock. Clicking the loop indicator while playing
   schedules a START in the gap after the current bar's last clock pulse and
   resets the transport at the next bar, in both master and slave modes.
+  Right-clicking the record dot opens a non-modal popover with loop length and
+  unit, beats per bar, bit depth and the save folder; left-click arms/disarms.
   `Options → MIDI sync…` is a non-modal page
   with the clock source, master tempo, transport send/receive, plugin transport
   following, and MIDI input/output routing. In beats mode the loop indicator

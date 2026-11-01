@@ -8,6 +8,19 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Loops and recording now live in the mixer.** Strip cards carry a record
+  source flag (off → post-fader → pre-fader → input) and bus cards an output
+  flag; clicking any other part of a card drags it to reorder. A loops pane
+  beside the buses appears while loops exist: left-click a card to start it on
+  the next bar or stop it immediately, right-click for edit, save, mute, output
+  bus and confirmed delete. Each loop has its own volume, waveform preview,
+  progress/queued indicator and output bus (master by default, retargeted to
+  master if the bus is removed) and is compensated for that bus's PDC target.
+  The Recorder and Loops dialogs are gone; remaining recording settings live in
+  a non-modal popover on the top-bar record dot (length/unit, beats per bar, bit
+  depth, save folder). Latency correction is always applied and takes are no
+  longer automatically nudged to their first transient (markers and manual snap
+  remain in the editor).
 - **Trim learn.** A strip's trim right-click menu can start a continuous learn
   mode that peak-holds the post-trim signal, cuts immediately above −0.1 dBFS,
   and boosts gradually only within the measured headroom. The loudest peak is
@@ -18,8 +31,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   receives the extra delay needed for every path into a bus (and into the
   master) to arrive together, on top of its manual `delay_ms` alignment. Dry
   paths are delayed to match latency-inducing FX buses, intermediate bus
-  inserts are included, and launcher playback is delayed by the same amount so
-  recorded loops stay aligned with live sources. The compensation is bounded by
+  inserts are included, and launcher playback is delayed by its output bus's
+  target so recorded loops stay aligned with live sources. The compensation is bounded by
   the 500 ms send-delay capacity; a warning is logged if a path exceeds it.
   It can be turned off from **Options → Automatic delay compensation** (saved
   with the session); when off, sends use only their manual delay and no

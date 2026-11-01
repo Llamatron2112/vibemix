@@ -8,6 +8,8 @@
 use realfft::RealFftPlanner;
 use serde::{Deserialize, Serialize};
 
+use crate::ids::BusId;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum RecorderSourceKind {
@@ -52,10 +54,12 @@ pub struct RecorderSettings {
     /// Folder for saved loops. Empty means `VIBEMIX_CONFIG_DIR/loops`.
     #[serde(default)]
     pub save_dir: String,
-    /// Apply the automatic JACK/plugin latency offset.
+    /// Retained for session compatibility; latency correction is always
+    /// applied, so this value is ignored.
     #[serde(default = "default_true")]
     pub auto_latency: bool,
-    /// Refine the offset with transient detection.
+    /// Retained for session compatibility; automatic first-transient snapping
+    /// is always off (the editor still shows markers).
     #[serde(default = "default_true")]
     pub transient: bool,
     /// Default transient-detector sensitivity for new takes, 0..1.
@@ -88,7 +92,7 @@ impl Default for RecorderSettings {
             bit_depth: 24,
             save_dir: String::new(),
             auto_latency: true,
-            transient: true,
+            transient: false,
             transient_sensitivity: default_sensitivity(),
             nudge_samples: 0,
             crossfade_ms: 0.0,
@@ -134,6 +138,9 @@ pub struct LoopSlot {
     pub peaks: Vec<f32>,
     #[serde(default = "default_gain")]
     pub gain: f32,
+    /// Bus this loop is played into. Master (bus 0) by default.
+    #[serde(default = "default_output_bus")]
+    pub output_bus: BusId,
     #[serde(default)]
     pub mute: bool,
     #[serde(default)]
@@ -144,6 +151,10 @@ pub struct LoopSlot {
 
 fn default_gain() -> f32 {
     1.0
+}
+
+fn default_output_bus() -> BusId {
+    BusId(0)
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -201,6 +212,10 @@ pub enum RecorderAction {
     SetLoopMute {
         slot: u32,
         mute: bool,
+    },
+    SetLoopBus {
+        slot: u32,
+        bus: u32,
     },
     LoopPlay {
         slot: u32,
@@ -598,6 +613,14 @@ mod tests {
         assert_eq!(rotate_interleaved(&src, 2, 1), vec![3.0, 4.0, 1.0, 2.0]);
         assert_eq!(rotate_interleaved(&src, 2, -1), vec![3.0, 4.0, 1.0, 2.0]);
         assert_eq!(rotate_interleaved(&src, 2, 3), vec![3.0, 4.0, 1.0, 2.0]);
+    }
+
+    #[test]
+    fn loop_defaults_play_into_master_and_do_not_snap_transients() {
+        let settings = RecorderSettings::default();
+        assert!(!settings.transient);
+        let slot = LoopSlot::default();
+        assert_eq!(slot.output_bus, BusId(0));
     }
 
     #[test]

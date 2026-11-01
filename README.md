@@ -52,8 +52,7 @@ small OSC control protocol.
 
 - **Menu bar**: **Add** for strips/buses, **Options** for MIDI sync…, MIDI
   bindings… and auto-fit, **File**/**Edit** for sessions and undo. Right-click
-  the top bar for the transport readouts (including the DSP usage), counters
-  and loop settings.
+  the top bar for the transport readouts (including the DSP usage) and counters.
 - **Layout**: `Options → Layout…` sets how many strips/buses per row (or
   **Auto**). Strips and buses are separate, independently scrolling panes.
 - **Add a plugin**: right-click a strip's insert chain → **Add plugin…**. The
@@ -65,14 +64,19 @@ small OSC control protocol.
   strip/bus sidechain panel.
 - **Meters**: click a meter to cycle its tap (strip IN/GAIN/OUT; bus
   IN/SEND/RET/OUT).
-- **Loop recorder**: `Options → Recorder…` selects any strips/buses (and the
-  tap for each strip), arms the recorder, and starts on the next bar 1 from the
-  MIDI clock. The editor opens the take with auto-latency and transient
-  offsets, fine/coarse circular nudge, and a WAV save at 16/24-bit or 32-bit
-  float. Saving opens a normal file dialog (the last folder is remembered in the
-  session) and can normalize the export to -1 dBFS. `Options → Loops…` is the
-  launcher: play/stop (quantized to the next bar), gain, mute and edit. The
-  editor's waveform zooms to the whole loop, its start, or its end. Drag
+- **Loop recorder**: click the record flag on strip cards to cycle its source
+  (post-fader → pre-fader → input → off), or on a bus card to record that bus
+  output; master cannot be recorded. Changes are refused while armed or
+  recording. Left-click the top-bar record dot to arm/cancel; right-click it for
+  length and unit, beats per bar, bit depth and the save folder. Recording
+  starts on the next bar 1 from the MIDI clock. A loops pane beside the buses
+  appears while loops exist: left-click a card to start on the next bar or stop
+  immediately, right-click for edit, save, mute, output bus and delete. Each
+  card shows volume, waveform, progress and output bus. The editor opens the take with the latency
+  correction always applied, fine/coarse circular nudge, transient markers and a
+  WAV save at 16/24-bit or 32-bit float. Saving opens a normal file dialog (the
+  last folder is remembered in the session) and can normalize the export to -1
+  dBFS. The editor's waveform zooms to the whole loop, its start, or its end. Drag
   horizontally to pan and vertically to zoom, Alt-drag to nudge (Shift = one
   sample per pixel), or type an exact manual value. Transient markers can be
   clicked with Ctrl to make that hit the loop start; "snap first" and "zero

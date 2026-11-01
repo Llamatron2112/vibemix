@@ -65,6 +65,7 @@ pub const RECORDER_SETTINGS: &str = "/vibemix/recorder/settings";
 pub const RECORDER_ACTION: &str = "/vibemix/recorder/action";
 pub const RECORDER_STATUS: &str = "/vibemix/recorder/status";
 pub const LOOP_LIST: &str = "/vibemix/loops";
+pub const LOOP_PROGRESS: &str = "/vibemix/loops/progress";
 pub const LOOP_WAVEFORM: &str = "/vibemix/loops/waveform";
 pub const LAYOUT: &str = "/vibemix/layout";
 pub const MIDI_LEARN: &str = "/vibemix/midi/learn";

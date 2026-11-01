@@ -346,6 +346,8 @@ pub struct LoopPlayback {
     pub quantized: bool,
     pub gain: f32,
     pub mute: bool,
+    /// Bus this loop is mixed into (0 = master).
+    pub output_bus: usize,
     /// Fading out before it stops, so a stop does not click.
     pub stopping: bool,
     /// Smoothed output level (follows `gain`, `mute` and `stopping`).
@@ -364,6 +366,7 @@ impl LoopPlayback {
             quantized: true,
             gain: 1.0,
             mute: false,
+            output_bus: 0,
             stopping: false,
             level: 1.0,
         }

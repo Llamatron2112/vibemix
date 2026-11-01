@@ -10,7 +10,7 @@ use std::thread;
 
 use vibemix_core::model::MixerModel;
 use vibemix_core::recorder::{
-    detect_transient, detect_transients_with_sensitivity, peaks, LoopSlot, LoopWaveform, Transient,
+    detect_transients_with_sensitivity, peaks, LoopSlot, LoopWaveform, Transient,
 };
 
 use super::loops::write_loop_wav;
@@ -36,8 +36,6 @@ pub(super) struct TakeAnalysisJob {
     pub frames: usize,
     pub sample_rate: u32,
     pub sensitivity: f32,
-    pub auto_transient: bool,
-    pub base: i64,
 }
 
 pub(super) struct SensitivityJob {
@@ -123,7 +121,6 @@ pub(super) struct TakeAnalysis {
     pub analysis_seq: u64,
     pub transients: Vec<Transient>,
     pub peaks: Vec<f32>,
-    pub transient: i64,
 }
 
 pub(super) struct SensitivityAnalysis {
@@ -246,20 +243,6 @@ fn run_autosave(job: AutosaveJob) -> WorkerOutput {
 fn run_take(job: TakeAnalysisJob) -> TakeAnalysis {
     let transients =
         detect_transients_with_sensitivity(&job.raw, job.frames, job.sample_rate, job.sensitivity);
-    let transient = if job.auto_transient {
-        let window = job.sample_rate as i64 / 10;
-        transients
-            .iter()
-            .find(|transient| (transient.frame as i64 - job.base).abs() <= window)
-            .map(|transient| transient.frame as i64 - job.base)
-            .unwrap_or_else(|| {
-                detect_transient(&job.raw, job.frames, job.sample_rate, job.base, 100.0)
-                    .map(|onset| onset - job.base)
-                    .unwrap_or(0)
-            })
-    } else {
-        0
-    };
     let peaks = peaks(&job.raw, job.frames, super::LOOP_PEAK_BUCKETS);
     TakeAnalysis {
         slot: job.slot,
@@ -267,7 +250,6 @@ fn run_take(job: TakeAnalysisJob) -> TakeAnalysis {
         analysis_seq: job.analysis_seq,
         transients,
         peaks,
-        transient,
     }
 }
 
@@ -473,8 +455,6 @@ mod tests {
             frames,
             sample_rate: 48_000,
             sensitivity: 0.5,
-            auto_transient: true,
-            base: 0,
         }
     }
 

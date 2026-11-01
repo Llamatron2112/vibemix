@@ -23,6 +23,8 @@ pub struct PdcPlan {
     /// True when a path could not be fully aligned because it exceeded the
     /// maximum delay the send lines can hold.
     limited: bool,
+    /// Whether automatic compensation is active.
+    enabled: bool,
 }
 
 impl PdcPlan {
@@ -33,6 +35,7 @@ impl PdcPlan {
             master_input: 0,
             local: vec![0.0; buses],
             limited: false,
+            enabled: true,
         }
     }
 
@@ -67,6 +70,7 @@ impl PdcPlan {
         let buses = self.bus_input.len();
         let max = max_frames as f32;
         let mut limited = false;
+        self.enabled = enabled;
 
         for row in &mut self.send_delay {
             row.fill(0);
@@ -224,6 +228,16 @@ impl PdcPlan {
     pub fn limited(&self) -> bool {
         self.limited
     }
+
+    /// Compensation delay for a launcher slot routed into `bus`. With PDC
+    /// disabled, launcher playback is not delayed.
+    pub fn loop_delay(&self, bus: usize) -> u32 {
+        if self.enabled {
+            self.bus_input(bus)
+        } else {
+            0
+        }
+    }
 }
 
 #[cfg(test)]
@@ -357,6 +371,42 @@ mod tests {
         assert_eq!(plan.bus_input(1), 100);
         assert_eq!(plan.bus_input(1) + 50, 150);
         assert!(!plan.limited());
+    }
+
+    #[test]
+    fn loops_use_the_delay_of_their_output_bus() {
+        let plan = plan(
+            [0, 0],
+            [100, 0],
+            [0, 50, 0],
+            [true, true, false],
+            &[(0, 0, false, 1.0, 0), (0, 1, false, 1.0, 0)],
+            48_000,
+        );
+        // Master is the slowest path; bus 1 arrives 50 frames earlier and needs
+        // less delay to line up. A loop routed to either bus follows that bus.
+        assert_eq!(plan.loop_delay(0), plan.master_input());
+        assert_eq!(plan.loop_delay(1), plan.bus_input(1));
+        assert!(plan.loop_delay(1) < plan.loop_delay(0));
+    }
+
+    #[test]
+    fn disabled_compensation_does_not_delay_loops() {
+        let mut plan = PdcPlan::new(2, 3);
+        plan.update(
+            &[0, 0],
+            &[100, 0],
+            &[0, 50, 0],
+            &[true, true, true],
+            &[true, true, false],
+            |_, _| 1.0,
+            |_, _| false,
+            |_, _| 0.0,
+            false,
+            48_000,
+        );
+        assert_eq!(plan.loop_delay(0), 0);
+        assert_eq!(plan.loop_delay(1), 0);
     }
 
     #[test]
