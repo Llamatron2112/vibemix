@@ -6371,6 +6371,7 @@ ApplicationWindow {
         property int gridDiv: 0
         property bool snapGrid: false
         property int exportOffset: 0
+        property int clickDiv: 1
         property var editorPeaks: []
         property var basePeaks: []
         property var waveSamples: []
@@ -6598,7 +6599,7 @@ ApplicationWindow {
                 bpm: ref && ref.bpm > 1 ? ref.bpm
                     : (slot.bpm > 1 ? slot.bpm : root.clockInfo().bpm),
                 beats_per_bar: root.beatsPerBar(),
-                subdivision: gridSubdivision(),
+                subdivision: clickDiv,
                 click_gain: 0.5
             })
             previewPlaying = true
@@ -6661,6 +6662,28 @@ ApplicationWindow {
                 buckets: 16384,
                 base: true
             })
+        }
+        function jumpToStart() {
+            var slot = currentSlot()
+            if (!slot) return
+            var span = Math.max(1, viewEnd - viewStart)
+            var view = clampView(0, Math.min(slot.frames, span))
+            viewStart = view.start
+            viewEnd = view.end
+            requestWaveform(null)
+            ruler.requestPaint()
+            editorWave.requestPaint()
+        }
+        function jumpToEnd() {
+            var slot = currentSlot()
+            if (!slot) return
+            var span = Math.max(1, viewEnd - viewStart)
+            var view = clampView(Math.max(0, slot.frames - span), slot.frames)
+            viewStart = view.start
+            viewEnd = view.end
+            requestWaveform(null)
+            ruler.requestPaint()
+            editorWave.requestPaint()
         }
         function fitView() {
             var slot = currentSlot()
@@ -7278,7 +7301,8 @@ ApplicationWindow {
                                     loopEditor.dragManual = pressManual + delta
                                 }
                                 requestTimer.start()
-                            } else if (loopEditor.navigating) {
+                            } else if (loopEditor.navigating
+                                       && !(mouse.modifiers & Qt.AltModifier)) {
                                 var span0 = Math.max(1, pressViewEnd - pressViewStart)
                                 var minSpan = Math.min(frames, 16)
                                 var pan = -dx * span0 / Math.max(1, width)
@@ -7398,6 +7422,16 @@ ApplicationWindow {
                     text: "fit"
                     implicitWidth: 34
                     onClicked: loopEditor.fitView()
+                }
+                FlatButton {
+                    text: "start"
+                    implicitWidth: 40
+                    onClicked: loopEditor.jumpToStart()
+                }
+                FlatButton {
+                    text: "end"
+                    implicitWidth: 34
+                    onClicked: loopEditor.jumpToEnd()
                 }
                 Label {
                     Layout.fillWidth: true
@@ -7657,6 +7691,18 @@ ApplicationWindow {
                 FlatButton {
                     text: loopEditor.previewPlaying ? "stop" : "preview"
                     onClicked: loopEditor.startPreview()
+                }
+                FlatButton {
+                    text: "click 1/" + loopEditor.clickDiv
+                    onClicked: {
+                        var values = [1, 2, 4]
+                        var at = values.indexOf(loopEditor.clickDiv)
+                        loopEditor.clickDiv = values[(at + 1) % values.length]
+                        if (loopEditor.previewPlaying) {
+                            loopEditor.startPreview()
+                            loopEditor.startPreview()
+                        }
+                    }
                 }
                 Label {
                     Layout.fillWidth: true
