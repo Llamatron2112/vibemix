@@ -22,8 +22,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   wrap without it, so showing loops does not wrap the strips into extra rows;
   the pane scrolls within the mixer height. Starting or restarting the
   transport relaunches playing loops on the bar, so a loop previewed while the
-  transport was stopped cannot stay out of phase. Latency correction is always
-  applied and takes are no longer automatically nudged to their first transient
+  transport was stopped cannot stay out of phase. The editor now requests an
+  explicit nudge, validates the nudge echoed by each waveform response, and
+  ignores stale windows, so the picture cannot disagree with playback after a
+  nudge change or reopening the editor. Latency correction is always applied
+  and takes are no longer automatically nudged to their first transient
   (markers and manual snap remain in the editor).
 - **Trim learn.** A strip's trim right-click menu can start a continuous learn
   mode that peak-holds the post-trim signal, cuts immediately above −0.1 dBFS,

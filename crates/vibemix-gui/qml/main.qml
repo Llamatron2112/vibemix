@@ -6306,6 +6306,10 @@ ApplicationWindow {
         property bool applying: false
         property int waveSeq: 0
         property int acceptedSeq: 0
+        /// Nudge used for the waveform window currently displayed. The window
+        /// is only drawn while this matches the current total, so the picture
+        /// can never lag behind playback after a nudge change.
+        property int waveNudge: 0
         property int saveDepth: 24
         property bool saveNormalize: false
         property real sensitivity: 0.5
@@ -6323,6 +6327,11 @@ ApplicationWindow {
             var slot = currentSlot()
             if (!slot) return 0
             return slot.base_nudge + slot.transient_nudge + displayManual()
+        }
+        function displayTotalMod() {
+            var slot = currentSlot()
+            var frames = slot && slot.frames ? slot.frames : 1
+            return ((displayTotal() % frames) + frames) % frames
         }
         function clampView(start, end) {
             var slot = currentSlot()
@@ -6344,12 +6353,13 @@ ApplicationWindow {
             viewEnd = Math.round(view.end)
             waveSeq += 1
             var full = view.start === 0 && view.end === slot.frames
+            var total = (nudge === undefined || nudge === null) ? loopEditor.displayTotal() : nudge
             root.sendRecorderAction({
                 action: "waveform",
                 slot: slot.id,
                 start: view.start,
                 end: view.end,
-                nudge: (nudge === undefined || nudge === null) ? null : nudge,
+                nudge: total,
                 seq: waveSeq,
                 buckets: full ? 16384 : 8192,
                 base: false
@@ -6494,6 +6504,7 @@ ApplicationWindow {
         }
         function openFor(id) {
             slotId = id
+            waveNudge = displayTotalMod()
             editorPeaks = []
             basePeaks = []
             waveSamples = []
@@ -6508,8 +6519,9 @@ ApplicationWindow {
             dragging = false
             navigating = false
             applying = false
-            waveSeq = 0
-            acceptedSeq = 0
+            // Keep the sequence monotonic across opens: a response from the
+            // previous editor session must not be accepted for this view.
+            acceptedSeq = waveSeq
             var opened = root.loopById(id)
             sensitivity = opened && opened.transient_sensitivity !== undefined
                 ? opened.transient_sensitivity : 0.5
@@ -6538,7 +6550,10 @@ ApplicationWindow {
                     if (wave.seq < loopEditor.acceptedSeq) return
                     if (Math.abs(wave.start - loopEditor.viewStart) > 0.5
                         || Math.abs(wave.end - loopEditor.viewEnd) > 0.5) return
+                    var wall = ((wave.nudge % frames) + frames) % frames
+                    if (wall !== loopEditor.displayTotalMod()) return
                     loopEditor.acceptedSeq = wave.seq
+                    loopEditor.waveNudge = wall
                     loopEditor.editorPeaks = peaks
                     loopEditor.waveSamples = wave.samples || []
                     loopEditor.waveHf = wave.hf || []
@@ -6660,7 +6675,16 @@ ApplicationWindow {
                         var base = loopEditor.basePeaks.length > 0
                             ? loopEditor.basePeaks : (slot.peaks || [])
                         var haveWindowPeaks = haveWindow && windowPeaks.length > 0
-                        var haveSamples = samples.length > 1 && haveWindow
+                        var total = loopEditor.displayTotal()
+                        var totalMod = loopEditor.displayTotalMod()
+                        // Only draw the loaded window when it was rotated with
+                        // the nudge that is current now; otherwise fall back to
+                        // the base peaks rotated by `total`. This keeps the
+                        // picture on the same phase as playback while a new
+                        // window is in flight.
+                        var windowMatches = loopEditor.waveNudge === totalMod
+                        haveWindowPeaks = haveWindowPeaks && windowMatches
+                        var haveSamples = samples.length > 1 && haveWindow && windowMatches
                             && viewStart >= dataStart - 1 && viewEnd <= dataEnd + 1
                         if (!haveWindowPeaks && base.length === 0 && !haveSamples) return
 
@@ -6670,8 +6694,7 @@ ApplicationWindow {
                         ctx.lineTo(width, height * 0.5)
                         ctx.stroke()
 
-                        var total = loopEditor.displayTotal()
-                        var phase = ((total % frames) + frames) % frames / frames
+                        var phase = totalMod / frames
                         var dataSpan = Math.max(1, dataEnd - dataStart)
 
                         function windowPeak(f0, f1) {

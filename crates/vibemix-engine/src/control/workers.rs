@@ -511,6 +511,38 @@ mod tests {
     }
 
     #[test]
+    fn waveform_window_is_rotated_by_its_nudge() {
+        let frames = 100;
+        let mut raw = vec![0.0f32; frames * 2];
+        // The first sound lives 60 frames into the raw take (capture latency).
+        raw[60 * 2] = 1.0;
+        raw[60 * 2 + 1] = 1.0;
+        let output = run_waveform(WaveformJob {
+            address: PathBuf::from("/tmp/vibemix-test.sock"),
+            slot: 0,
+            generation: 1,
+            raw: Arc::from(raw),
+            frames,
+            sample_rate: 48_000,
+            start: 0,
+            end: frames,
+            nudge: 60,
+            buckets: 512,
+            base: false,
+            seq: 1,
+            transients: Vec::new(),
+        });
+        let WorkerOutput::Waveform { json, .. } = output else {
+            panic!("expected waveform");
+        };
+        let payload: LoopWaveform =
+            serde_json::from_str(json.as_deref().expect("json")).expect("parse");
+        assert_eq!(payload.nudge, 60);
+        // Nudging the take by its latency puts the first sound at frame 0.
+        assert_eq!(payload.samples[0], 1.0);
+    }
+
+    #[test]
     fn save_loop_job_writes_the_file() {
         let dir = std::env::temp_dir().join(format!("vibemix-worker-save-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
