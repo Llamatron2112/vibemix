@@ -7114,7 +7114,7 @@ ApplicationWindow {
 
                         // Ghost of the snapped release position while an
                         // Alt-drag is in progress.
-                        if (loopEditor.ghostVisible && base.length > 0) {
+                        if (loopEditor.ghostVisible && loopEditor.dragging && base.length > 0) {
                             var ghostPhase =
                                 (((loopEditor.ghostOffset % frames) + frames) % frames) / frames
                             ctx.strokeStyle = Qt.rgba(
@@ -7476,6 +7476,8 @@ ApplicationWindow {
                         var slot = loopEditor.currentSlot()
                         if (dragMarker !== "") {
                             dragMarker = ""
+                            loopEditor.ghostVisible = false
+                            loopEditor.snapTarget = -1
                             loopEditor.storeExportSettings()
                             loopEditor.restartPreview()
                             editorWave.requestPaint()
@@ -7528,6 +7530,8 @@ ApplicationWindow {
                                 loopEditor.requestWaveform(null)
                             }
                         }
+                        loopEditor.ghostVisible = false
+                        loopEditor.snapTarget = -1
                         editorWave.requestPaint()
                         ruler.requestPaint()
                     }
