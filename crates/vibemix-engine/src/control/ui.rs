@@ -279,6 +279,7 @@ impl Controller {
         param: usize,
         value: f32,
     ) {
+        self.plugin_state_dirty.set(true);
         if let Some(chain) = strip_chain(location) {
             self.params
                 .set_plugin_param(target as usize, chain, slot as usize, param, value);
@@ -521,7 +522,13 @@ impl Controller {
     /// live in the UI host, so they need an explicit `Close`; in-process LV2
     /// and VST3 editors tear their window down when dropped.
     pub(super) fn close_ui(&mut self, key: (u32, u32, u32)) {
-        if let Some(OpenUi::Lv2Remote { id, .. }) = self.uis.remove(&key) {
+        let Some(ui) = self.uis.remove(&key) else {
+            return;
+        };
+        // A closed editor may have changed internal state that is not exposed
+        // as a parameter, so the next save must re-capture it.
+        self.plugin_state_dirty.set(true);
+        if let OpenUi::Lv2Remote { id, .. } = ui {
             self.ui_service.close(id);
         }
     }

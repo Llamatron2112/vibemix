@@ -73,6 +73,13 @@ PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
 - While plugin state is captured (session save, sample-rate rebuild) the chains
   are not run; a chain with active plugins is silenced for that short window
   rather than passed through dry (which would bypass limiters/compressors).
+  VST3/CLAP state access is UI-thread-only, so the capture itself stays on the
+  control thread; it is skipped when no plugin changed since the last capture,
+  and the session/autosave serialization and file writes run on the I/O worker.
+- Loop transient analysis, waveform envelope scans and WAV export run on
+  background workers. A finished take is installed immediately (base + manual
+  nudge) and the worker result updates its peaks, transient markers and nudge;
+  stale results are discarded by loop generation/sequence numbers.
 - The callback times itself; the smoothed load (time used over the period) and a
   decaying peak are published with the state snapshot and shown in the GUI.
 - The engine autosaves the session (`autosave.toml`, with the owning pid in
@@ -98,7 +105,9 @@ PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
   protocol, editor-host IPC, LV2 atoms, saved plugin state, session files, sweep
   output) with deterministic mutation tests that also run briefly in
   `cargo test`, and `just asan` runs the shims, the engine under load and every
-  installed plugin's smoke test under AddressSanitizer and UBSan.
+  installed plugin's smoke test under AddressSanitizer and UBSan. CI runs the
+  `just rt-guard`/`just rt-count` allocation audit against a dummy JACK server;
+  ASAN stays a local/manual run because of its build cost.
 - A JACK/PipeWire server shutdown is flagged from the notification handler and
   the control thread exits the engine, instead of idling on a dead client.
 - LV2 worker communication uses a dedicated non-RT worker thread.
@@ -649,24 +658,26 @@ through a separate launcher window.
 - A finished take is handed back through an `rtrb` queue. The control thread
   trims it, applies the automatic offset (JACK buffer + plugin latency up to
   the tap; for a bus output this includes the send compensation and the bus
-  inserts), optionally refines it with transient detection, and applies the
-  manual offset. The audio thread keeps the automatic offset current while the
-  recorder is armed, so a plugin latency change mid-take is reflected in the
-  finished take. All offsets are a circular rotation:
-  `out[i] = in[(i + nudge) mod frames]`.
+  inserts), and applies the manual offset. Transient detection runs on the
+  analysis worker: the take is installed with the base/manual rotation right
+  away, then the worker result updates its markers and transient nudge. The
+  audio thread keeps the automatic offset current while the recorder is armed,
+  so a plugin latency change mid-take is reflected in the finished take. All
+  offsets are a circular rotation: `out[i] = in[(i + nudge) mod frames]`.
 - The launcher installs the raw buffer through the command queue and keeps the
   rotation as a playback offset (`(pos + offset) mod frames`); nudging sends a
   lightweight offset update, so a playing loop keeps running. Playback is mixed
   into the master input and starts on the next bar when quantized. Buffers are
   retired through a garbage queue, so no allocation or free happens on the
   audio thread.
-- WAV files are written by the control thread at 16-bit, 24-bit or 32-bit
+- WAV files are written by the I/O worker at 16-bit, 24-bit or 32-bit
   float to the path chosen in the GUI's save dialog (default
   `VIBEMIX_CONFIG_DIR/loops/`). The chosen directory is remembered in the
   session, and the export can be normalized to -1 dBFS. The session stores loop
   metadata and paths.
-- The editor requests an envelope for the visible window on demand; the
-  launcher cards keep a smaller whole-loop envelope. The view is free pan/zoom
+- The editor requests an envelope for the visible window on demand; the scan
+  runs on the analysis worker and stale replies are dropped by sequence number.
+  The launcher cards keep a smaller whole-loop envelope. The view is free pan/zoom
   (horizontal drag pans, vertical drag zooms). Navigation keeps the last
   window's samples and envelope, remaps them into the new view, and requests a
   new resolution only after the gesture settles (120 ms), so zooming never

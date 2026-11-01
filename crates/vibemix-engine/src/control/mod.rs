@@ -19,9 +19,8 @@ use vibemix_core::model::{
 };
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_core::recorder::{
-    detect_transient, detect_transients_with_sensitivity, peaks, rotate_interleaved, snap_seam,
-    LoopSlot, LoopWaveform, RecorderAction, RecorderSettings, RecorderSource, RecorderStatus,
-    Transient,
+    detect_transients_with_sensitivity, peaks, rotate_interleaved, snap_seam, LoopSlot,
+    RecorderAction, RecorderSettings, RecorderSource, RecorderStatus, Transient,
 };
 use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 
@@ -43,6 +42,7 @@ mod plugins;
 mod smoke;
 mod state;
 mod ui;
+mod workers;
 
 pub use catalog::{discover_or_load_catalog, trust_catalog_bundles};
 pub use state::{apply_model, clamp_to_capacity, sync_model_from_params};
@@ -50,6 +50,7 @@ pub use state::{apply_model, clamp_to_capacity, sync_model_from_params};
 use catalog::*;
 use plugins::*;
 use state::*;
+use workers::*;
 
 const PLUGIN_LOC_STRIP_PRE: u32 = 0;
 const PLUGIN_LOC_STRIP_POST: u32 = 1;
@@ -110,8 +111,15 @@ struct PluginClipboard {
 /// file when loaded from disk); the engine holds the rotated playback copy.
 struct LoopRuntime {
     slot: LoopSlot,
-    raw: Vec<f32>,
+    /// Shared with the analysis/export workers so they can run without
+    /// copying the loop buffer.
+    raw: Arc<[f32]>,
     transients: Vec<Transient>,
+    /// Changes whenever this slot is replaced, so stale worker results are
+    /// discarded instead of being applied to a different loop.
+    generation: u64,
+    /// Changes on every transient-analysis request for this slot.
+    analysis_seq: u64,
 }
 
 struct PendingWaveform {
@@ -231,6 +239,21 @@ pub struct Controller {
     pending_waveform: Option<PendingWaveform>,
     /// Last "PDC exceeded the delay capacity" state reported to the log.
     pdc_limited_reported: bool,
+    /// Background workers for loop analysis, WAV I/O and session writes.
+    workers: WorkerPool,
+    /// Next generation assigned to an installed loop slot.
+    next_loop_generation: u64,
+    /// Latest waveform request sequence submitted for the editor.
+    waveform_seq: u64,
+    /// Latest waveform request, re-run when analysis finishes so the editor
+    /// gets fresh transient markers.
+    last_waveform: Option<(PathBuf, WaveformSpec)>,
+    /// A session save is being written on the I/O worker.
+    session_saving: bool,
+    /// The periodic autosave is being written on the I/O worker.
+    autosave_saving: bool,
+    /// A plugin's saved state may have changed since the last capture.
+    plugin_state_dirty: std::cell::Cell<bool>,
 }
 
 /// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
@@ -475,6 +498,13 @@ impl Controller {
             loops_dirty: true,
             pending_waveform: None,
             pdc_limited_reported: false,
+            workers: WorkerPool::new(),
+            next_loop_generation: 1,
+            waveform_seq: 0,
+            last_waveform: None,
+            session_saving: false,
+            autosave_saving: false,
+            plugin_state_dirty: std::cell::Cell::new(true),
         };
         controller.ensure_model_plugin_controls();
         controller
@@ -593,6 +623,7 @@ impl Controller {
             }
             self.engine.drain_garbage();
             self.poll_recorder();
+            self.poll_workers();
             self.pump_uis();
             let vst3_edits = self.drain_vst3_param_edits();
             let clap_edits = self.drain_clap_param_edits();
@@ -677,6 +708,7 @@ impl Controller {
             // A MIDI control-surface CC changed a parameter; push it to the UI
             // immediately instead of waiting for the next state query.
             if self.engine.midi_map().take_changed() {
+                self.plugin_state_dirty.set(true);
                 sync_model_from_params(&self.params, &mut self.model);
                 actions.snapshot = true;
             }
@@ -703,7 +735,7 @@ impl Controller {
                 self.send_message(&message, address);
             }
             if let Some(slot) = self.pending_waveform.take() {
-                self.send_loop_waveform(address, slot);
+                self.submit_waveform(address, slot);
             }
             if actions.catalog {
                 self.send_catalog(address);
@@ -817,23 +849,24 @@ impl Controller {
     /// at the last explicit save; parameters and the mix are always current.
     fn autosave(&mut self) {
         self.last_autosave = Instant::now();
-        sync_model_from_params(&self.params, &mut self.model);
-        self.engine.capture_connections(&mut self.model);
-        let Ok(text) = toml::to_string_pretty(&self.model) else {
-            return;
-        };
-        if text == self.last_autosave_text {
+        if self.autosave_saving {
             return;
         }
+        sync_model_from_params(&self.params, &mut self.model);
+        self.engine.capture_connections(&mut self.model);
         // Record which process owns the file, so another engine sharing this
         // config directory does not mistake a live autosave for a crashed one.
         let _ = vibemix_core::config::write_atomic(
             &autosave_owner_path(),
             std::process::id().to_string(),
         );
-        match vibemix_core::config::write_atomic(&autosave_path(), &text) {
-            Ok(()) => self.last_autosave_text = text,
-            Err(error) => tracing::warn!(%error, "autosave failed"),
+        let job = IoJob::Autosave(AutosaveJob {
+            model: Box::new(self.model.clone()),
+            path: autosave_path(),
+            previous: self.last_autosave_text.clone(),
+        });
+        if self.workers.submit_io(job) {
+            self.autosave_saving = true;
         }
     }
 
@@ -1187,6 +1220,7 @@ impl Controller {
                 param,
                 value,
             } => {
+                self.plugin_state_dirty.set(true);
                 let value = self.clamp_plugin_param(location, target, slot, param, value);
                 if let Some(chain) = strip_chain(location) {
                     self.params.set_plugin_param(
@@ -1498,19 +1532,38 @@ impl Controller {
                 height,
                 maximized,
             } => {
+                if self.session_saving {
+                    self.pending_session = Some((
+                        false,
+                        path,
+                        "a session save is already in progress".to_string(),
+                    ));
+                    return Actions::default();
+                }
                 self.model.window = Some(WindowGeometry {
                     width: width.max(1),
                     height: height.max(1),
                     maximized,
                 });
                 sync_model_from_params(&self.params, &mut self.model);
-                self.capture_plugin_states();
+                // VST3/CLAP state access is UI-thread-only, so the capture
+                // itself stays here. Skip it entirely when no plugin changed,
+                // which removes the common save-time stall.
+                if self.plugin_state_dirty.get() || !self.uis.is_empty() {
+                    self.capture_plugin_states();
+                }
                 self.engine.capture_connections(&mut self.model);
                 self.rebuild_model_loops();
-                self.pending_session = Some(match save_session(&self.model, &path) {
-                    Ok(()) => (true, path.clone(), String::new()),
-                    Err(error) => (false, path.clone(), error),
+                let job = IoJob::SaveSession(SaveSessionJob {
+                    model: Box::new(self.model.clone()),
+                    path: path.clone(),
                 });
+                if self.workers.submit_io(job) {
+                    self.session_saving = true;
+                } else {
+                    self.pending_session =
+                        Some((false, path, "file-I/O worker is unavailable".to_string()));
+                }
                 Actions::default()
             }
             ControlMessage::NewSession => {
@@ -2400,6 +2453,21 @@ mod fuzz_tests;
 #[cfg(test)]
 mod overwrite_guard_tests {
     use super::*;
+
+    #[test]
+    fn oversized_session_is_refused_before_reading() {
+        let dir = std::env::temp_dir().join(format!("vibemix-large-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("huge.toml");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len(MAX_SESSION_BYTES + 1).unwrap();
+        drop(file);
+        let model = MixerModel::default_minimal();
+        assert!(save_session(&model, path.to_str().unwrap()).is_err());
+        assert!(load_session(path.to_str().unwrap()).is_err());
+        assert_eq!(fs::metadata(&path).unwrap().len(), MAX_SESSION_BYTES + 1);
+        fs::remove_dir_all(&dir).unwrap();
+    }
 
     #[test]
     fn saving_a_session_will_not_clobber_other_files() {

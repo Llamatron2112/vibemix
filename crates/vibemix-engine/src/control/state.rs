@@ -347,7 +347,7 @@ pub fn clamp_to_capacity(model: &mut MixerModel, strips: usize, buses: usize) {
 }
 
 /// Refuse absurdly large session files instead of reading them into memory.
-const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
+pub(super) const MAX_SESSION_BYTES: u64 = 64 * 1024 * 1024;
 
 fn check_session_size(path: &str) -> Result<(), String> {
     if fs::metadata(path)
@@ -692,6 +692,7 @@ impl Controller {
         }
 
         self.resume_rt();
+        self.plugin_state_dirty.set(false);
     }
 
     pub(super) fn snapshot_entry(&self, label: &str) -> UndoEntry {
@@ -761,6 +762,7 @@ impl Controller {
         // Delay compensation is a global preference, not part of an edit:
         // undo/redo must not silently switch the audio timing.
         let pdc = self.model.pdc;
+        self.plugin_state_dirty.set(true);
         self.model = snapshot;
         self.model.window = window;
         self.model.pdc = pdc;

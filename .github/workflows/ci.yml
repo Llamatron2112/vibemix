@@ -30,7 +30,7 @@ jobs:
             qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
             qml6-module-qtquick-dialogs qml6-module-qtquick-window \
             lv2-dev liblilv-dev libserd-dev libsord-dev libsratom-dev libsuil-dev \
-            libjack-jackd2-dev
+            libjack-jackd2-dev jackd2 calf-plugins just
 
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
@@ -51,6 +51,22 @@ jobs:
 
       - name: Test
         run: cargo test --workspace
+
+      # The RT audit needs a JACK server; a dummy one is enough because the
+      # engine runs with --auto-connect false.
+      - name: Real-time allocation audit
+        run: |
+          mkdir -p .ci-bin
+          printf '#!/bin/sh\nexec "$@"\n' > .ci-bin/pw-jack
+          chmod +x .ci-bin/pw-jack
+          export PATH="$PWD/.ci-bin:$PATH"
+          export JACK_NO_AUDIO_RESERVATION=1
+          jackd -d dummy -r 48000 -p 1024 > /tmp/jackd.log 2>&1 &
+          sleep 2
+          cat /tmp/jackd.log
+          pgrep -x jackd >/dev/null || { cat /tmp/jackd.log; exit 1; }
+          just rt-guard
+          just rt-count
 
       # Advisory: the generated `com.vibemix.gui` module is not on the lint
       # import path, so the Qt version shipped by the runner reports unresolved

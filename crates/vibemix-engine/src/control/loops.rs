@@ -26,6 +26,18 @@ pub(super) fn timestamp_slug() -> String {
     )
 }
 
+fn pending_from_spec(spec: &WaveformSpec) -> PendingWaveform {
+    PendingWaveform {
+        slot: spec.slot,
+        start: spec.start,
+        end: spec.end,
+        nudge: spec.nudge,
+        seq: spec.seq,
+        buckets: spec.buckets,
+        base: spec.base,
+    }
+}
+
 pub(super) fn sanitize_file_name(name: &str) -> String {
     let mut out = String::new();
     for ch in name.chars() {
@@ -174,9 +186,9 @@ impl Controller {
         }
     }
 
-    /// Send a high-resolution envelope for the editor. Kept out of the 30 Hz
-    /// loop list so gain/play updates stay small.
-    pub(super) fn send_loop_waveform(&self, address: &Path, request: PendingWaveform) {
+    /// Queue a high-resolution envelope for the editor. The scan runs on the
+    /// analysis worker; the result is sent when it comes back.
+    pub(super) fn submit_waveform(&mut self, address: &Path, request: PendingWaveform) {
         let Some(runtime) = self
             .loops
             .get(request.slot as usize)
@@ -207,86 +219,183 @@ impl Controller {
                 .unwrap_or(runtime.slot.nudge_samples)
                 .rem_euclid(frames as i64) as usize
         };
-        let span = end - start;
-        const RAW_SAMPLE_LIMIT: usize = 32_768;
-        let samples = if !request.base && span <= RAW_SAMPLE_LIMIT {
-            (start..end)
-                .map(|frame| {
-                    let raw = (nudge + frame) % frames;
-                    (runtime.raw[raw * 2] + runtime.raw[raw * 2 + 1]) * 0.5
-                })
-                .collect::<Vec<f32>>()
-        } else {
-            Vec::new()
-        };
         let buckets = if request.buckets == 0 {
             LOOP_WAVEFORM_BUCKETS
         } else {
             (request.buckets as usize).clamp(512, 32_768)
         };
-        // Always return an envelope: when raw samples are sent it is the
-        // current window's resolution, so the editor can keep that detail
-        // while zooming out instead of falling back to the whole loop.
-        let peaks = {
-            let mut peaks = vec![0.0f32; buckets];
-            for (bucket, peak) in peaks.iter_mut().enumerate() {
-                let from = start + span * bucket / buckets;
-                let to = (start + span * (bucket + 1) / buckets)
-                    .max(from + 1)
-                    .min(end);
-                for frame in from..to {
-                    let raw = (nudge + frame) % frames;
-                    let index = raw * 2;
-                    *peak = peak
-                        .max(runtime.raw[index].abs())
-                        .max(runtime.raw[index + 1].abs());
-                }
-            }
-            peaks
-        };
-        // High-pass energy (first difference) for the visual HF strip. Long
-        // windows are skipped; zooming in brings it back.
-        const HF_BUCKETS: usize = 2048;
-        let hf = if !request.base && span <= self.engine.sample_rate() as usize * 10 {
-            let mut hf = vec![0.0f32; HF_BUCKETS];
-            for (bucket, value) in hf.iter_mut().enumerate() {
-                let from = start + span * bucket / HF_BUCKETS;
-                let to = (start + span * (bucket + 1) / HF_BUCKETS)
-                    .max(from + 1)
-                    .min(end);
-                for frame in from..to {
-                    let raw = (nudge + frame) % frames;
-                    let previous = (raw + frames - 1) % frames;
-                    let mono = (runtime.raw[raw * 2] + runtime.raw[raw * 2 + 1]) * 0.5;
-                    let previous =
-                        (runtime.raw[previous * 2] + runtime.raw[previous * 2 + 1]) * 0.5;
-                    *value = value.max((mono - previous).abs());
-                }
-            }
-            let peak = hf.iter().copied().fold(0.0f32, f32::max);
-            if peak > 1.0e-6 {
-                for value in &mut hf {
-                    *value /= peak;
-                }
-            }
-            hf
-        } else {
-            Vec::new()
-        };
-        let json = LoopWaveform {
+        let spec = WaveformSpec {
             slot: request.slot,
             start: start as u64,
             end: end as u64,
-            nudge: nudge as i64,
-            seq: request.seq,
-            peaks,
-            samples,
-            hf,
-            transients: runtime.transients.clone(),
+            nudge: request.nudge,
+            buckets: buckets as u32,
             base: request.base,
+            seq: request.seq,
         };
-        if let Ok(json) = serde_json::to_string(&json) {
-            self.send_message(&ControlMessage::LoopWaveform { json }, address);
+        self.waveform_seq = request.seq;
+        self.last_waveform = Some((address.to_path_buf(), spec));
+        self.workers
+            .submit_analysis(AnalysisJob::Waveform(WaveformJob {
+                address: address.to_path_buf(),
+                slot: request.slot,
+                generation: runtime.generation,
+                raw: Arc::clone(&runtime.raw),
+                frames,
+                sample_rate: runtime.slot.sample_rate,
+                start,
+                end,
+                nudge,
+                buckets,
+                base: request.base,
+                seq: request.seq,
+                transients: runtime.transients.clone(),
+            }));
+    }
+
+    /// Re-run the last editor view after transient analysis changed. Reusing
+    /// the sequence number lets the open editor accept the refreshed data.
+    pub(super) fn refresh_waveform(&mut self, slot: u32) {
+        let Some((address, spec)) = self.last_waveform.clone() else {
+            return;
+        };
+        if spec.slot != slot {
+            return;
+        }
+        self.submit_waveform(&address, pending_from_spec(&spec));
+    }
+
+    /// Poll the background workers and apply their results.
+    pub(super) fn poll_workers(&mut self) {
+        while let Some(output) = self.workers.try_recv() {
+            match output {
+                WorkerOutput::Take(result) => {
+                    let Some(runtime) = self
+                        .loops
+                        .get_mut(result.slot as usize)
+                        .and_then(Option::as_mut)
+                    else {
+                        continue;
+                    };
+                    if runtime.generation != result.generation
+                        || runtime.analysis_seq != result.analysis_seq
+                    {
+                        continue;
+                    }
+                    runtime.transients = result.transients;
+                    runtime.slot.peaks = result.peaks;
+                    if self.model.recorder.transient {
+                        runtime.slot.transient_nudge = result.transient;
+                    }
+                    let total = runtime.slot.base_nudge
+                        + runtime.slot.transient_nudge
+                        + runtime.slot.manual_nudge;
+                    self.set_loop_total(result.slot, total);
+                    self.loops_dirty = true;
+                    self.refresh_waveform(result.slot);
+                }
+                WorkerOutput::Sensitivity(result) => {
+                    let Some(runtime) = self
+                        .loops
+                        .get_mut(result.slot as usize)
+                        .and_then(Option::as_mut)
+                    else {
+                        continue;
+                    };
+                    if runtime.generation != result.generation
+                        || runtime.analysis_seq != result.analysis_seq
+                        || runtime.slot.transient_sensitivity != result.sensitivity
+                    {
+                        continue;
+                    }
+                    runtime.transients = result.transients;
+                    self.recorder_dirty = true;
+                    self.refresh_waveform(result.slot);
+                }
+                WorkerOutput::Waveform {
+                    address,
+                    slot,
+                    generation,
+                    seq,
+                    json,
+                } => {
+                    if seq != self.waveform_seq {
+                        continue;
+                    }
+                    if self
+                        .loops
+                        .get(slot as usize)
+                        .and_then(Option::as_ref)
+                        .is_none_or(|runtime| runtime.generation != generation)
+                    {
+                        continue;
+                    }
+                    if let Some(json) = json {
+                        self.send_message(&ControlMessage::LoopWaveform { json }, &address);
+                    }
+                }
+                WorkerOutput::LoopSaved(result) => {
+                    let Some(runtime) = self
+                        .loops
+                        .get_mut(result.slot as usize)
+                        .and_then(Option::as_mut)
+                    else {
+                        continue;
+                    };
+                    if runtime.generation != result.generation {
+                        continue;
+                    }
+                    match result.result {
+                        Ok(()) => {
+                            let saved_dir = result
+                                .path
+                                .parent()
+                                .map(|parent| parent.to_string_lossy().into_owned());
+                            runtime.slot.path = Some(result.path.to_string_lossy().into_owned());
+                            // If the loop moved while the worker was writing,
+                            // the file is from the old rotation.
+                            runtime.slot.saved = runtime.slot.nudge_samples == result.nudge;
+                            runtime.slot.normalize = result.normalize;
+                            if let Some(dir) = saved_dir {
+                                self.model.recorder.save_dir = dir;
+                            }
+                            self.model.recorder.bit_depth = result.bit_depth;
+                            self.rebuild_model_loops();
+                            self.loops_dirty = true;
+                            self.recorder_status.message =
+                                format!("saved {}", result.path.display());
+                            self.recorder_dirty = true;
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                path = %result.path.display(),
+                                "failed to save loop"
+                            );
+                            self.recorder_status.message = error;
+                            self.recorder_dirty = true;
+                        }
+                    }
+                }
+                WorkerOutput::SessionSaved { path, result } => {
+                    self.session_saving = false;
+                    self.pending_session = Some(match result {
+                        Ok(()) => (true, path, String::new()),
+                        Err(error) => (false, path, error),
+                    });
+                }
+                WorkerOutput::Autosave { text, result } => {
+                    self.autosave_saving = false;
+                    match result {
+                        Ok(()) => {
+                            if let Some(text) = text {
+                                self.last_autosave_text = text;
+                            }
+                        }
+                        Err(error) => tracing::warn!(%error, "autosave failed"),
+                    }
+                }
+            }
         }
     }
 
@@ -345,46 +454,33 @@ impl Controller {
     /// Trim a captured take, apply the automatic/transient/manual offsets, and
     /// install it in the next free launcher slot.
     pub(super) fn finish_take(&mut self, take: crate::recorder::RecordedTake) {
-        let frames = take.frames;
+        let crate::recorder::RecordedTake {
+            buffer,
+            frames,
+            sample_rate,
+            latency_frames,
+            loop_beats,
+        } = take;
         if frames == 0 {
             return;
         }
-        let raw = take.buffer[..frames * 2].to_vec();
-        let sample_rate = take.sample_rate;
-        let base = if self.model.recorder.auto_latency {
-            take.latency_frames as i64
-        } else {
-            0
-        };
-        let transients = detect_transients_with_sensitivity(
-            &raw,
-            frames,
-            sample_rate,
-            self.model.recorder.transient_sensitivity,
-        );
-        let transient = if self.model.recorder.transient {
-            let window = sample_rate as i64 / 10;
-            transients
-                .iter()
-                .find(|transient| (transient.frame as i64 - base).abs() <= window)
-                .map(|transient| transient.frame as i64 - base)
-                .unwrap_or_else(|| {
-                    detect_transient(&raw, frames, sample_rate, base, 100.0)
-                        .map(|onset| onset - base)
-                        .unwrap_or(0)
-                })
-        } else {
-            0
-        };
-        let manual = self.model.recorder.nudge_samples;
-        let total = base + transient + manual;
-        let loop_peaks = peaks(&raw, frames, LOOP_PEAK_BUCKETS);
-
         let Some(slot_index) = self.loops.iter().position(Option::is_none) else {
             self.recorder_status.message = "loop slots are full".to_string();
             self.recorder_dirty = true;
             return;
         };
+        let base = if self.model.recorder.auto_latency {
+            latency_frames as i64
+        } else {
+            0
+        };
+        let manual = self.model.recorder.nudge_samples;
+        let total = base + manual;
+        let sensitivity = self.model.recorder.transient_sensitivity;
+        let auto_transient = self.model.recorder.transient;
+        let generation = self.next_loop_generation;
+        self.next_loop_generation = self.next_loop_generation.wrapping_add(1);
+        let raw: Arc<[f32]> = Arc::from(&buffer[..frames * 2]);
         let bpm = self
             .engine
             .clock()
@@ -396,24 +492,21 @@ impl Controller {
             path: None,
             frames: frames as u64,
             sample_rate,
-            loop_beats: take.loop_beats,
+            loop_beats,
             bpm,
             nudge_samples: total,
             base_nudge: base,
-            transient_nudge: transient,
+            transient_nudge: 0,
             manual_nudge: manual,
-            transient_sensitivity: self.model.recorder.transient_sensitivity,
+            transient_sensitivity: sensitivity,
             normalize: false,
-            peaks: loop_peaks,
+            peaks: Vec::new(),
             gain: 1.0,
             mute: false,
             playing: false,
             saved: false,
         };
-        if let Err(error) =
-            self.engine
-                .set_loop(slot_index, raw.clone().into_boxed_slice(), frames, total)
-        {
+        if let Err(error) = self.engine.set_loop(slot_index, buffer, frames, total) {
             tracing::warn!(%error, "failed to install recorded loop");
             self.recorder_status.message = error.to_string();
             self.recorder_dirty = true;
@@ -421,9 +514,23 @@ impl Controller {
         }
         self.loops[slot_index] = Some(LoopRuntime {
             slot,
-            raw,
-            transients,
+            raw: Arc::clone(&raw),
+            transients: Vec::new(),
+            generation,
+            analysis_seq: 1,
         });
+        self.workers
+            .submit_analysis(AnalysisJob::Take(TakeAnalysisJob {
+                slot: slot_index as u32,
+                generation,
+                analysis_seq: 1,
+                raw,
+                frames,
+                sample_rate,
+                sensitivity,
+                auto_transient,
+                base,
+            }));
         self.rebuild_model_loops();
         self.loops_dirty = true;
         self.recorder_status = RecorderStatus::default();
@@ -613,13 +720,23 @@ impl Controller {
         let frames = runtime.slot.frames as usize;
         let sample_rate = runtime.slot.sample_rate;
         runtime.slot.transient_sensitivity = sensitivity;
-        runtime.transients =
-            detect_transients_with_sensitivity(&runtime.raw, frames, sample_rate, sensitivity);
+        runtime.analysis_seq = runtime.analysis_seq.wrapping_add(1);
+        let analysis_seq = runtime.analysis_seq;
+        let job = SensitivityJob {
+            slot,
+            generation: runtime.generation,
+            analysis_seq,
+            raw: Arc::clone(&runtime.raw),
+            frames,
+            sample_rate,
+            sensitivity,
+        };
         // New takes start from the sensitivity the user last settled on.
         self.model.recorder.transient_sensitivity = sensitivity;
         self.rebuild_model_loops();
         self.loops_dirty = true;
         self.recorder_dirty = true;
+        self.workers.submit_analysis(AnalysisJob::Sensitivity(job));
     }
 
     pub(super) fn set_loop_nudge(&mut self, slot: u32, manual: i64) {
@@ -715,38 +832,22 @@ impl Controller {
                 }
                 candidate
             });
-        match write_loop_wav(
-            &path,
-            &runtime.raw,
+        self.recorder_status.message = format!("saving {}…", path.display());
+        self.recorder_dirty = true;
+        let job = IoJob::SaveLoop(SaveLoopJob {
+            slot,
+            generation: runtime.generation,
+            raw: Arc::clone(&runtime.raw),
             frames,
             sample_rate,
+            path,
             bit_depth,
-            runtime.slot.nudge_samples,
+            nudge: runtime.slot.nudge_samples,
             normalize,
-        ) {
-            Ok(()) => {
-                let saved_dir = path
-                    .parent()
-                    .map(|parent| parent.to_string_lossy().into_owned());
-                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
-                    runtime.slot.path = Some(path.to_string_lossy().into_owned());
-                    runtime.slot.saved = true;
-                    runtime.slot.normalize = normalize;
-                }
-                if let Some(dir) = saved_dir {
-                    self.model.recorder.save_dir = dir;
-                }
-                self.model.recorder.bit_depth = bit_depth;
-                self.rebuild_model_loops();
-                self.loops_dirty = true;
-                self.recorder_status.message = format!("saved {}", path.display());
-                self.recorder_dirty = true;
-            }
-            Err(error) => {
-                tracing::warn!(%error, path = %path.display(), "failed to save loop");
-                self.recorder_status.message = error.to_string();
-                self.recorder_dirty = true;
-            }
+        });
+        if !self.workers.submit_io(job) {
+            self.recorder_status.message = "file-I/O worker is unavailable".to_string();
+            self.recorder_dirty = true;
         }
     }
 
@@ -792,12 +893,13 @@ impl Controller {
                     slot.transient_nudge = 0;
                     slot.manual_nudge = 0;
                     slot.playing = false;
+                    let raw: Arc<[f32]> = Arc::from(raw);
                     slot.peaks = peaks(&raw, frames, LOOP_PEAK_BUCKETS);
                     if self
                         .engine
                         .set_loop(
                             index,
-                            raw.clone().into_boxed_slice(),
+                            raw.to_vec().into_boxed_slice(),
                             frames,
                             slot.nudge_samples,
                         )
@@ -809,10 +911,14 @@ impl Controller {
                             sample_rate,
                             slot.transient_sensitivity,
                         );
+                        let generation = self.next_loop_generation;
+                        self.next_loop_generation = self.next_loop_generation.wrapping_add(1);
                         self.loops[index] = Some(LoopRuntime {
                             slot,
                             raw,
                             transients,
+                            generation,
+                            analysis_seq: 1,
                         });
                     }
                 }
@@ -846,6 +952,37 @@ mod wav_tests {
                 assert!((a - b).abs() <= tolerance, "{depth}: {a} vs {b}");
             }
         }
+        fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn over_long_wav_is_rejected_before_decoding() {
+        let dir = std::env::temp_dir().join(format!("vibemix-wav-long-{}", std::process::id()));
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("too-long.wav");
+        let frames = 48_000u64 * 300 + 1;
+        let data_len = frames * 4;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&((36 + data_len) as u32).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&1u16.to_le_bytes());
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&48_000u32.to_le_bytes());
+        bytes.extend_from_slice(&192_000u32.to_le_bytes());
+        bytes.extend_from_slice(&4u16.to_le_bytes());
+        bytes.extend_from_slice(&16u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&(data_len as u32).to_le_bytes());
+        fs::write(&path, &bytes).unwrap();
+        // Make the file length match the declared sparse data chunk.
+        let file = fs::OpenOptions::new().write(true).open(&path).unwrap();
+        file.set_len(44 + data_len).unwrap();
+        drop(file);
+
+        let error = read_loop_wav(&path, 48_000).unwrap_err().to_string();
+        assert!(error.contains("longer than"), "{error}");
         fs::remove_dir_all(&dir).unwrap();
     }
 

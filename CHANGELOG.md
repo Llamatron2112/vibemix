@@ -30,6 +30,16 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Recorder latency covers send and return paths.** Bus-output takes include
   the send compensation and the bus inserts, and the trim is updated while a
   take is armed or recording instead of being frozen at arm time.
+- **Loop analysis and file I/O no longer stall the control thread.** Transient
+  detection, waveform envelope scans and WAV export run on background workers;
+  a finished take is installed immediately and its markers/nudge update when
+  the analysis returns. Session and autosave TOML serialization/writes also run
+  on the I/O worker; plugin-state capture is skipped when no plugin changed.
+- **Large-file and overflow limits are covered by tests.** Oversized sessions
+  and over-five-minute loop WAVs are rejected before decoding.
+- **CI runs the real-time allocation audit.** `just rt-guard` and
+  `just rt-count` execute against a headless dummy JACK server (ASAN remains a
+  local/manual run).
 
 ### Fixed
 
