@@ -19,8 +19,8 @@ use vibemix_core::model::{
 };
 use vibemix_core::params::{clamp_trim_db, Gain, Pan};
 use vibemix_core::recorder::{
-    detect_transients_with_sensitivity, peaks, rotate_interleaved, snap_seam, LoopSlot,
-    RecorderAction, RecorderSettings, RecorderSource, RecorderStatus, Transient,
+    rotate_interleaved, snap_seam, LoopSlot, RecorderAction, RecorderSettings, RecorderSource,
+    RecorderStatus, Transient,
 };
 use vibemix_lv2::{find_ui, Host, SharedOutputs, SharedUiInputs, UiCandidate, UiMessage, UiWindow};
 
@@ -120,6 +120,13 @@ struct LoopRuntime {
     generation: u64,
     /// Changes on every transient-analysis request for this slot.
     analysis_seq: u64,
+}
+
+/// A saved loop whose WAV is being read by the I/O worker.
+struct PendingLoopLoad {
+    slot: LoopSlot,
+    index: usize,
+    generation: u64,
 }
 
 struct PendingWaveform {
@@ -254,6 +261,10 @@ pub struct Controller {
     autosave_saving: bool,
     /// A plugin's saved state may have changed since the last capture.
     plugin_state_dirty: std::cell::Cell<bool>,
+    /// Saved loops whose WAVs are still being read.
+    pending_loop_loads: Vec<PendingLoopLoad>,
+    /// Throttles repeated restart requests from the same VST3 slot.
+    vst3_restart_throttle: HashMap<(u32, u32, u32), Instant>,
 }
 
 /// An open plugin editor: an LV2 toolkit UI (in the engine or the out-of-process
@@ -505,6 +516,8 @@ impl Controller {
             session_saving: false,
             autosave_saving: false,
             plugin_state_dirty: std::cell::Cell::new(true),
+            pending_loop_loads: Vec::new(),
+            vst3_restart_throttle: HashMap::new(),
         };
         controller.ensure_model_plugin_controls();
         controller
@@ -627,7 +640,8 @@ impl Controller {
             self.pump_uis();
             let vst3_edits = self.drain_vst3_param_edits();
             let clap_edits = self.drain_clap_param_edits();
-            let param_edits = vst3_edits || clap_edits;
+            let restarts = self.poll_vst3_restarts();
+            let param_edits = vst3_edits || clap_edits || restarts;
 
             // Keep the sidechain-aware strip order up to date. The topological
             // sort allocates, so only run it when the sidechain routing (the

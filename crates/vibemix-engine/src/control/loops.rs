@@ -334,6 +334,53 @@ impl Controller {
                         self.send_message(&ControlMessage::LoopWaveform { json }, &address);
                     }
                 }
+                WorkerOutput::LoopLoaded {
+                    index,
+                    generation,
+                    result,
+                } => {
+                    let Some(position) = self.pending_loop_loads.iter().position(|pending| {
+                        pending.index == index && pending.generation == generation
+                    }) else {
+                        continue;
+                    };
+                    let mut pending = self.pending_loop_loads.remove(position);
+                    match result {
+                        Ok(loaded) => {
+                            pending.slot.frames = loaded.frames as u64;
+                            pending.slot.sample_rate = self.engine.sample_rate();
+                            pending.slot.peaks = loaded.peaks;
+                            pending.slot.playing = false;
+                            let raw: Arc<[f32]> = Arc::from(loaded.raw);
+                            if let Err(error) = self.engine.set_loop(
+                                index,
+                                raw.to_vec().into_boxed_slice(),
+                                loaded.frames,
+                                pending.slot.nudge_samples,
+                            ) {
+                                tracing::warn!(%error, "failed to install loaded loop");
+                            } else {
+                                self.loops[index] = Some(LoopRuntime {
+                                    slot: pending.slot,
+                                    raw,
+                                    transients: loaded.transients,
+                                    generation,
+                                    analysis_seq: 1,
+                                });
+                            }
+                        }
+                        Err(error) => {
+                            tracing::warn!(
+                                %error,
+                                index,
+                                path = pending.slot.path.as_deref().unwrap_or(""),
+                                "failed to load loop"
+                            );
+                        }
+                    }
+                    self.rebuild_model_loops();
+                    self.loops_dirty = true;
+                }
                 WorkerOutput::LoopSaved(result) => {
                     let Some(runtime) = self
                         .loops
@@ -451,6 +498,17 @@ impl Controller {
         }
     }
 
+    /// First slot with neither a loaded loop nor a pending WAV load.
+    fn free_loop_slot(&self) -> Option<usize> {
+        (0..MAX_LOOPS).find(|index| {
+            self.loops[*index].is_none()
+                && !self
+                    .pending_loop_loads
+                    .iter()
+                    .any(|pending| pending.index == *index)
+        })
+    }
+
     /// Trim a captured take, apply the automatic/transient/manual offsets, and
     /// install it in the next free launcher slot.
     pub(super) fn finish_take(&mut self, take: crate::recorder::RecordedTake) {
@@ -464,7 +522,7 @@ impl Controller {
         if frames == 0 {
             return;
         }
-        let Some(slot_index) = self.loops.iter().position(Option::is_none) else {
+        let Some(slot_index) = self.free_loop_slot() else {
             self.recorder_status.message = "loop slots are full".to_string();
             self.recorder_dirty = true;
             return;
@@ -657,16 +715,36 @@ impl Controller {
                 }
             }
             RecorderAction::LoopDelete { slot } => {
-                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::take) {
+                let index = slot as usize;
+                let was_pending = self
+                    .pending_loop_loads
+                    .iter()
+                    .position(|pending| pending.index == index)
+                    .map(|position| self.pending_loop_loads.remove(position));
+                if let Some(runtime) = self.loops.get_mut(index).and_then(Option::take) {
                     let _ = runtime;
-                    let _ = self.engine.clear_loop(slot as usize);
+                }
+                if was_pending.is_some() || index < self.loops.len() {
+                    let _ = self.engine.clear_loop(index);
                     self.rebuild_model_loops();
                     self.loops_dirty = true;
                 }
             }
             RecorderAction::LoopRename { slot, name } => {
-                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
+                let index = slot as usize;
+                let mut changed = false;
+                if let Some(pending) = self
+                    .pending_loop_loads
+                    .iter_mut()
+                    .find(|pending| pending.index == index)
+                {
+                    pending.slot.name = name;
+                    changed = true;
+                } else if let Some(runtime) = self.loops.get_mut(index).and_then(Option::as_mut) {
                     runtime.slot.name = name;
+                    changed = true;
+                }
+                if changed {
                     self.rebuild_model_loops();
                     self.loops_dirty = true;
                 }
@@ -852,12 +930,19 @@ impl Controller {
     }
 
     pub(super) fn rebuild_model_loops(&mut self) {
-        self.model.loops = self
-            .loops
+        let mut loops: Vec<LoopSlot> = self
+            .pending_loop_loads
             .iter()
-            .flatten()
-            .map(|runtime| runtime.slot.clone())
+            .map(|pending| pending.slot.clone())
+            .chain(
+                self.loops
+                    .iter()
+                    .flatten()
+                    .map(|runtime| runtime.slot.clone()),
+            )
             .collect();
+        loops.sort_by_key(|slot| slot.id);
+        self.model.loops = loops;
     }
 
     pub(super) fn clear_loops(&mut self) {
@@ -865,6 +950,7 @@ impl Controller {
             let _ = self.engine.clear_loop(index);
             self.loops[index] = None;
         }
+        self.pending_loop_loads.clear();
         self.model.loops.clear();
         self.loops_dirty = true;
     }
@@ -875,57 +961,44 @@ impl Controller {
             let _ = self.engine.clear_loop(index);
             self.loops[index] = None;
         }
+        self.pending_loop_loads.clear();
+        // Keep the saved metadata visible while the files are read.
+        self.model.loops = saved.clone();
         let sample_rate = self.engine.sample_rate();
+        let mut used = [false; MAX_LOOPS];
         for mut slot in saved {
             let Some(path) = slot.path.clone() else {
                 continue;
             };
-            match read_loop_wav(Path::new(&path), sample_rate) {
-                Ok((raw, frames)) => {
-                    let Some(index) = self.loops.iter().position(Option::is_none) else {
-                        break;
-                    };
-                    slot.id = index as u32;
-                    slot.frames = frames as u64;
-                    slot.sample_rate = sample_rate;
-                    slot.nudge_samples = 0;
-                    slot.base_nudge = 0;
-                    slot.transient_nudge = 0;
-                    slot.manual_nudge = 0;
-                    slot.playing = false;
-                    let raw: Arc<[f32]> = Arc::from(raw);
-                    slot.peaks = peaks(&raw, frames, LOOP_PEAK_BUCKETS);
-                    if self
-                        .engine
-                        .set_loop(
-                            index,
-                            raw.to_vec().into_boxed_slice(),
-                            frames,
-                            slot.nudge_samples,
-                        )
-                        .is_ok()
-                    {
-                        let transients = detect_transients_with_sensitivity(
-                            &raw,
-                            frames,
-                            sample_rate,
-                            slot.transient_sensitivity,
-                        );
-                        let generation = self.next_loop_generation;
-                        self.next_loop_generation = self.next_loop_generation.wrapping_add(1);
-                        self.loops[index] = Some(LoopRuntime {
-                            slot,
-                            raw,
-                            transients,
-                            generation,
-                            analysis_seq: 1,
-                        });
-                    }
-                }
-                Err(error) => {
-                    tracing::warn!(%error, path, "failed to load loop");
-                }
+            let mut index = slot.id as usize;
+            if index >= MAX_LOOPS || used[index] {
+                let Some(free) = (0..MAX_LOOPS).find(|index| !used[*index]) else {
+                    break;
+                };
+                index = free;
             }
+            used[index] = true;
+            slot.id = index as u32;
+            slot.sample_rate = sample_rate;
+            slot.nudge_samples = 0;
+            slot.base_nudge = 0;
+            slot.transient_nudge = 0;
+            slot.manual_nudge = 0;
+            slot.playing = false;
+            let generation = self.next_loop_generation;
+            self.next_loop_generation = self.next_loop_generation.wrapping_add(1);
+            self.pending_loop_loads.push(PendingLoopLoad {
+                slot: slot.clone(),
+                index,
+                generation,
+            });
+            self.workers.submit_io(IoJob::LoadLoop(LoadLoopJob {
+                slot,
+                index,
+                generation,
+                path: PathBuf::from(path),
+                sample_rate,
+            }));
         }
         self.rebuild_model_loops();
         self.loops_dirty = true;

@@ -3264,6 +3264,37 @@ impl JackEngine {
         self.slot_meta(strip, chain, slot)?.proxy.clone()
     }
 
+    /// VST3 slots that requested a restart since the last poll. Returns
+    /// `(location, target, slot, flags)`; bus slots use location 2.
+    pub fn take_vst3_restart_flags(&self) -> Vec<(u32, u32, u32, i32)> {
+        let mut out = Vec::new();
+        for (strip, chains) in self.strip_meta.iter().enumerate() {
+            for (chain, slots) in chains.iter().enumerate() {
+                for (slot, meta) in slots.iter().enumerate() {
+                    let Some(SlotState::Vst3(handle)) = meta.proxy.as_ref() else {
+                        continue;
+                    };
+                    let flags = handle.take_restart_flags();
+                    if flags != 0 {
+                        out.push((chain as u32, strip as u32, slot as u32, flags));
+                    }
+                }
+            }
+        }
+        for (bus, slots) in self.bus_meta.iter().enumerate() {
+            for (slot, meta) in slots.iter().enumerate() {
+                let Some(SlotState::Vst3(handle)) = meta.proxy.as_ref() else {
+                    continue;
+                };
+                let flags = handle.take_restart_flags();
+                if flags != 0 {
+                    out.push((2, bus as u32, slot as u32, flags));
+                }
+            }
+        }
+        out
+    }
+
     pub fn plugin_handle(
         &self,
         strip: usize,

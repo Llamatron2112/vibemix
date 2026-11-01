@@ -302,29 +302,87 @@ impl Controller {
                 self.apply_vst3_param(location, target, slot, param, value);
                 changed = true;
             }
+        }
+        changed
+    }
 
-            // The plugin may have changed its own parameters, latency or IO.
-            let flags = handle.take_restart_flags();
+    /// Handles `restartComponent` requests from every VST3 instance, not only
+    /// plugins whose editor happens to be open. Latency changes are picked up
+    /// by the PDC refresh; IO/reload requests rebuild the graph from the saved
+    /// model (the plugin instance is replaced).
+    pub(super) fn poll_vst3_restarts(&mut self) -> bool {
+        let mut changed = false;
+        let mut rebuild = false;
+        self.vst3_restart_throttle
+            .retain(|_, when| when.elapsed() < Duration::from_secs(30));
+        for (location, target, slot, flags) in self.engine.take_vst3_restart_flags() {
             if flags & VST3_RESTART_PARAM_VALUES != 0 {
-                for param in 0..handle.param_count().min(MAX_PARAMS) {
-                    let value = handle.param_value(param);
-                    self.apply_vst3_param(location, target, slot, param, value);
+                let handle = if let Some(chain) = strip_chain(location) {
+                    self.engine
+                        .state_proxy(target as usize, chain, slot as usize)
+                } else {
+                    self.engine.bus_state_proxy(target as usize, slot as usize)
+                };
+                if let Some(crate::backend_jack::SlotState::Vst3(handle)) = handle {
+                    for param in 0..handle.param_count().min(MAX_PARAMS) {
+                        let value = handle.param_value(param);
+                        self.apply_vst3_param(location, target, slot, param, value);
+                    }
+                    changed = true;
                 }
-                changed = true;
             }
-            if flags & (VST3_RESTART_LATENCY | VST3_RESTART_IO | VST3_RESTART_RELOAD) != 0 {
-                let latency = handle.latency();
+            if flags & VST3_RESTART_LATENCY != 0 {
+                tracing::info!(location, target, slot, "VST3 plugin changed latency");
+            }
+            if flags & (VST3_RESTART_IO | VST3_RESTART_RELOAD) != 0 {
+                let key = (location, target, slot);
+                let repeated = self
+                    .vst3_restart_throttle
+                    .get(&key)
+                    .is_some_and(|when| when.elapsed() < Duration::from_secs(2));
+                if repeated {
+                    tracing::warn!(
+                        location,
+                        target,
+                        slot,
+                        "ignoring repeated VST3 restart request"
+                    );
+                    continue;
+                }
+                self.vst3_restart_throttle.insert(key, Instant::now());
                 tracing::info!(
                     flags,
-                    latency,
                     location,
                     target,
                     slot,
-                    "VST3 plugin requested restart"
+                    "VST3 plugin requested a restart"
                 );
+                rebuild = true;
             }
         }
+        if rebuild {
+            self.rebuild_after_vst3_restart();
+            changed = true;
+        }
         changed
+    }
+
+    fn rebuild_after_vst3_restart(&mut self) {
+        self.close_all_uis();
+        self.capture_plugin_states();
+        let sample_rate = self.engine.sample_rate() as f64;
+        if let Err(error) = self.engine.rebuild_plugins(
+            &self.host,
+            &self.vst3,
+            &self.clap,
+            &mut self.model,
+            &self.params,
+            sample_rate,
+        ) {
+            tracing::warn!(%error, "failed to rebuild plugins after VST3 restart");
+        }
+        self.missing_report = missing_report_json(&self.engine.restore_connections(&self.model));
+        self.engine.sync_port_names(&self.model);
     }
 
     /// Folds parameter moves made in open CLAP editors into the shared state

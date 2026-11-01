@@ -10,7 +10,7 @@ use std::thread;
 
 use vibemix_core::model::MixerModel;
 use vibemix_core::recorder::{
-    detect_transient, detect_transients_with_sensitivity, peaks, LoopWaveform, Transient,
+    detect_transient, detect_transients_with_sensitivity, peaks, LoopSlot, LoopWaveform, Transient,
 };
 
 use super::loops::write_loop_wav;
@@ -89,6 +89,21 @@ pub(super) struct AutosaveJob {
     pub previous: String,
 }
 
+pub(super) struct LoadLoopJob {
+    pub slot: LoopSlot,
+    pub index: usize,
+    pub generation: u64,
+    pub path: PathBuf,
+    pub sample_rate: u32,
+}
+
+pub(super) struct LoadedLoop {
+    pub raw: Vec<f32>,
+    pub frames: usize,
+    pub peaks: Vec<f32>,
+    pub transients: Vec<Transient>,
+}
+
 pub(super) enum AnalysisJob {
     Take(TakeAnalysisJob),
     Sensitivity(SensitivityJob),
@@ -96,6 +111,7 @@ pub(super) enum AnalysisJob {
 }
 
 pub(super) enum IoJob {
+    LoadLoop(LoadLoopJob),
     SaveLoop(SaveLoopJob),
     SaveSession(SaveSessionJob),
     Autosave(AutosaveJob),
@@ -139,6 +155,11 @@ pub(super) enum WorkerOutput {
         json: Option<String>,
     },
     LoopSaved(LoopSaved),
+    LoopLoaded {
+        index: usize,
+        generation: u64,
+        result: Result<LoadedLoop, String>,
+    },
     SessionSaved {
         path: String,
         result: Result<(), String>,
@@ -162,6 +183,14 @@ impl AnalysisJob {
 impl IoJob {
     fn run(self) -> WorkerOutput {
         match self {
+            IoJob::LoadLoop(job) => {
+                let result = run_load_loop(&job);
+                WorkerOutput::LoopLoaded {
+                    index: job.index,
+                    generation: job.generation,
+                    result,
+                }
+            }
             IoJob::SaveLoop(job) => WorkerOutput::LoopSaved(run_save_loop(job)),
             IoJob::SaveSession(job) => WorkerOutput::SessionSaved {
                 path: job.path.clone(),
@@ -170,6 +199,24 @@ impl IoJob {
             IoJob::Autosave(job) => run_autosave(job),
         }
     }
+}
+
+fn run_load_loop(job: &LoadLoopJob) -> Result<LoadedLoop, String> {
+    let (raw, frames) = super::loops::read_loop_wav(&job.path, job.sample_rate)
+        .map_err(|error| error.to_string())?;
+    let peaks = peaks(&raw, frames, super::LOOP_PEAK_BUCKETS);
+    let transients = detect_transients_with_sensitivity(
+        &raw,
+        frames,
+        job.sample_rate,
+        job.slot.transient_sensitivity,
+    );
+    Ok(LoadedLoop {
+        raw,
+        frames,
+        peaks,
+        transients,
+    })
 }
 
 fn run_autosave(job: AutosaveJob) -> WorkerOutput {

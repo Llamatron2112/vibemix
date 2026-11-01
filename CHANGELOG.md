@@ -38,8 +38,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 - **Large-file and overflow limits are covered by tests.** Oversized sessions
   and over-five-minute loop WAVs are rejected before decoding.
 - **CI runs the real-time allocation audit.** `just rt-guard` and
-  `just rt-count` execute against a headless dummy JACK server (ASAN remains a
-  local/manual run).
+  `just rt-count` execute against a headless dummy JACK server, and a
+  scheduled/manual **Audit** workflow runs the ASAN/UBSan suite with a real
+  plugin catalog.
 
 ### Fixed
 

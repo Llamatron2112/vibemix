@@ -107,7 +107,8 @@ PipeWire `pw_filter`) is added (unscheduled; see the roadmap).
   `cargo test`, and `just asan` runs the shims, the engine under load and every
   installed plugin's smoke test under AddressSanitizer and UBSan. CI runs the
   `just rt-guard`/`just rt-count` allocation audit against a dummy JACK server;
-  ASAN stays a local/manual run because of its build cost.
+  ASAN runs in the scheduled/manual **Audit** workflow because of its build
+  cost.
 - A JACK/PipeWire server shutdown is flagged from the notification handler and
   the control thread exits the engine, instead of idling on a dead client.
 - LV2 worker communication uses a dedicated non-RT worker thread.
@@ -420,8 +421,9 @@ back into the shared parameter state via an `IComponentHandler::performEdit`
 queue (mirroring the LV2 `ui:portEvent` write-back), so they survive session
 saves and are pushed to the DSP. `restartComponent` is observed as well:
 `kParamValuesChanged` resyncs the shared values; latency changes are picked up
-by the periodic chain-latency refresh (no graph restart needed), while IO and
-reload requests are logged. Opening an editor is gated by a headless child smoke test
+by the periodic chain-latency refresh (no graph restart needed), and IO/reload
+requests capture state and rebuild the plugin instances. Opening an editor is
+gated by a headless child smoke test
 (`--smoke-vst3-ui`), and the editor button is only shown when the plugin
 reports an X11-editable view.
 
@@ -674,7 +676,8 @@ through a separate launcher window.
   float to the path chosen in the GUI's save dialog (default
   `VIBEMIX_CONFIG_DIR/loops/`). The chosen directory is remembered in the
   session, and the export can be normalized to -1 dBFS. The session stores loop
-  metadata and paths.
+  metadata and paths. Saved loops are read and analysed on the I/O worker; a
+  pending slot keeps its saved metadata visible until the file is installed.
 - The editor requests an envelope for the visible window on demand; the scan
   runs on the analysis worker and stale replies are dropped by sequence number.
   The launcher cards keep a smaller whole-loop envelope. The view is free pan/zoom

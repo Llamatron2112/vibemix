@@ -1,0 +1,70 @@
+name: Audit
+
+# ASAN needs a sanitizer build and a real plugin catalog, so it runs on a
+# schedule/manual dispatch instead of every pull request.
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: "0 4 * * 0"
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-C link-arg=-fuse-ld=lld"
+
+jobs:
+  asan:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          submodules: recursive
+
+      - name: Install system dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake ninja-build pkg-config lld gcc \
+            qt6-base-dev qt6-declarative-dev qt6-declarative-dev-tools \
+            libx11-dev libgl-dev \
+            qml6-module-qtquick qml6-module-qtquick-controls qml6-module-qtquick-layouts \
+            qml6-module-qtquick-dialogs qml6-module-qtquick-window \
+            lv2-dev liblilv-dev libserd-dev libsord-dev libsratom-dev libsuil-dev \
+            libjack-jackd2-dev jackd2 calf-plugins just
+
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache cargo
+        uses: Swatinem/rust-cache@v2
+
+      - name: ASAN/UBSan audit
+        run: |
+          mkdir -p .ci-bin
+          printf '#!/bin/sh\nexec "$@"\n' > .ci-bin/pw-jack
+          chmod +x .ci-bin/pw-jack
+          export PATH="$PWD/.ci-bin:$PATH"
+          export JACK_NO_AUDIO_RESERVATION=1
+
+          jackd -d dummy -r 48000 -p 1024 > /tmp/jackd.log 2>&1 &
+          sleep 2
+          pgrep -x jackd >/dev/null || { cat /tmp/jackd.log; exit 1; }
+
+          # The asan recipe copies this catalog into its isolated config dir.
+          cargo build -p vibemix-engine
+          ./target/debug/vibemix-engine --strips 1 --buses 1 \
+            --socket /tmp/vibemix-catalog.sock --auto-connect false \
+            > /tmp/vibemix-catalog.log 2>&1 &
+          catalog_engine=$!
+          for _ in $(seq 1 60); do
+            [ -s "$HOME/.config/vibemix/catalog.json" ] && break
+            sleep 1
+          done
+          kill "$catalog_engine" 2>/dev/null || true
+          wait "$catalog_engine" 2>/dev/null || true
+          test -s "$HOME/.config/vibemix/catalog.json" || {
+            tail -50 /tmp/vibemix-catalog.log
+            exit 1
+          }
+
+          just asan
