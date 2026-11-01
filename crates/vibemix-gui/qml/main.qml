@@ -108,6 +108,7 @@ ApplicationWindow {
     readonly property int stripBody: 76
     readonly property int stripCardWidth: stripBody + 12
     readonly property int busCardWidth: stripBody + 12
+    readonly property int loopsPaneWidth: 184
     readonly property int pluginRowHeight: 18
     readonly property int pluginFrame: pluginRowHeight * 2 + 6
     readonly property color accentColor: palette.highlight
@@ -552,6 +553,10 @@ ApplicationWindow {
         var layout = root.layoutSettings()
         return kind === "strip" ? layout.strips_per_row : layout.buses_per_row
     }
+    function columnsForWidth(kind, width) {
+        var card = kind === "strip" ? root.stripCardWidth : root.busCardWidth
+        return Math.max(1, Math.floor((width - 8 + 4) / (card + 4)))
+    }
     function paneColumns(kind) {
         // Count the cards that exist (the id models drive the repeaters), not
         // the snapshot, so the column count and the cards change together.
@@ -569,9 +574,8 @@ ApplicationWindow {
             return Math.max(1, Math.min(Math.max(1, count), columns))
         }
         if (fixed && fixed > 0) return Math.min(32, fixed)
-        var card = kind === "strip" ? root.stripCardWidth : root.busCardWidth
         var availableWidth = kind === "strip" ? stripsFlick.width : busesFlick.width
-        return Math.max(1, Math.floor((availableWidth - 8 + 4) / (card + 4)))
+        return columnsForWidth(kind, availableWidth)
     }
     function canAddStrip() {
         var capacity = mix.strip_capacity
@@ -584,7 +588,8 @@ ApplicationWindow {
     function autoFitWidth() {
         var strips = Math.max(160, stripsGrid.implicitWidth + 12)
         var buses = Math.max(140, busesGrid.implicitWidth + 12)
-        return Math.max(320, strips + buses + 12)
+        var loops = root.loopList().length > 0 ? root.loopsPaneWidth : 0
+        return Math.max(320, strips + buses + loops + 12)
     }
     function autoFitHeight() {
         var strips = stripsGrid.implicitHeight + 24 + 10
@@ -594,8 +599,14 @@ ApplicationWindow {
     function toggleAutoFit() {
         var on = !root.transportUi().autosize
         if (on) {
-            // Preserve the wrap the user is looking at.
-            root.autoFitStripColumns = Math.max(1, stripsGrid.columns)
+            // Preserve the wrap the user is looking at. The loops pane sits in
+            // the same window but is not part of the strip pane, so credit its
+            // width when capturing the strip wrap; otherwise adding it at
+            // toggle time wraps the strips into extra rows and makes auto-fit
+            // grow the window tall.
+            var loopWidth = root.loopList().length > 0 ? root.loopsPaneWidth : 0
+            root.autoFitStripColumns =
+                root.columnsForWidth("strip", stripsFlick.width + loopWidth)
             root.autoFitBusColumns = Math.max(1, busesGrid.columns)
         }
         root.setTransportUi({ autosize: on })
@@ -6022,8 +6033,8 @@ ApplicationWindow {
         Item {
             id: loopsPane
             visible: root.loopList().length > 0
-            SplitView.preferredWidth: visible ? 184 : 0
-            SplitView.minimumWidth: visible ? 164 : 0
+            SplitView.preferredWidth: visible ? root.loopsPaneWidth : 0
+            SplitView.minimumWidth: visible ? root.loopsPaneWidth - 20 : 0
 
             ColumnLayout {
                 anchors.fill: parent

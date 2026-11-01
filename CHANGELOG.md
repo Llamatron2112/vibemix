@@ -18,9 +18,11 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   master if the bus is removed) and is compensated for that bus's PDC target.
   The Recorder and Loops dialogs are gone; remaining recording settings live in
   a non-modal popover on the top-bar record dot (length/unit, beats per bar, bit
-  depth, save folder). Latency correction is always applied and takes are no
-  longer automatically nudged to their first transient (markers and manual snap
-  remain in the editor).
+  depth, save folder). Auto-fit counts the loops pane and captures the strip
+  wrap without it, so showing loops does not wrap the strips into extra rows;
+  the pane scrolls within the mixer height. Latency correction is always
+  applied and takes are no longer automatically nudged to their first transient
+  (markers and manual snap remain in the editor).
 - **Trim learn.** A strip's trim right-click menu can start a continuous learn
   mode that peak-holds the post-trim signal, cuts immediately above −0.1 dBFS,
   and boosts gradually only within the measured headroom. The loudest peak is
