@@ -2845,11 +2845,11 @@ ApplicationWindow {
         property real value: 1
         property real liveValue: 1
         property real resetValue: 1
-        property real dragStart: 0
         property double lastTapAt: 0
+        property bool dragging: false
         property string valueText: ""
         property string entryUnit: "db"
-        readonly property bool interacting: dragHandler.active || valueTimer.running
+        readonly property bool interacting: fader.dragging || valueTimer.running
         readonly property real displayValue: fader.interacting ? fader.liveValue : fader.value
         readonly property string shownValueText: fader.interacting
             ? root.gainText(fader.liveValue)
@@ -2866,7 +2866,6 @@ ApplicationWindow {
         function bump() { valueTimer.restart() }
         function resetToDefault() {
             fader.liveValue = fader.resetValue
-            fader.dragStart = fader.resetValue
             fader.moved(fader.resetValue)
             fader.bump()
         }
@@ -2922,48 +2921,32 @@ ApplicationWindow {
             border.width: 1
         }
 
-        DragHandler {
-            id: dragHandler
-            target: null
-            xAxis.enabled: false
-            // Start moving as soon as the pointer moves: without this, Qt waits
-            // for the platform drag distance (~10px), leaving a dead zone before
-            // the value reacts.
-            dragThreshold: 2
-            onActiveChanged: {
-                if (dragHandler.active) {
-                    fader.dragStart = fader.liveValue
-                    fader.bump()
-                }
-            }
-            onTranslationChanged: {
-                var span = fader.to - fader.from
-                var delta = -dragHandler.translation.y / track.height * span
-                var next = Math.max(fader.from, Math.min(fader.to, fader.dragStart + delta))
-                fader.liveValue = next
-                fader.moved(next)
-                fader.bump()
-            }
-        }
-
         MouseArea {
             anchors.fill: parent
             acceptedButtons: Qt.LeftButton
+            preventStealing: true
             onPressed: (mouse) => {
-                if (mouse.modifiers & Qt.ControlModifier) {
-                    fader.resetToDefault()
-                    return
-                }
+                fader.dragging = true
                 var now = Date.now()
                 var interval = Qt.styleHints
                     ? Qt.styleHints.mouseDoubleClickInterval : 400
-                if (fader.lastTapAt > 0 && now - fader.lastTapAt < interval) {
+                if (mouse.modifiers & Qt.ControlModifier) {
+                    fader.resetToDefault()
+                } else if (fader.lastTapAt > 0 && now - fader.lastTapAt < interval) {
                     fader.resetToDefault()
                 } else {
                     fader.setFromY(mouse.y)
                 }
                 fader.lastTapAt = now
+                fader.bump()
             }
+            onPositionChanged: (mouse) => {
+                if (!pressed) return
+                fader.setFromY(mouse.y)
+                fader.bump()
+            }
+            onReleased: fader.dragging = false
+            onCanceled: fader.dragging = false
         }
 
         WheelHandler {
@@ -3376,9 +3359,10 @@ ApplicationWindow {
         property real dragStart: 0
         property double lastTapAt: 0
         property real resetValue: (from + to) / 2
+        property bool dragging: false
         property string valueText: ""
         property string entryUnit: "linear"
-        readonly property bool interacting: knobDrag.active || valueTimer.running
+        readonly property bool interacting: knob.dragging || valueTimer.running
         readonly property real displayValue: knob.interacting ? knob.liveValue : knob.value
         readonly property string shownValueText: {
             if (!knob.interacting) return knob.valueText
@@ -3441,7 +3425,7 @@ ApplicationWindow {
             anchors.fill: parent
             radius: width / 2
             color: root.controlColor
-            border.color: knobDrag.active ? root.accentColor : root.borderColor
+            border.color: knob.dragging ? root.accentColor : root.borderColor
             border.width: 1
         }
 
@@ -3455,42 +3439,36 @@ ApplicationWindow {
             rotation: -135 + knob.normalized * 270
         }
 
-        DragHandler {
-            id: knobDrag
-            target: null
-            xAxis.enabled: false
-            dragThreshold: 2
-            onActiveChanged: {
-                if (knobDrag.active) {
-                    knob.dragStart = knob.liveValue
-                    knob.bump()
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.LeftButton
+            preventStealing: true
+            property real pressY: 0
+            onPressed: (mouse) => {
+                knob.dragging = true
+                pressY = mouse.y
+                knob.dragStart = knob.liveValue
+                var now = Date.now()
+                var interval = Qt.styleHints
+                    ? Qt.styleHints.mouseDoubleClickInterval : 400
+                if (mouse.modifiers & Qt.ControlModifier) {
+                    knob.resetToDefault()
+                } else if (knob.lastTapAt > 0 && now - knob.lastTapAt < interval) {
+                    knob.resetToDefault()
                 }
+                knob.lastTapAt = now
+                knob.bump()
             }
-            onTranslationChanged: {
-                var delta = -knobDrag.translation.y / 120 * (knob.to - knob.from)
+            onPositionChanged: (mouse) => {
+                if (!pressed) return
+                var delta = -(mouse.y - pressY) / 120 * (knob.to - knob.from)
                 var next = Math.max(knob.from, Math.min(knob.to, knob.dragStart + delta))
                 knob.liveValue = next
                 knob.moved(next)
                 knob.bump()
             }
-        }
-
-        MouseArea {
-            anchors.fill: parent
-            acceptedButtons: Qt.LeftButton
-            onPressed: (mouse) => {
-                if (mouse.modifiers & Qt.ControlModifier) {
-                    knob.resetToDefault()
-                    return
-                }
-                var now = Date.now()
-                var interval = Qt.styleHints
-                    ? Qt.styleHints.mouseDoubleClickInterval : 400
-                if (knob.lastTapAt > 0 && now - knob.lastTapAt < interval) {
-                    knob.resetToDefault()
-                }
-                knob.lastTapAt = now
-            }
+            onReleased: knob.dragging = false
+            onCanceled: knob.dragging = false
         }
 
         TapHandler {
