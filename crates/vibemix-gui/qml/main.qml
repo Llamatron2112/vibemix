@@ -2491,13 +2491,10 @@ ApplicationWindow {
             anchors.centerIn: parent
             text: {
                 if (!flag.recordable) return "MASTER"
-                if (flag.tap.length > 0) {
-                    return flag.kind === "strip" ? "POST" : "OUT"
-                }
-                return "REC"
+                return flag.tap.length > 0 ? "●" : "REC"
             }
             color: flag.tap.length > 0 ? "white" : root.mutedText
-            font.pixelSize: 7
+            font.pixelSize: flag.tap.length > 0 ? 9 : 7
             font.bold: flag.tap.length > 0
         }
 
