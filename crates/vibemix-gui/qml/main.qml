@@ -131,6 +131,7 @@ ApplicationWindow {
     // `dataRevision`, so bindings re-run once per snapshot.
     ListModel { id: stripIdModel }
     ListModel { id: busIdModel }
+    ListModel { id: loopIdModel }
     property var dataIndex: ({ strips: ({}), buses: ({}) })
     // JSON text of each entry as last stored, so an unchanged strip or bus keeps
     // the very same object and none of its bindings fire.
@@ -161,6 +162,42 @@ ApplicationWindow {
                 model.insert(j, entry)
             }
         }
+    }
+
+    // Loops arrive as their own JSON list (not part of the snapshot) and change
+    // on every volume move. Drive the loop Repeater from an id-only model too:
+    // handing a fresh array to it would re-create every card on each update,
+    // destroying the volume slider under the mouse and dropping its grab.
+    property var loopIndex: ({})
+    property var loopText: ({})
+    property int loopRevision: 0
+    function loopAt(id) { return loopRevision >= 0 ? loopIndex[id] : undefined }
+    function syncLoops() {
+        var loops = []
+        try {
+            var parsed = JSON.parse(backend.loops)
+            if (Array.isArray(parsed)) loops = parsed
+        } catch (e) {}
+        var ids = []
+        var wanted = {}
+        for (var i = 0; i < loops.length; i++) {
+            var loop = loops[i]
+            var text = JSON.stringify(loop)
+            if (loopText[loop.id] !== text || !loopIndex[loop.id]) {
+                loopIndex[loop.id] = loop
+                loopText[loop.id] = text
+            }
+            ids.push(loop.id)
+            wanted[loop.id] = true
+        }
+        for (var key in loopIndex) {
+            if (!wanted[key]) {
+                delete loopIndex[key]
+                delete loopText[key]
+            }
+        }
+        syncIdModel(loopIdModel, "loopId", ids)
+        loopRevision++
     }
 
     function applySnapshot(parsed) {
@@ -2216,6 +2253,10 @@ ApplicationWindow {
     Connections {
         target: backend
         function onValuesChanged() { values = JSON.parse(backend.values) }
+    }
+    Connections {
+        target: backend
+        function onLoopsChanged() { root.syncLoops() }
     }
     Connections {
         target: backend
@@ -6128,11 +6169,11 @@ ApplicationWindow {
                         spacing: 4
 
                         Repeater {
-                            model: root.loopList()
+                            model: loopIdModel
 
                             delegate: Rectangle {
-                                property var loopData: modelData
-                                property var loopState: root.loopStatus(modelData.id)
+                                property var loopData: root.loopAt(model.loopId)
+                                property var loopState: root.loopStatus(model.loopId)
                                 Layout.fillWidth: true
                                 Layout.preferredHeight: loopContent.implicitHeight + 12
                                 color: root.panelColor
