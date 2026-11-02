@@ -428,6 +428,8 @@ pub enum EngineCommand {
         loop_beats: f32,
     },
     RecorderCancel,
+    /// End the running take at the next bar boundary, keeping it.
+    RecorderStopAtBar,
     SetLoop {
         slot: usize,
         buffer: Box<[f32]>,
@@ -913,6 +915,9 @@ impl MixerGraph {
                 EngineCommand::RecorderCancel => {
                     self.recorder
                         .cancel(&mut self.loop_garbage, &self.shared_recorder);
+                }
+                EngineCommand::RecorderStopAtBar => {
+                    self.recorder.request_bar_stop();
                 }
                 EngineCommand::SetLoop {
                     slot,
@@ -2709,6 +2714,12 @@ impl JackEngine {
     pub fn cancel_recorder(&mut self) -> Result<()> {
         self.commands
             .push(EngineCommand::RecorderCancel)
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn stop_recorder_at_bar(&mut self) -> Result<()> {
+        self.commands
+            .push(EngineCommand::RecorderStopAtBar)
             .map_err(|_| anyhow!("engine command queue full"))
     }
 

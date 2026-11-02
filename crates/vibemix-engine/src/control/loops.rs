@@ -756,10 +756,14 @@ impl Controller {
         let expected =
             ((loop_beats as f64 * 60.0 / bpm as f64) * sample_rate as f64).ceil() as usize;
         // Allocate for a slow (30 BPM) take so a tempo lower than the current
-        // estimate cannot overflow the buffer; the audio thread discards the
-        // take if it still runs out.
+        // estimate cannot overflow the buffer; also round the loop length up to
+        // a whole bar so a "stop at bar" (which can extend past a loop that
+        // ends mid-bar) always fits. The audio thread discards the take if it
+        // still runs out.
+        let bar = self.model.beats_per_bar.max(1.0);
+        let capacity_beats = (loop_beats / bar).ceil() * bar;
         let capacity_frames =
-            ((loop_beats as f64 * 60.0 / 30.0) * sample_rate as f64).ceil() as usize;
+            ((capacity_beats as f64 * 60.0 / 30.0) * sample_rate as f64).ceil() as usize;
         let cap = sample_rate * 300;
         if expected == 0 {
             self.recorder_status.message = "loop length is zero".to_string();
@@ -816,6 +820,9 @@ impl Controller {
                 let _ = self.engine.cancel_recorder();
                 self.recorder_status = RecorderStatus::default();
                 self.recorder_dirty = true;
+            }
+            RecorderAction::StopAtBar => {
+                let _ = self.engine.stop_recorder_at_bar();
             }
             RecorderAction::SetNudge { slot, manual } => self.set_loop_nudge(slot, manual),
             RecorderAction::SetLoopGain { slot, gain } => {

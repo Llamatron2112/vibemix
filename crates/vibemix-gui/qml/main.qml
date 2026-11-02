@@ -1685,7 +1685,11 @@ ApplicationWindow {
                                     return
                                 }
                                 var r = root.recorderInfo()
-                                root.sendRecorderAction({ action: r.state === "idle" ? "arm" : "cancel" })
+                                var action
+                                if (r.state === "idle") action = "arm"
+                                else if (r.state === "armed") action = "cancel"
+                                else action = "stop_at_bar"
+                                root.sendRecorderAction({ action: action })
                             }
                         }
 

@@ -835,7 +835,9 @@ slave mode it is silent for clock but can forward start/stop.
   schedules a START on the next bar's first clock pulse and resets the transport
   on that bar, in both master and slave modes.
   Right-clicking the record dot opens a non-modal popover with loop length and
-  unit, beats per bar, bit depth and the save folder; left-click arms/disarms.
+  unit, beats per bar, bit depth and the save folder; left-click arms, and while
+  recording ends the take at the next bar (keeping it, overriding the loop
+  length).
   `Options → MIDI sync…` is a non-modal page
   with the clock source, master tempo, transport send/receive, plugin transport
   following, and MIDI input/output routing. In beats mode the loop indicator

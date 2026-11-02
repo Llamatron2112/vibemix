@@ -272,6 +272,9 @@ pub enum RecorderAction {
     Cancel,
     /// Stop an in-progress take (it is discarded).
     Stop,
+    /// End an in-progress take at the next bar boundary, keeping it as a loop.
+    /// This overrides the configured loop length.
+    StopAtBar,
     /// Change the manual nudge of a slot, in samples.
     SetNudge {
         slot: u32,
@@ -796,6 +799,13 @@ mod tests {
             }
             _ => panic!("wrong action"),
         }
+    }
+
+    #[test]
+    fn stop_at_bar_action_parses_from_the_gui_json() {
+        let action: RecorderAction =
+            serde_json::from_str(r#"{"action":"stop_at_bar"}"#).expect("parse stop_at_bar");
+        assert!(matches!(action, RecorderAction::StopAtBar));
     }
 
     #[test]

@@ -88,6 +88,9 @@ pub struct Recorder {
     loop_beats: f32,
     peak: f32,
     since_pulse: usize,
+    /// End the take at the next bar boundary instead of the configured loop
+    /// length (set from the GUI while recording).
+    stop_at_bar: bool,
 }
 
 impl Recorder {
@@ -104,6 +107,7 @@ impl Recorder {
             loop_beats: 4.0,
             peak: 0.0,
             since_pulse: 0,
+            stop_at_bar: false,
         }
     }
 
@@ -129,6 +133,7 @@ impl Recorder {
         self.loop_beats = loop_beats;
         self.peak = 0.0;
         self.since_pulse = 0;
+        self.stop_at_bar = false;
         shared.set_loop_beats(loop_beats);
         shared.set_status(0, 0, 0.0);
         shared.set_state(RecorderState::Armed);
@@ -142,6 +147,14 @@ impl Recorder {
         }
     }
 
+    /// Finish the running take at the next bar boundary instead of the
+    /// configured loop length. The take is kept.
+    pub fn request_bar_stop(&mut self) {
+        if self.state == State::Recording {
+            self.stop_at_bar = true;
+        }
+    }
+
     pub fn cancel(&mut self, garbage: &mut Producer<Box<[f32]>>, shared: &SharedRecorder) {
         if let Some(buffer) = self.buffer.take() {
             if let Err(buffer) = garbage.push(buffer) {
@@ -151,6 +164,7 @@ impl Recorder {
         self.state = State::Idle;
         self.write = 0;
         self.since_pulse = 0;
+        self.stop_at_bar = false;
         shared.set_state(RecorderState::Idle);
         shared.set_status(0, 0, 0.0);
     }
@@ -221,7 +235,15 @@ impl Recorder {
                         }
                     } else if start_off.map(|s| offset > s).unwrap_or(true) {
                         pulses += 1;
-                        if pulses >= self.loop_pulses {
+                        if self.stop_at_bar {
+                            if is_bar(beats, bpb) {
+                                // Keep the take's real length, not the
+                                // configured loop length.
+                                self.loop_beats = pulses as f32 / 24.0;
+                                end_off = Some(offset);
+                                break;
+                            }
+                        } else if pulses >= self.loop_pulses {
                             end_off = Some(offset);
                             break;
                         }
@@ -296,6 +318,7 @@ impl Recorder {
             self.state = State::Idle;
             self.write = 0;
             self.pulses = 0;
+            self.stop_at_bar = false;
             shared.set_state(RecorderState::Idle);
             shared.set_status(0, 0, 0.0);
             if frames == 0 {
@@ -765,6 +788,70 @@ mod tests {
         assert!((take.buffer[1] - 1.0).abs() < 1e-6);
         assert!((take.buffer[4] - 0.3).abs() < 1e-6);
         assert!((take.buffer[5] - 3.0).abs() < 1e-6);
+        assert_eq!(shared.state(), RecorderState::Idle);
+    }
+
+    #[test]
+    fn stop_at_bar_ends_at_the_next_bar_and_keeps_the_take() {
+        let shared = SharedRecorder::new();
+        let (mut take_tx, mut take_rx) = rtrb::RingBuffer::<RecordedTake>::new(2);
+        let (mut garbage_tx, _garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(2);
+        let mut recorder = Recorder::new();
+        // Configured loop: 2 beats. A bar stop must end at the far sooner
+        // one-beat bar boundary instead.
+        recorder.arm(
+            vec![0.0; 64 * 2].into_boxed_slice(),
+            64,
+            96,
+            48,
+            0,
+            2.0,
+            &shared,
+        );
+
+        let left = [0.1f32; 64];
+        let right = [0.2f32; 64];
+
+        // Block 1: START begins the take at frame 0.
+        recorder.process(
+            0,
+            2,
+            &[MidiEvent::new(0, &[START])],
+            0.0,
+            1.0,
+            &left[..2],
+            &right[..2],
+            48_000,
+            &shared,
+            &mut take_tx,
+            &mut garbage_tx,
+        );
+        assert_eq!(shared.state(), RecorderState::Recording);
+
+        // The user clicks record while recording: finish at the next bar.
+        recorder.request_bar_stop();
+
+        // Block 2: 24 CLOCKs bring the take to the one-beat bar boundary.
+        let events: Vec<MidiEvent> = (0..24).map(|i| MidiEvent::new(i, &[CLOCK])).collect();
+        recorder.process(
+            2,
+            30,
+            &events,
+            0.0,
+            1.0,
+            &left[..30],
+            &right[..30],
+            48_000,
+            &shared,
+            &mut take_tx,
+            &mut garbage_tx,
+        );
+
+        let take = take_rx.pop().expect("bar-stopped take");
+        // 2 frames from the first block + 23 up to the boundary.
+        assert_eq!(take.frames, 25);
+        // The take reports its real one-beat length, not the configured two.
+        assert!((take.loop_beats - 1.0).abs() < 1e-6);
         assert_eq!(shared.state(), RecorderState::Idle);
     }
 }
