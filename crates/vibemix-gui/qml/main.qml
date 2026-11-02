@@ -2847,7 +2847,6 @@ ApplicationWindow {
         property real resetValue: 1
         property real dragStart: 0
         property double lastTapAt: 0
-        property bool suppressSingleClick: false
         property string valueText: ""
         property string entryUnit: "db"
         readonly property bool interacting: dragHandler.active || valueTimer.running
@@ -2869,6 +2868,14 @@ ApplicationWindow {
             fader.liveValue = fader.resetValue
             fader.dragStart = fader.resetValue
             fader.moved(fader.resetValue)
+            fader.bump()
+        }
+        function setFromY(y) {
+            var clamped = Math.max(track.y, Math.min(track.y + track.height, y))
+            var n = 1 - (clamped - track.y) / track.height
+            var next = fader.from + n * (fader.to - fader.from)
+            fader.liveValue = next
+            fader.moved(next)
             fader.bump()
         }
         function entryFrom() { return entryUnit === "db" ? -60 : from }
@@ -2922,8 +2929,7 @@ ApplicationWindow {
             // Start moving as soon as the pointer moves: without this, Qt waits
             // for the platform drag distance (~10px), leaving a dead zone before
             // the value reacts.
-            dragThreshold: 0
-            grabPermissions: PointerHandler.TakeOverForbidden
+            dragThreshold: 2
             onActiveChanged: {
                 if (dragHandler.active) {
                     fader.dragStart = fader.liveValue
@@ -2940,42 +2946,23 @@ ApplicationWindow {
             }
         }
 
-        TapHandler {
-            acceptedModifiers: Qt.NoModifier
-            onPressedChanged: {
-                if (!pressed) return
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.LeftButton
+            onPressed: (mouse) => {
+                if (mouse.modifiers & Qt.ControlModifier) {
+                    fader.resetToDefault()
+                    return
+                }
                 var now = Date.now()
                 var interval = Qt.styleHints
                     ? Qt.styleHints.mouseDoubleClickInterval : 400
                 if (fader.lastTapAt > 0 && now - fader.lastTapAt < interval) {
                     fader.resetToDefault()
-                    fader.suppressSingleClick = true
                 } else {
-                    fader.suppressSingleClick = false
+                    fader.setFromY(mouse.y)
                 }
                 fader.lastTapAt = now
-            }
-            onSingleTapped: (eventPoint) => {
-                if (fader.suppressSingleClick) {
-                    fader.suppressSingleClick = false
-                    return
-                }
-                var y = eventPoint.position.y
-                var clamped = Math.max(track.y, Math.min(track.y + track.height, y))
-                var n = 1 - (clamped - track.y) / track.height
-                var next = fader.from + n * (fader.to - fader.from)
-                fader.liveValue = next
-                fader.moved(next)
-                fader.bump()
-            }
-        }
-
-        TapHandler {
-            acceptedModifiers: Qt.ControlModifier
-            onSingleTapped: {
-                fader.liveValue = fader.resetValue
-                fader.moved(fader.resetValue)
-                fader.bump()
             }
         }
 
@@ -3472,8 +3459,7 @@ ApplicationWindow {
             id: knobDrag
             target: null
             xAxis.enabled: false
-            dragThreshold: 0
-            grabPermissions: PointerHandler.TakeOverForbidden
+            dragThreshold: 2
             onActiveChanged: {
                 if (knobDrag.active) {
                     knob.dragStart = knob.liveValue
@@ -3489,10 +3475,14 @@ ApplicationWindow {
             }
         }
 
-        TapHandler {
-            acceptedModifiers: Qt.NoModifier
-            onPressedChanged: {
-                if (!pressed) return
+        MouseArea {
+            anchors.fill: parent
+            acceptedButtons: Qt.LeftButton
+            onPressed: (mouse) => {
+                if (mouse.modifiers & Qt.ControlModifier) {
+                    knob.resetToDefault()
+                    return
+                }
                 var now = Date.now()
                 var interval = Qt.styleHints
                     ? Qt.styleHints.mouseDoubleClickInterval : 400
@@ -3500,15 +3490,6 @@ ApplicationWindow {
                     knob.resetToDefault()
                 }
                 knob.lastTapAt = now
-            }
-        }
-
-        TapHandler {
-            acceptedModifiers: Qt.ControlModifier
-            onSingleTapped: {
-                knob.liveValue = knob.resetValue
-                knob.moved(knob.resetValue)
-                knob.bump()
             }
         }
 
