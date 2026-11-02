@@ -259,6 +259,13 @@ ApplicationWindow {
     property var busMeterSource: ({})
     property bool sliderHovered: false
     property bool gripDragging: false
+    // Set when the user queues a stop-at-bar, so the record dot can show the
+    // "ending at the next bar" state until the take lands.
+    property bool stopQueued: false
+    // Loop-indicator cell where the current take started (-1 when not
+    // recording), so the red recording fill starts there and leaves the blue
+    // position fill before it untouched.
+    property int recordStartCell: -1
 
     function val(map, id, key, fallback) {
         var entry = map[id]
@@ -933,6 +940,17 @@ ApplicationWindow {
     }
     function recorderInfo() {
         try { return JSON.parse(backend.recorder) } catch (e) { return ({ state: "idle", progress: 0 }) }
+    }
+    // True while a recording is committed to stop at the next bar: either the
+    // user queued a stop, or the take is in its final bar of the configured
+    // loop (and will end at the bar's end).
+    function recorderEndingAtBar() {
+        var r = root.recorderInfo()
+        if (r.state !== "recording") return false
+        if (root.stopQueued) return true
+        var loopBeats = (r.loop_beats > 0) ? r.loop_beats : 1
+        var left = loopBeats * (1 - Math.max(0, Math.min(1, r.progress || 0)))
+        return left <= root.beatsPerBar()
     }
     function recorderSourceTap(kind, id) {
         var sources = root.recorderSettings().sources || []
@@ -1656,11 +1674,16 @@ ApplicationWindow {
                         width: 16
                         height: 16
                         radius: 8
-                        border.color: root.borderColor
+                        border.color: (root.recorderInfo().state === "idle"
+                            && (root.recorderSettings().sources || []).length > 0)
+                            ? "#e53935"
+                            : root.borderColor
                         border.width: 1
                         color: {
                             var r = root.recorderInfo()
-                            if (r.state === "recording") return "#e53935"
+                            if (r.state === "recording") {
+                                return root.recorderEndingAtBar() ? "#f57c00" : "#e53935"
+                            }
                             if (r.state === "armed") return "#f9a825"
                             return root.controlColor
                         }
@@ -1671,7 +1694,11 @@ ApplicationWindow {
                         ToolTip.text: {
                             var r = root.recorderInfo()
                             if (r.message) return r.message
-                            if (r.state === "recording") return "recording " + Math.round((r.progress || 0) * 100) + "%"
+                            if (r.state === "recording") {
+                                return root.recorderEndingAtBar()
+                                    ? "recording — stopping at the next bar"
+                                    : "recording — click to end at the next bar"
+                            }
                             if (r.state === "armed") return "armed: waiting for bar 1"
                             return "click to record a loop · right-click for settings"
                         }
@@ -1689,6 +1716,7 @@ ApplicationWindow {
                                 if (r.state === "idle") action = "arm"
                                 else if (r.state === "armed") action = "cancel"
                                 else action = "stop_at_bar"
+                                if (action === "stop_at_bar") root.stopQueued = true
                                 root.sendRecorderAction({ action: action })
                             }
                         }
@@ -1698,7 +1726,7 @@ ApplicationWindow {
                             parent: recordDot
                             x: -width + recordDot.width
                             y: recordDot.height + 4
-                            width: 250
+                            width: 300
                             padding: 8
                             modal: false
                             closePolicy: Popup.CloseOnEscape | Popup.CloseOnPressOutside
@@ -1731,6 +1759,7 @@ ApplicationWindow {
                                     SpinBox {
                                         from: 1
                                         to: 64
+                                        Layout.preferredWidth: 88
                                         value: root.transportUi().loop_length
                                         onValueModified: root.setTransportUi({ loop_length: value })
                                     }
@@ -1752,6 +1781,7 @@ ApplicationWindow {
                                     SpinBox {
                                         from: 1
                                         to: 16
+                                        Layout.preferredWidth: 88
                                         value: Math.round(root.beatsPerBar())
                                         onValueModified: backend.setBeatsPerBar(value)
                                     }
@@ -1812,14 +1842,9 @@ ApplicationWindow {
                     }
 
                     Label {
-                        visible: root.recorderInfo().state !== "idle"
-                        text: {
-                            var r = root.recorderInfo()
-                            if (r.state === "recording") return "REC " + Math.round((r.progress || 0) * 100) + "%"
-                            if (r.state === "armed") return "ARM"
-                            return ""
-                        }
-                        color: root.recorderInfo().state === "recording" ? "#e53935" : "#f9a825"
+                        visible: root.recorderInfo().state === "armed"
+                        text: "ARM"
+                        color: "#f9a825"
                         font.pixelSize: 10
                         font.family: "monospace"
                     }
@@ -1852,7 +1877,17 @@ ApplicationWindow {
                                         width: 6
                                         height: 6
                                         anchors.right: parent.right
-                                        color: index <= root.loopInfo().index ? root.accentColor : root.borderColor
+                                        color: {
+                                            var info = root.loopInfo()
+                                            var r = root.recorderInfo()
+                                            if (r.state === "recording" && root.recordStartCell >= 0) {
+                                                var recorded = (r.progress || 0) * info.count
+                                                var offset = ((index - root.recordStartCell) % info.count
+                                                    + info.count) % info.count
+                                                if (offset < recorded) return "#e53935"
+                                            }
+                                            return index <= info.index ? root.accentColor : root.borderColor
+                                        }
                                     }
                                 }
                             }
@@ -2261,6 +2296,30 @@ ApplicationWindow {
     Connections {
         target: backend
         function onLoopsChanged() { root.syncLoops() }
+    }
+    Connections {
+        target: backend
+        function onRecorderChanged() {
+            if (root.recorderInfo().state !== "recording") {
+                root.recordStartCell = -1
+                root.stopQueued = false
+            }
+        }
+    }
+    Connections {
+        target: backend
+        // Capture the take's start cell from the freshest clock. The recorder
+        // update in the same poll still carries the previous clock, which can
+        // be one beat before the actual start and would colour that beat red.
+        // Waiting until a few frames are recorded guarantees the position is
+        // past the start boundary.
+        function onClockChanged() {
+            if (root.recordStartCell >= 0) return
+            var r = root.recorderInfo()
+            if (r.state === "recording" && (r.progress || 0) > 0) {
+                root.recordStartCell = root.loopInfo().index
+            }
+        }
     }
     Connections {
         target: backend
