@@ -18,6 +18,8 @@ pub struct RecordedTake {
     pub sample_rate: u32,
     pub latency_frames: u32,
     pub loop_beats: f32,
+    /// Absolute engine frame where the take ended (exclusive).
+    pub end_frame: u64,
 }
 
 pub const MAX_LOOPS: usize = 16;
@@ -158,6 +160,7 @@ impl Recorder {
     #[allow(clippy::too_many_arguments)]
     pub fn process(
         &mut self,
+        abs_frame: u64,
         frames: usize,
         events: &[MidiEvent],
         beats_before: f64,
@@ -306,12 +309,14 @@ impl Recorder {
             let Some(buffer) = self.buffer.take() else {
                 return;
             };
+            let end_at = end_off.unwrap_or(frames).min(frames) as u64;
             let take = RecordedTake {
                 buffer,
                 frames,
                 sample_rate,
                 latency_frames: self.latency_frames,
                 loop_beats: self.loop_beats,
+                end_frame: abs_frame.saturating_add(end_at),
             };
             if let Err(take) = take_tx.push(take) {
                 let rtrb::PushError::Full(take) = take;
@@ -344,6 +349,8 @@ pub struct LoopPlayback {
     pub playing: bool,
     pub pending: bool,
     pub quantized: bool,
+    /// Start immediately at the phase elapsed since this absolute frame.
+    pub phase_end: Option<u64>,
     pub gain: f32,
     pub mute: bool,
     /// Bus this loop is mixed into (0 = master).
@@ -366,6 +373,7 @@ impl LoopPlayback {
             playing: false,
             pending: false,
             quantized: true,
+            phase_end: None,
             gain: 1.0,
             mute: false,
             output_bus: 0,
@@ -387,9 +395,19 @@ impl LoopPlayback {
     /// Starts playback from the top at full level (a quantized launch should
     /// hit the downbeat, not fade in).
     pub fn start(&mut self) {
-        self.pos = 0;
+        self.start_at(0);
+    }
+
+    /// Start at an already elapsed loop position (phase-correct handoff).
+    pub fn start_at(&mut self, pos: usize) {
+        self.pos = if self.frames == 0 {
+            0
+        } else {
+            pos % self.frames
+        };
         self.playing = true;
         self.pending = false;
+        self.phase_end = None;
         self.stopping = false;
         self.level = self.target();
     }
@@ -514,6 +532,16 @@ mod tests {
     }
 
     #[test]
+    fn phased_start_begins_at_the_elapsed_loop_position() {
+        let mut playback = loop_with(&[0.0, 1.0, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0]);
+        playback.start_at(3);
+        let (mut l, mut r) = ([0.0f32; 3], [0.0f32; 3]);
+        playback.mix(&mut l, &mut r, 0, 3, 1.0);
+        assert_eq!(l, [3.0, 4.0, 5.0]);
+        assert!(playback.playing);
+    }
+
+    #[test]
     fn one_shot_plays_once_then_stops() {
         let mut playback = loop_with(&[1.0, 2.0, 3.0, 4.0]);
         playback.one_shot = true;
@@ -576,6 +604,7 @@ mod tests {
             MidiEvent::new(2, &[CLOCK]),
         ];
         recorder.process(
+            0,
             4,
             &events,
             95.0 / 24.0,
@@ -607,6 +636,7 @@ mod tests {
                 sample_rate: 48_000,
                 latency_frames: 0,
                 loop_beats: 1.0,
+                end_frame: 0,
             })
             .unwrap();
         let (mut garbage_tx, mut garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(2);
@@ -629,6 +659,7 @@ mod tests {
             MidiEvent::new(2, &[CLOCK]),
         ];
         recorder.process(
+            0,
             4,
             &events,
             95.0 / 24.0,
@@ -674,6 +705,7 @@ mod tests {
             MidiEvent::new(3, &[CLOCK]),
         ];
         recorder.process(
+            0,
             4,
             &events,
             0.0,
@@ -714,6 +746,7 @@ mod tests {
             MidiEvent::new(3, &[CLOCK]),
         ];
         recorder.process(
+            0,
             4,
             &events,
             0.0,

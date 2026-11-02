@@ -451,19 +451,18 @@ pub enum EngineCommand {
     },
     LoopPreview(PreviewSpec),
     LoopPreviewStop,
-    AutoSwapMute {
-        strips: [usize; 16],
-        strip_count: usize,
-        buses: [usize; 16],
-        bus_count: usize,
-    },
-    AutoSwapMuteCancel,
     ClearLoop {
         slot: usize,
     },
     LoopPlay {
         slot: usize,
         quantized: bool,
+    },
+    /// Start a freshly installed take immediately at the phase elapsed since
+    /// its recording end, avoiding a one-bar wait.
+    LoopPlayPhase {
+        slot: usize,
+        end_frame: u64,
     },
     LoopStop {
         slot: usize,
@@ -554,28 +553,6 @@ impl PreviewRuntime {
             click_phase: 0.0,
             click_freq: 1000.0,
         }
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-struct PendingAutoMute {
-    strips: [usize; 16],
-    strip_count: usize,
-    buses: [usize; 16],
-    bus_count: usize,
-}
-
-impl PendingAutoMute {
-    fn new(strips: &[usize], buses: &[usize]) -> Self {
-        let mut this = Self {
-            strips: [0; 16],
-            strip_count: strips.len().min(16),
-            buses: [0; 16],
-            bus_count: buses.len().min(16),
-        };
-        this.strips[..this.strip_count].copy_from_slice(&strips[..this.strip_count]);
-        this.buses[..this.bus_count].copy_from_slice(&buses[..this.bus_count]);
-        this
     }
 }
 
@@ -706,14 +683,11 @@ struct MixerGraph {
     /// Previous block's transport state, used to relaunch loops when the
     /// transport starts or restarts.
     transport_playing: bool,
+    /// Absolute engine frame at the start of this block.
+    abs_frames: u64,
     /// Dry editor audition: loop plus reference/metronome, mixed after the
     /// master chain so bus PDC cannot shift their relative timing.
     preview: Option<PreviewRuntime>,
-    /// Sources to mute on the next bar when a take auto-swaps to its loop.
-    pending_auto_mute: Option<PendingAutoMute>,
-    /// A bar was mid-block; apply the mutes at the next block start so the
-    /// source overlaps the loop briefly instead of fading out before it.
-    pending_auto_mute_deferred: bool,
 }
 
 impl MixerGraph {
@@ -976,24 +950,6 @@ impl MixerGraph {
                 EngineCommand::LoopPreviewStop => {
                     self.preview = None;
                 }
-                EngineCommand::AutoSwapMute {
-                    strips,
-                    strip_count,
-                    buses,
-                    bus_count,
-                } => {
-                    let mut pending = PendingAutoMute::new(&[], &[]);
-                    pending.strip_count = strip_count.min(16);
-                    pending.strips[..pending.strip_count]
-                        .copy_from_slice(&strips[..pending.strip_count]);
-                    pending.bus_count = bus_count.min(16);
-                    pending.buses[..pending.bus_count].copy_from_slice(&buses[..pending.bus_count]);
-                    self.pending_auto_mute = Some(pending);
-                }
-                EngineCommand::AutoSwapMuteCancel => {
-                    self.pending_auto_mute = None;
-                    self.pending_auto_mute_deferred = false;
-                }
                 EngineCommand::LoopOneShot { slot, one_shot } => {
                     if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
                     {
@@ -1029,6 +985,18 @@ impl MixerGraph {
                         loop_slot.playing = false;
                         loop_slot.stopping = false;
                         loop_slot.pos = 0;
+                        loop_slot.phase_end = None;
+                    }
+                }
+                EngineCommand::LoopPlayPhase { slot, end_frame } => {
+                    if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
+                    {
+                        loop_slot.quantized = false;
+                        loop_slot.pending = true;
+                        loop_slot.playing = false;
+                        loop_slot.stopping = false;
+                        loop_slot.pos = 0;
+                        loop_slot.phase_end = Some(end_frame);
                     }
                 }
                 EngineCommand::LoopStop { slot } => {
@@ -1791,6 +1759,7 @@ impl MixerGraph {
             shared_loops,
             gain_coeff,
             delay_coeff,
+            abs_frames,
             ..
         } = self;
         let bus_count = bus_accum.len();
@@ -1804,7 +1773,12 @@ impl MixerGraph {
                 continue;
             };
             let start = if loop_slot.pending {
-                if loop_slot.quantized && playing {
+                if let Some(end) = loop_slot.phase_end.take() {
+                    let frames = loop_slot.frames.max(1);
+                    let elapsed = abs_frames.saturating_sub(end) as usize % frames;
+                    loop_slot.start_at(elapsed);
+                    0
+                } else if loop_slot.quantized && playing {
                     let Some(offset) = bar else {
                         shared_loops.publish(index, 0.0, false, true);
                         continue;
@@ -2274,32 +2248,6 @@ impl ProcessHandler for MixerGraph {
         }
         self.transport_playing = playing;
 
-        if self.pending_auto_mute.is_some() {
-            let mut apply_mutes = self.pending_auto_mute_deferred;
-            self.pending_auto_mute_deferred = false;
-            if let Some(offset) =
-                bar_boundary_offset(self.transport_midi.as_slice(), beats_before, beats_per_bar)
-            {
-                if offset == 0 {
-                    apply_mutes = true;
-                } else {
-                    // The loop starts inside this block; let the source run
-                    // through it and fade at the next block to avoid a gap.
-                    self.pending_auto_mute_deferred = true;
-                }
-            }
-            if apply_mutes {
-                if let Some(pending) = self.pending_auto_mute.take() {
-                    for &strip in &pending.strips[..pending.strip_count] {
-                        self.params.set_strip_mute(strip, true);
-                    }
-                    for &bus in &pending.buses[..pending.bus_count] {
-                        self.params.set_bus_mute(bus, true);
-                    }
-                }
-            }
-        }
-
         self.process_strips(scope, frames, paused);
         self.mix_loops(frames, beats_before, beats_per_bar, playing);
         self.process_buses(scope, frames);
@@ -2310,6 +2258,7 @@ impl ProcessHandler for MixerGraph {
         self.recorder
             .set_latency(self.buffer_size as u32 + self.source_latency_frames());
         self.recorder.process(
+            self.abs_frames,
             frames,
             self.transport_midi.as_slice(),
             beats_before,
@@ -2322,6 +2271,7 @@ impl ProcessHandler for MixerGraph {
             &mut self.loop_garbage,
         );
 
+        self.abs_frames = self.abs_frames.wrapping_add(frames as u64);
         self.mix_preview(frames);
         self.add_preview_to_output(scope, frames);
 
@@ -2638,9 +2588,8 @@ impl JackEngine {
             slave_restart_pending: false,
             transport_midi: MidiBlock::default(),
             transport_playing: false,
+            abs_frames: 0,
             preview: None,
-            pending_auto_mute: None,
-            pending_auto_mute_deferred: false,
             clock: Clock::new(sample_rate as f32, 4.0),
             shared_clock: Arc::clone(&shared_clock),
             position: vibemix_lv2::TimePosition::default(),
@@ -2802,45 +2751,21 @@ impl JackEngine {
             .map_err(|_| anyhow!("engine command queue full"))
     }
 
-    pub fn auto_swap_mute(&mut self, strips: &[usize], buses: &[usize]) -> Result<()> {
-        let mut strip_array = [0usize; 16];
-        let mut bus_array = [0usize; 16];
-        let strip_count = strips.len().min(16);
-        let bus_count = buses.len().min(16);
-        strip_array[..strip_count].copy_from_slice(&strips[..strip_count]);
-        bus_array[..bus_count].copy_from_slice(&buses[..bus_count]);
-        self.commands
-            .push(EngineCommand::AutoSwapMute {
-                strips: strip_array,
-                strip_count,
-                buses: bus_array,
-                bus_count,
-            })
-            .map_err(|_| anyhow!("engine command queue full"))
-    }
-
-    pub fn auto_swap_mute_cancel(&mut self) -> Result<()> {
-        self.commands
-            .push(EngineCommand::AutoSwapMuteCancel)
-            .map_err(|_| anyhow!("engine command queue full"))
-    }
-
     pub fn loop_bus(&mut self, slot: usize, bus: usize) -> Result<()> {
         self.commands
             .push(EngineCommand::LoopBus { slot, bus })
             .map_err(|_| anyhow!("engine command queue full"))
     }
 
-    /// Latest playback progress/playing/pending for a launcher slot.
-    pub fn loop_status(&self, slot: usize) -> (f32, bool, bool) {
-        self.shared_loops.status(slot)
-    }
-
-    /// Change a loop's playback rotation without replacing its buffer.
     pub fn loop_offset(&mut self, slot: usize, offset: i64) -> Result<()> {
         self.commands
             .push(EngineCommand::LoopOffset { slot, offset })
             .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    /// Latest playback progress/playing/pending for a launcher slot.
+    pub fn loop_status(&self, slot: usize) -> (f32, bool, bool) {
+        self.shared_loops.status(slot)
     }
 
     pub fn clear_loop(&mut self, slot: usize) -> Result<()> {
@@ -2852,6 +2777,12 @@ impl JackEngine {
     pub fn loop_play(&mut self, slot: usize, quantized: bool) -> Result<()> {
         self.commands
             .push(EngineCommand::LoopPlay { slot, quantized })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn loop_play_phase(&mut self, slot: usize, end_frame: u64) -> Result<()> {
+        self.commands
+            .push(EngineCommand::LoopPlayPhase { slot, end_frame })
             .map_err(|_| anyhow!("engine command queue full"))
     }
 

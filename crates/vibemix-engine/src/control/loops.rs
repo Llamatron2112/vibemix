@@ -576,16 +576,12 @@ impl Controller {
             sample_rate,
             latency_frames,
             loop_beats,
+            end_frame,
         } = take;
         if frames == 0 {
             return;
         }
         let auto_swap = self.model.recorder.auto_swap;
-        let auto_undo = if auto_swap {
-            Some(self.snapshot_entry("Auto-swap record"))
-        } else {
-            None
-        };
         let Some(slot_index) = self.free_loop_slot() else {
             self.recorder_status.message = "loop slots are full".to_string();
             self.recorder_dirty = true;
@@ -664,58 +660,70 @@ impl Controller {
             }));
 
         if auto_swap {
-            let mut strips: Vec<u32> = Vec::new();
-            let mut buses: Vec<u32> = Vec::new();
-            for source in &self.model.recorder.sources {
-                match source.kind {
-                    vibemix_core::recorder::RecorderSourceKind::Strip => {
-                        if self
-                            .model
-                            .strips
-                            .iter()
-                            .any(|strip| strip.id.0 == source.id)
-                            && !strips.contains(&source.id)
-                        {
-                            strips.push(source.id);
+            let clock_playing = self
+                .engine
+                .clock()
+                .snapshot(self.engine.sample_rate() as f32)
+                .playing;
+            if !clock_playing {
+                let _ = self.engine.clear_loop(slot_index);
+                self.loops[slot_index] = None;
+                self.recorder_status.message = "auto-swap canceled: transport stopped".to_string();
+            } else {
+                let mut strips: Vec<u32> = Vec::new();
+                let mut buses: Vec<u32> = Vec::new();
+                for source in &self.model.recorder.sources {
+                    match source.kind {
+                        vibemix_core::recorder::RecorderSourceKind::Strip => {
+                            if self
+                                .model
+                                .strips
+                                .iter()
+                                .any(|strip| strip.id.0 == source.id)
+                                && !strips.contains(&source.id)
+                            {
+                                strips.push(source.id);
+                            }
                         }
-                    }
-                    vibemix_core::recorder::RecorderSourceKind::Bus => {
-                        if source.id != 0
-                            && source.id != output_bus
-                            && self.model.buses.iter().any(|bus| bus.id.0 == source.id)
-                            && !buses.contains(&source.id)
-                        {
-                            buses.push(source.id);
+                        vibemix_core::recorder::RecorderSourceKind::Bus => {
+                            if source.id != 0
+                                && source.id != output_bus
+                                && self.model.buses.iter().any(|bus| bus.id.0 == source.id)
+                                && !buses.contains(&source.id)
+                            {
+                                buses.push(source.id);
+                            }
                         }
                     }
                 }
-            }
-            if let Some(undo) = auto_undo {
-                if strips.is_empty() && buses.is_empty() {
-                    // Nothing to mute; leave the take as a normal loop.
-                } else {
+                if !strips.is_empty() || !buses.is_empty() {
                     if let Some(runtime) = self.loops[slot_index].as_mut() {
                         runtime.slot.playing = true;
                     }
-                    let strip_indices: Vec<usize> = strips.iter().map(|id| *id as usize).collect();
-                    let bus_indices: Vec<usize> = buses.iter().map(|id| *id as usize).collect();
-                    let _ = self.engine.loop_play(slot_index, true);
-                    let _ = self.engine.auto_swap_mute(&strip_indices, &bus_indices);
-                    self.auto_swap = Some(PendingAutoSwap {
-                        slot: slot_index as u32,
-                        generation,
-                        strips,
-                        buses,
-                        undo,
-                    });
+                    for id in &strips {
+                        if let Some(strip) =
+                            self.model.strips.iter_mut().find(|strip| strip.id.0 == *id)
+                        {
+                            strip.mute = true;
+                            self.params.set_strip_mute(*id as usize, true);
+                        }
+                    }
+                    for id in &buses {
+                        if let Some(bus) = self.model.buses.iter_mut().find(|bus| bus.id.0 == *id) {
+                            bus.mute = true;
+                            self.params.set_bus_mute(*id as usize, true);
+                        }
+                    }
+                    let _ = self.engine.loop_play_phase(slot_index, end_frame);
+                    self.push_auto_swap_undo(slot_index as u32, strips, buses);
                     self.recorder_status.message =
-                        "auto-swap: waiting for the next bar".to_string();
+                        "auto-swap: source muted, loop playing".to_string();
                 }
             }
         }
         self.rebuild_model_loops();
         self.loops_dirty = true;
-        self.recorder_status = if auto_swap && self.auto_swap.is_some() {
+        self.recorder_status = if auto_swap && !self.recorder_status.message.is_empty() {
             self.recorder_status.clone()
         } else {
             RecorderStatus::default()
@@ -723,95 +731,8 @@ impl Controller {
         self.recorder_dirty = true;
     }
 
-    /// Commit a pending auto-swap once the loop has actually started.
-    fn commit_auto_swap(&mut self, pending: PendingAutoSwap) {
-        for id in &pending.strips {
-            if let Some(strip) = self.model.strips.iter_mut().find(|strip| strip.id.0 == *id) {
-                strip.mute = true;
-                self.params.set_strip_mute(*id as usize, true);
-            }
-        }
-        for id in &pending.buses {
-            if let Some(bus) = self.model.buses.iter_mut().find(|bus| bus.id.0 == *id) {
-                bus.mute = true;
-                self.params.set_bus_mute(*id as usize, true);
-            }
-        }
-        self.push_undo_entry(pending.undo);
-        self.recorder_status.message = "auto-swap: sources muted, loop playing".to_string();
-        self.recorder_dirty = true;
-        self.loops_dirty = true;
-        self.edit_dirty = true;
-    }
-
-    /// Drop a pending swap without touching the mixer. The temporary loop is
-    /// removed; no undo entry is created.
-    pub(super) fn cancel_auto_swap(&mut self, reason: &str) {
-        let Some(pending) = self.auto_swap.take() else {
-            return;
-        };
-        let _ = self.engine.auto_swap_mute_cancel();
-        let slot = pending.slot as usize;
-        let same_generation = self
-            .loops
-            .get(slot)
-            .and_then(Option::as_ref)
-            .is_some_and(|runtime| runtime.generation == pending.generation);
-        if same_generation {
-            let _ = self.engine.clear_loop(slot);
-            self.loops[slot] = None;
-            self.model
-                .loops
-                .retain(|loop_slot| loop_slot.id != pending.slot);
-            self.loops_dirty = true;
-        }
-        self.recorder_status.message = reason.to_string();
-        self.recorder_dirty = true;
-    }
-
-    /// Poll the pending auto-swap. Returns true when a snapshot should be sent.
-    pub(super) fn poll_auto_swap(&mut self) -> bool {
-        let Some(pending) = self.auto_swap.as_ref() else {
-            return false;
-        };
-        let slot = pending.slot as usize;
-        let (_, started, _) = self.engine.loop_status(slot);
-        if started {
-            let pending = self.auto_swap.take().expect("pending swap");
-            self.commit_auto_swap(pending);
-            return true;
-        }
-        let playing = self
-            .engine
-            .clock()
-            .snapshot(self.engine.sample_rate() as f32)
-            .playing;
-        if !playing {
-            self.cancel_auto_swap("auto-swap canceled: transport stopped");
-            return true;
-        }
-        match self.loops.get(slot).and_then(Option::as_ref) {
-            Some(runtime) if runtime.generation == pending.generation => {
-                if !runtime.slot.playing {
-                    self.cancel_auto_swap("auto-swap canceled: loop stopped");
-                    return true;
-                }
-            }
-            Some(_) => {
-                self.auto_swap = None;
-                let _ = self.engine.auto_swap_mute_cancel();
-                return true;
-            }
-            None => {
-                self.auto_swap = None;
-                let _ = self.engine.auto_swap_mute_cancel();
-                return true;
-            }
-        }
-        false
-    }
-
     pub(super) fn arm_recorder(&mut self) {
+        self.model.recorder.normalize_taps();
         let sources = self.model.recorder.sources.clone();
         if sources.is_empty() {
             self.recorder_status.message = "select at least one source".to_string();

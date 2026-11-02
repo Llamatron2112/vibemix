@@ -12,11 +12,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   **File → Recent** to remove it from the recent list without touching the
   session file on disk.
 - **Auto-swap after recording.** An optional recorder setting installs the
-  finished take, waits for the next bar, mutes the recorded strip/bus sources
-  and launches the loop on that same bar with a short crossfade, so recording
-  can continue without manually muting and restarting. The source mutes and the
-  new loop are one undo step. If the transport stops before the swap bar, the
-  take is deleted, nothing is muted, and no undo entry is created.
+  finished take, starts the loop immediately at the phase elapsed since the
+  recording end, and mutes the recorded strip/bus sources with a short
+  crossfade. Undo is targeted: it unmutes the sources and stops the loop but
+  keeps the loop in the mixer. If the transport is already stopped when the
+  take is processed, the take is deleted, nothing is muted, and no undo entry
+  is created.
 - **Loop export and alignment.** The loop editor can render a new WAV from
   exactly what is aligned on screen without changing the loop used by the
   mixer. A one-shot loop plays once and exports a selected start/end range.
@@ -28,8 +29,7 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
   The export offset is stored separately from the live playback nudge, and the
   original loop is never replaced.
 - **Loops and recording now live in the mixer.** Strip cards carry a record
-  source flag (off → post-fader → pre-fader → input) and bus cards an output
-  flag; clicking any other part of a card drags it to reorder. A loops pane
+  source flag (off → post-fader) and bus cards an output flag; clicking any other part of a card drags it to reorder. A loops pane
   beside the buses appears while loops exist: left-click a card to start it on
   the next bar or stop it immediately, right-click for edit, save, mute, output
   bus and confirmed delete. Each loop has its own volume, waveform preview,

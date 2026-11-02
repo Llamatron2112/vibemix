@@ -88,6 +88,18 @@ pub fn default_sensitivity() -> f32 {
     0.5
 }
 
+impl RecorderSettings {
+    /// Strip takes are always post-fader (after the post-fader inserts); only
+    /// bus sources retain the tap distinction for older sessions.
+    pub fn normalize_taps(&mut self) {
+        for source in &mut self.sources {
+            if source.kind == RecorderSourceKind::Strip {
+                source.tap = RecorderTap::PostFader;
+            }
+        }
+    }
+}
+
 impl Default for RecorderSettings {
     fn default() -> Self {
         Self {
@@ -784,6 +796,28 @@ mod tests {
             }
             _ => panic!("wrong action"),
         }
+    }
+
+    #[test]
+    fn strip_recorder_sources_are_normalized_to_post_fader() {
+        let mut settings = RecorderSettings {
+            sources: vec![
+                RecorderSource {
+                    kind: RecorderSourceKind::Strip,
+                    id: 3,
+                    tap: RecorderTap::Input,
+                },
+                RecorderSource {
+                    kind: RecorderSourceKind::Bus,
+                    id: 2,
+                    tap: RecorderTap::Output,
+                },
+            ],
+            ..Default::default()
+        };
+        settings.normalize_taps();
+        assert_eq!(settings.sources[0].tap, RecorderTap::PostFader);
+        assert_eq!(settings.sources[1].tap, RecorderTap::Output);
     }
 
     #[test]

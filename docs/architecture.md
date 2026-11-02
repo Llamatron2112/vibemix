@@ -666,8 +666,8 @@ through a loops pane beside the buses, shown only while at least one loop
 exists.
 
 - **Sources** are chosen directly on strip and bus cards. A strip's record flag
-  cycles off → post-fader → pre-fader → input; a bus flag toggles its output.
-  The selected sources are summed. Master (bus 0) is excluded so a playing
+  toggles its post-fader take (after the post-fader insert chain); a bus flag
+  toggles its output. The selected sources are summed. Master (bus 0) is excluded so a playing
   launcher cannot record itself. Source changes are refused while the recorder
   is armed or recording. Removing a strip or bus drops the matching source.
 - The control thread allocates the capture buffer and sends it through the
@@ -685,11 +685,13 @@ exists.
   automatic offset current while the recorder is armed, so a plugin latency
   change mid-take is reflected in the finished take. All offsets are a circular
   rotation: `out[i] = in[(i + nudge) mod frames]`.
-- With **auto-swap** enabled, a finished take is installed but retained as a
-  pending transaction. On the next bar the audio thread mutes the recorded
-  strip/bus sources and the loop starts on the same bar; the mutes and the new
-  loop are one undo entry. If the transport stops before that bar, the pending
-  loop is deleted, no mute is applied, and no history entry is created.
+- With **auto-swap** enabled, a finished take is installed and started
+  immediately at the phase elapsed since its recording end, so the handoff does
+  not wait for a bar. The recorded strip/bus sources are muted at the same
+  time. Undo is targeted: it unmutes those sources and stops the loop but keeps
+  the loop in the mixer. If the transport is already stopped when the take is
+  processed, the take is deleted, nothing is muted, and no history entry is
+  created.
 - The launcher installs the raw buffer through the command queue and keeps the
   rotation as a playback offset (`(pos + offset) mod frames`); nudging sends a
   lightweight offset update, so a playing loop keeps running. Each loop is

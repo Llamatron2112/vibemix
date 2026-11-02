@@ -919,10 +919,6 @@ ApplicationWindow {
             if (index < 0) {
                 if (sources.length >= 16) return
                 sources.push({ kind: kind, id: id, tap: "post_fader" })
-            } else if (sources[index].tap === "post_fader") {
-                sources[index].tap = "pre_fader"
-            } else if (sources[index].tap === "pre_fader") {
-                sources[index].tap = "input"
             } else {
                 sources.splice(index, 1)
             }
@@ -2495,10 +2491,9 @@ ApplicationWindow {
             anchors.centerIn: parent
             text: {
                 if (!flag.recordable) return "MASTER"
-                if (flag.tap === "input") return "IN"
-                if (flag.tap === "pre_fader") return "PRE"
-                if (flag.tap === "post_fader") return "POST"
-                if (flag.tap === "output") return "OUT"
+                if (flag.tap.length > 0) {
+                    return flag.kind === "strip" ? "POST" : "OUT"
+                }
                 return "REC"
             }
             color: flag.tap.length > 0 ? "white" : root.mutedText

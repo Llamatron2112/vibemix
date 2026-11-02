@@ -711,6 +711,7 @@ impl Controller {
             model,
             label: label.to_string(),
             bytes,
+            auto_swap: None,
         }
     }
 
@@ -737,6 +738,74 @@ impl Controller {
         self.edit_dirty = true;
     }
 
+    fn undo_auto_swap(&mut self, auto: &AutoSwapUndo) {
+        for id in &auto.strips {
+            if let Some(strip) = self.model.strips.iter_mut().find(|strip| strip.id.0 == *id) {
+                strip.mute = false;
+                self.params.set_strip_mute(*id as usize, false);
+            }
+        }
+        for id in &auto.buses {
+            if let Some(bus) = self.model.buses.iter_mut().find(|bus| bus.id.0 == *id) {
+                bus.mute = false;
+                self.params.set_bus_mute(*id as usize, false);
+            }
+        }
+        if let Some(runtime) = self
+            .loops
+            .get_mut(auto.slot as usize)
+            .and_then(Option::as_mut)
+        {
+            runtime.slot.playing = false;
+            let _ = self.engine.loop_stop(auto.slot as usize);
+        }
+        self.rebuild_model_loops();
+        self.loops_dirty = true;
+        self.recorder_status.message =
+            "auto-swap undone: sources unmuted, loop stopped".to_string();
+        self.recorder_dirty = true;
+    }
+
+    fn redo_auto_swap(&mut self, auto: &AutoSwapUndo) {
+        for id in &auto.strips {
+            if let Some(strip) = self.model.strips.iter_mut().find(|strip| strip.id.0 == *id) {
+                strip.mute = true;
+                self.params.set_strip_mute(*id as usize, true);
+            }
+        }
+        for id in &auto.buses {
+            if let Some(bus) = self.model.buses.iter_mut().find(|bus| bus.id.0 == *id) {
+                bus.mute = true;
+                self.params.set_bus_mute(*id as usize, true);
+            }
+        }
+        if let Some(runtime) = self
+            .loops
+            .get_mut(auto.slot as usize)
+            .and_then(Option::as_mut)
+        {
+            runtime.slot.playing = true;
+            let _ = self.engine.loop_play(auto.slot as usize, true);
+        }
+        self.rebuild_model_loops();
+        self.loops_dirty = true;
+        self.recorder_status.message = "auto-swap restored".to_string();
+        self.recorder_dirty = true;
+    }
+
+    pub(super) fn push_auto_swap_undo(&mut self, slot: u32, strips: Vec<u32>, buses: Vec<u32>) {
+        self.push_undo_entry(UndoEntry {
+            model: MixerModel::default_minimal(),
+            label: "Auto-swap record".to_string(),
+            bytes: 0,
+            auto_swap: Some(AutoSwapUndo {
+                slot,
+                strips,
+                buses,
+            }),
+        });
+    }
+
     /// Push a pre-created snapshot. Used by transactions whose changes happen
     /// after the snapshot was taken (auto-swap recording).
     pub(super) fn push_undo_entry(&mut self, entry: UndoEntry) {
@@ -759,6 +828,18 @@ impl Controller {
             return false;
         };
         self.undo_bytes = self.undo_bytes.saturating_sub(entry.bytes);
+        if let Some(auto) = entry.auto_swap {
+            self.undo_auto_swap(&auto);
+            self.redo_stack.push(UndoEntry {
+                model: MixerModel::default_minimal(),
+                label: entry.label,
+                bytes: 0,
+                auto_swap: Some(auto),
+            });
+            self.undo_coalesce = None;
+            self.edit_dirty = true;
+            return true;
+        }
         let current = self.snapshot_entry(&entry.label);
         self.redo_stack.push(current);
         self.restore_model(entry.model);
@@ -771,6 +852,18 @@ impl Controller {
         let Some(entry) = self.redo_stack.pop() else {
             return false;
         };
+        if let Some(auto) = entry.auto_swap {
+            self.redo_auto_swap(&auto);
+            self.undo_stack.push_back(UndoEntry {
+                model: MixerModel::default_minimal(),
+                label: entry.label,
+                bytes: 0,
+                auto_swap: Some(auto),
+            });
+            self.undo_coalesce = None;
+            self.edit_dirty = true;
+            return true;
+        }
         let current = self.snapshot_entry(&entry.label);
         self.undo_bytes += current.bytes;
         self.undo_stack.push_back(current);
