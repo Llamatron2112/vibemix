@@ -979,7 +979,8 @@ ApplicationWindow {
             transient: r.transient !== false,
             transient_sensitivity: (r.transient_sensitivity !== undefined) ? r.transient_sensitivity : 0.5,
             nudge_samples: r.nudge_samples || 0,
-            crossfade_ms: r.crossfade_ms || 0
+            crossfade_ms: r.crossfade_ms || 0,
+            auto_swap: r.auto_swap === true
         }
     }
     function updateRecorderSetting(key, value) {
@@ -1745,6 +1746,12 @@ ApplicationWindow {
                                         ToolTip.text: root.loopFolder()
                                         HoverHandler { id: folderHover }
                                     }
+                                }
+
+                                CheckBox {
+                                    text: "after take: mute sources & play loop"
+                                    checked: root.recorderSettings().auto_swap
+                                    onToggled: root.updateRecorderSetting("auto_swap", checked)
                                 }
                             }
                         }

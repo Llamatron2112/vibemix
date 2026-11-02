@@ -79,7 +79,10 @@ small OSC control protocol.
   immediately, right-click for edit, save, mute, output bus and delete. Each
   card shows volume, waveform, progress and output bus. The editor opens the take with the latency
   correction always applied, fine/coarse circular nudge, transient markers and a
-  WAV save at 16/24-bit or 32-bit float. Saving opens a normal file dialog (the
+  WAV save at 16/24-bit or 32-bit float. The record-settings popover can
+  **auto-swap** a finished take: on the next bar it mutes the recorded sources
+  and starts the loop, and cancelling before that bar deletes the take with no
+  mute. Saving opens a normal file dialog (the
   last folder is remembered in the session) and can normalize the export to -1
   dBFS. The editor's waveform zooms to the whole loop, its start, or its end. Drag
   horizontally to pan and vertically to zoom, Alt-drag to nudge (Shift = one

@@ -685,6 +685,11 @@ exists.
   automatic offset current while the recorder is armed, so a plugin latency
   change mid-take is reflected in the finished take. All offsets are a circular
   rotation: `out[i] = in[(i + nudge) mod frames]`.
+- With **auto-swap** enabled, a finished take is installed but retained as a
+  pending transaction. On the next bar the audio thread mutes the recorded
+  strip/bus sources and the loop starts on the same bar; the mutes and the new
+  loop are one undo entry. If the transport stops before that bar, the pending
+  loop is deleted, no mute is applied, and no history entry is created.
 - The launcher installs the raw buffer through the command queue and keeps the
   rotation as a playback offset (`(pos + offset) mod frames`); nudging sends a
   lightweight offset update, so a playing loop keeps running. Each loop is

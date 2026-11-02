@@ -8,6 +8,12 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Auto-swap after recording.** An optional recorder setting installs the
+  finished take, waits for the next bar, mutes the recorded strip/bus sources
+  and launches the loop on that same bar with a short crossfade, so recording
+  can continue without manually muting and restarting. The source mutes and the
+  new loop are one undo step. If the transport stops before the swap bar, the
+  take is deleted, nothing is muted, and no undo entry is created.
 - **Loop export and alignment.** The loop editor can render a new WAV from
   exactly what is aligned on screen without changing the loop used by the
   mixer. A one-shot loop plays once and exports a selected start/end range.

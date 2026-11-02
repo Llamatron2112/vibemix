@@ -451,6 +451,13 @@ pub enum EngineCommand {
     },
     LoopPreview(PreviewSpec),
     LoopPreviewStop,
+    AutoSwapMute {
+        strips: [usize; 16],
+        strip_count: usize,
+        buses: [usize; 16],
+        bus_count: usize,
+    },
+    AutoSwapMuteCancel,
     ClearLoop {
         slot: usize,
     },
@@ -547,6 +554,28 @@ impl PreviewRuntime {
             click_phase: 0.0,
             click_freq: 1000.0,
         }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PendingAutoMute {
+    strips: [usize; 16],
+    strip_count: usize,
+    buses: [usize; 16],
+    bus_count: usize,
+}
+
+impl PendingAutoMute {
+    fn new(strips: &[usize], buses: &[usize]) -> Self {
+        let mut this = Self {
+            strips: [0; 16],
+            strip_count: strips.len().min(16),
+            buses: [0; 16],
+            bus_count: buses.len().min(16),
+        };
+        this.strips[..this.strip_count].copy_from_slice(&strips[..this.strip_count]);
+        this.buses[..this.bus_count].copy_from_slice(&buses[..this.bus_count]);
+        this
     }
 }
 
@@ -680,6 +709,11 @@ struct MixerGraph {
     /// Dry editor audition: loop plus reference/metronome, mixed after the
     /// master chain so bus PDC cannot shift their relative timing.
     preview: Option<PreviewRuntime>,
+    /// Sources to mute on the next bar when a take auto-swaps to its loop.
+    pending_auto_mute: Option<PendingAutoMute>,
+    /// A bar was mid-block; apply the mutes at the next block start so the
+    /// source overlaps the loop briefly instead of fading out before it.
+    pending_auto_mute_deferred: bool,
 }
 
 impl MixerGraph {
@@ -941,6 +975,24 @@ impl MixerGraph {
                 }
                 EngineCommand::LoopPreviewStop => {
                     self.preview = None;
+                }
+                EngineCommand::AutoSwapMute {
+                    strips,
+                    strip_count,
+                    buses,
+                    bus_count,
+                } => {
+                    let mut pending = PendingAutoMute::new(&[], &[]);
+                    pending.strip_count = strip_count.min(16);
+                    pending.strips[..pending.strip_count]
+                        .copy_from_slice(&strips[..pending.strip_count]);
+                    pending.bus_count = bus_count.min(16);
+                    pending.buses[..pending.bus_count].copy_from_slice(&buses[..pending.bus_count]);
+                    self.pending_auto_mute = Some(pending);
+                }
+                EngineCommand::AutoSwapMuteCancel => {
+                    self.pending_auto_mute = None;
+                    self.pending_auto_mute_deferred = false;
                 }
                 EngineCommand::LoopOneShot { slot, one_shot } => {
                     if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
@@ -2222,6 +2274,32 @@ impl ProcessHandler for MixerGraph {
         }
         self.transport_playing = playing;
 
+        if self.pending_auto_mute.is_some() {
+            let mut apply_mutes = self.pending_auto_mute_deferred;
+            self.pending_auto_mute_deferred = false;
+            if let Some(offset) =
+                bar_boundary_offset(self.transport_midi.as_slice(), beats_before, beats_per_bar)
+            {
+                if offset == 0 {
+                    apply_mutes = true;
+                } else {
+                    // The loop starts inside this block; let the source run
+                    // through it and fade at the next block to avoid a gap.
+                    self.pending_auto_mute_deferred = true;
+                }
+            }
+            if apply_mutes {
+                if let Some(pending) = self.pending_auto_mute.take() {
+                    for &strip in &pending.strips[..pending.strip_count] {
+                        self.params.set_strip_mute(strip, true);
+                    }
+                    for &bus in &pending.buses[..pending.bus_count] {
+                        self.params.set_bus_mute(bus, true);
+                    }
+                }
+            }
+        }
+
         self.process_strips(scope, frames, paused);
         self.mix_loops(frames, beats_before, beats_per_bar, playing);
         self.process_buses(scope, frames);
@@ -2561,6 +2639,8 @@ impl JackEngine {
             transport_midi: MidiBlock::default(),
             transport_playing: false,
             preview: None,
+            pending_auto_mute: None,
+            pending_auto_mute_deferred: false,
             clock: Clock::new(sample_rate as f32, 4.0),
             shared_clock: Arc::clone(&shared_clock),
             position: vibemix_lv2::TimePosition::default(),
@@ -2719,6 +2799,29 @@ impl JackEngine {
     pub fn loop_preview_stop(&mut self) -> Result<()> {
         self.commands
             .push(EngineCommand::LoopPreviewStop)
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn auto_swap_mute(&mut self, strips: &[usize], buses: &[usize]) -> Result<()> {
+        let mut strip_array = [0usize; 16];
+        let mut bus_array = [0usize; 16];
+        let strip_count = strips.len().min(16);
+        let bus_count = buses.len().min(16);
+        strip_array[..strip_count].copy_from_slice(&strips[..strip_count]);
+        bus_array[..bus_count].copy_from_slice(&buses[..bus_count]);
+        self.commands
+            .push(EngineCommand::AutoSwapMute {
+                strips: strip_array,
+                strip_count,
+                buses: bus_array,
+                bus_count,
+            })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn auto_swap_mute_cancel(&mut self) -> Result<()> {
+        self.commands
+            .push(EngineCommand::AutoSwapMuteCancel)
             .map_err(|_| anyhow!("engine command queue full"))
     }
 

@@ -71,6 +71,9 @@ pub struct RecorderSettings {
     /// Optional seam crossfade applied on playback/export.
     #[serde(default)]
     pub crossfade_ms: f32,
+    /// After a take, mute its sources and launch the new loop at the next bar.
+    #[serde(default)]
+    pub auto_swap: bool,
 }
 
 fn default_bit_depth() -> u8 {
@@ -96,11 +99,12 @@ impl Default for RecorderSettings {
             transient_sensitivity: default_sensitivity(),
             nudge_samples: 0,
             crossfade_ms: 0.0,
+            auto_swap: false,
         }
     }
 }
 
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct LoopSlot {
     pub id: u32,
     #[serde(default)]

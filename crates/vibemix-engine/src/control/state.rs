@@ -737,6 +737,23 @@ impl Controller {
         self.edit_dirty = true;
     }
 
+    /// Push a pre-created snapshot. Used by transactions whose changes happen
+    /// after the snapshot was taken (auto-swap recording).
+    pub(super) fn push_undo_entry(&mut self, entry: UndoEntry) {
+        self.undo_bytes += entry.bytes;
+        self.undo_stack.push_back(entry);
+        while self.undo_stack.len() > MAX_UNDO_ENTRIES
+            || (self.undo_bytes > MAX_UNDO_BYTES && self.undo_stack.len() > 1)
+        {
+            if let Some(dropped) = self.undo_stack.pop_front() {
+                self.undo_bytes = self.undo_bytes.saturating_sub(dropped.bytes);
+            }
+        }
+        self.redo_stack.clear();
+        self.undo_coalesce = None;
+        self.edit_dirty = true;
+    }
+
     pub(super) fn undo(&mut self) -> bool {
         let Some(entry) = self.undo_stack.pop_back() else {
             return false;
@@ -765,6 +782,7 @@ impl Controller {
 
     pub(super) fn restore_model(&mut self, snapshot: MixerModel) {
         let structure_changed = !structure_eq(&self.model, &snapshot);
+        let loops_changed = self.model.loops != snapshot.loops;
         let window = self.model.window.clone();
         // Delay compensation is a global preference, not part of an edit:
         // undo/redo must not silently switch the audio timing.
@@ -806,6 +824,9 @@ impl Controller {
             self.apply_model_plugin_params();
         }
 
+        if loops_changed {
+            self.load_loops_from_model();
+        }
         self.engine.sync_port_names(&self.model);
     }
 

@@ -132,6 +132,16 @@ struct PendingLoopLoad {
     generation: u64,
 }
 
+/// A take installed by auto-swap. The source mutes are held back until the
+/// loop actually starts, so a canceled take leaves no trace.
+struct PendingAutoSwap {
+    slot: u32,
+    generation: u64,
+    strips: Vec<u32>,
+    buses: Vec<u32>,
+    undo: UndoEntry,
+}
+
 struct PendingWaveform {
     slot: u32,
     start: u64,
@@ -266,6 +276,8 @@ pub struct Controller {
     plugin_state_dirty: std::cell::Cell<bool>,
     /// Saved loops whose WAVs are still being read.
     pending_loop_loads: Vec<PendingLoopLoad>,
+    /// Pending "mute sources + launch take" transaction.
+    auto_swap: Option<PendingAutoSwap>,
     /// Throttles repeated restart requests from the same VST3 slot.
     vst3_restart_throttle: HashMap<(u32, u32, u32), Instant>,
     /// Per-strip trim-learn detector state.
@@ -525,6 +537,7 @@ impl Controller {
             autosave_saving: false,
             plugin_state_dirty: std::cell::Cell::new(true),
             pending_loop_loads: Vec::new(),
+            auto_swap: None,
             vst3_restart_throttle: HashMap::new(),
             trim_learn: (0..strip_count).map(|_| TrimLearn::default()).collect(),
             trim_learn_ids: Vec::with_capacity(strip_count),
@@ -774,6 +787,9 @@ impl Controller {
             // and re-parsed by the GUI), and a fader drag produces many edits
             // per second. Coalesce them: the latest state is always sent, at
             // most once per SNAPSHOT_MIN_INTERVAL.
+            if self.poll_auto_swap() {
+                actions.snapshot = true;
+            }
             snapshot_pending |= actions.snapshot;
             state_pending |= param_edits;
             let mut sent_state = false;
@@ -1854,6 +1870,9 @@ impl Controller {
             }
             ControlMessage::SetRecorderSettings { json } => {
                 if let Ok(settings) = serde_json::from_str::<RecorderSettings>(&json) {
+                    if settings.sources != self.model.recorder.sources {
+                        self.cancel_auto_swap("auto-swap canceled: sources changed");
+                    }
                     self.engine.recorder().set_sources(&settings.sources);
                     self.model.recorder = settings;
                 }
