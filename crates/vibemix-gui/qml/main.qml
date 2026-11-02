@@ -1852,14 +1852,6 @@ ApplicationWindow {
                         }
                     }
 
-                    Label {
-                        visible: root.recorderInfo().state === "armed"
-                        text: "ARM"
-                        color: "#f9a825"
-                        font.pixelSize: 10
-                        font.family: "monospace"
-                    }
-
                     Item {
                         id: loopIndicator
                         visible: root.transportUi().loop_indicator && backend.clock.length > 0
