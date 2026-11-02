@@ -8,6 +8,9 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Added
 
+- **Recent sessions can be pruned.** Right-click an entry in
+  **File → Recent** to remove it from the recent list without touching the
+  session file on disk.
 - **Auto-swap after recording.** An optional recorder setting installs the
   finished take, waits for the next bar, mutes the recorded strip/bus sources
   and launches the loop on that same bar with a short crossfade, so recording

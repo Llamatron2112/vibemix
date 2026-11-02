@@ -184,6 +184,23 @@ fn note_recent(path: &str) {
     save_recent();
 }
 
+fn forget_recent(path: &str) -> bool {
+    if path.is_empty() {
+        return false;
+    }
+    let removed = if let Ok(mut guard) = RECENT.lock() {
+        let before = guard.len();
+        guard.retain(|entry| entry != path);
+        guard.len() != before
+    } else {
+        false
+    };
+    if removed {
+        save_recent();
+    }
+    removed
+}
+
 /// Read-modify-write the global launch preferences. The engine reads the same
 /// file at startup, and the GUI only writes it when a session is loaded/saved
 /// or the startup toggle changes.
@@ -1190,6 +1207,10 @@ pub mod qobject {
         fn set_load_last_session_on_startup(self: Pin<&mut Self>, on: bool);
 
         #[qinvokable]
+        #[cxx_name = "removeRecent"]
+        fn remove_recent(self: Pin<&mut Self>, path: &QString);
+
+        #[qinvokable]
         #[cxx_name = "setStripMidiChannel"]
         fn set_strip_midi_channel(&self, strip: i32, channel: i32);
 
@@ -2060,6 +2081,21 @@ impl qobject::Backend {
         note_action("load last session on startup");
         update_startup_settings(|settings| settings.load_last_session = on);
         self.as_mut().set_load_last_session(on);
+    }
+
+    pub fn remove_recent(mut self: Pin<&mut Self>, path: &QString) {
+        note_action("remove recent");
+        if !forget_recent(&path.to_string()) {
+            return;
+        }
+        if let Ok(list) = RECENT.lock() {
+            if let Ok(json) = serde_json::to_string(&*list) {
+                self.as_mut().set_recent_files(QString::from(json.as_str()));
+                if let Ok(mut last) = LAST_RECENT.lock() {
+                    *last = json;
+                }
+            }
+        }
     }
 
     pub fn set_strip_midi_channel(&self, strip: i32, channel: i32) {

@@ -17,6 +17,7 @@ ApplicationWindow {
     property bool forceClose: false
     property var pendingAction: null
     property string sessionError: ""
+    property string recentContextPath: ""
     // Mixer button whose keyboard binding is being captured, or null.
     property var midiKeyLearnSpec: null
     // Column counts frozen while auto-fit is on (0 = not captured).
@@ -1378,6 +1379,14 @@ ApplicationWindow {
         })
     }
 
+    Menu {
+        id: recentItemMenu
+        MenuItem {
+            text: "Remove from Recent"
+            onTriggered: backend.removeRecent(root.recentContextPath)
+        }
+    }
+
     onClosing: (close) => {
         if (root.forceClose || !backend.dirty) return
         close.accepted = false
@@ -1423,6 +1432,14 @@ ApplicationWindow {
                         onTriggered: root.guardUnsaved(function() {
                             backend.loadSession(modelData)
                         })
+                        MouseArea {
+                            anchors.fill: parent
+                            acceptedButtons: Qt.RightButton
+                            onClicked: {
+                                root.recentContextPath = modelData
+                                recentItemMenu.popup()
+                            }
+                        }
                     }
                 }
             }
