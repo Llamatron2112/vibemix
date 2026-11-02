@@ -952,6 +952,17 @@ ApplicationWindow {
         var left = loopBeats * (1 - Math.max(0, Math.min(1, r.progress || 0)))
         return left <= root.beatsPerBar()
     }
+    // Loop cell for the bar boundary the current take started on. A take always
+    // starts on a bar boundary, so snap the (possibly one-message-stale) clock
+    // beat to the nearest boundary instead of using the raw playhead cell.
+    function recorderStartCellNow() {
+        var t = root.transportUi()
+        var len = Math.max(1, t.loop_length)
+        var bpb = root.beatsPerBar()
+        var total = t.loop_bars ? len * bpb : len
+        var boundary = Math.round(root.clockInfo().beats / bpb) * bpb
+        return Math.floor((((boundary % total) + total) % total) / total * len)
+    }
     function recorderSourceTap(kind, id) {
         var sources = root.recorderSettings().sources || []
         for (var i = 0; i < sources.length; i++) {
@@ -2311,13 +2322,12 @@ ApplicationWindow {
         // Capture the take's start cell from the freshest clock. The recorder
         // update in the same poll still carries the previous clock, which can
         // be one beat before the actual start and would colour that beat red.
-        // Waiting until a few frames are recorded guarantees the position is
-        // past the start boundary.
+        // recorderStartCellNow() snaps to the bar boundary the take started on.
         function onClockChanged() {
             if (root.recordStartCell >= 0) return
             var r = root.recorderInfo()
             if (r.state === "recording" && (r.progress || 0) > 0) {
-                root.recordStartCell = root.loopInfo().index
+                root.recordStartCell = root.recorderStartCellNow()
             }
         }
     }
