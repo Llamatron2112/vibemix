@@ -2846,6 +2846,8 @@ ApplicationWindow {
         property real liveValue: 1
         property real resetValue: 1
         property real dragStart: 0
+        property double lastTapAt: 0
+        property bool suppressSingleClick: false
         property string valueText: ""
         property string entryUnit: "db"
         readonly property bool interacting: dragHandler.active || valueTimer.running
@@ -2863,6 +2865,12 @@ ApplicationWindow {
         Component.onCompleted: fader.liveValue = fader.value
 
         function bump() { valueTimer.restart() }
+        function resetToDefault() {
+            fader.liveValue = fader.resetValue
+            fader.dragStart = fader.resetValue
+            fader.moved(fader.resetValue)
+            fader.bump()
+        }
         function entryFrom() { return entryUnit === "db" ? -60 : from }
         function entryTo() { return entryUnit === "db" ? root.gainToDb(Math.max(to, 1.0e-6)) : to }
         function entryFormat(v) { return entryUnit === "db" ? root.gainToDb(v).toFixed(1) : Number(v).toFixed(3) }
@@ -2934,18 +2942,30 @@ ApplicationWindow {
 
         TapHandler {
             acceptedModifiers: Qt.NoModifier
+            onPressedChanged: {
+                if (!pressed) return
+                var now = Date.now()
+                var interval = Qt.styleHints
+                    ? Qt.styleHints.mouseDoubleClickInterval : 400
+                if (fader.lastTapAt > 0 && now - fader.lastTapAt < interval) {
+                    fader.resetToDefault()
+                    fader.suppressSingleClick = true
+                } else {
+                    fader.suppressSingleClick = false
+                }
+                fader.lastTapAt = now
+            }
             onSingleTapped: (eventPoint) => {
+                if (fader.suppressSingleClick) {
+                    fader.suppressSingleClick = false
+                    return
+                }
                 var y = eventPoint.position.y
                 var clamped = Math.max(track.y, Math.min(track.y + track.height, y))
                 var n = 1 - (clamped - track.y) / track.height
                 var next = fader.from + n * (fader.to - fader.from)
                 fader.liveValue = next
                 fader.moved(next)
-                fader.bump()
-            }
-            onDoubleTapped: {
-                fader.liveValue = fader.resetValue
-                fader.moved(fader.resetValue)
                 fader.bump()
             }
         }
@@ -3367,6 +3387,7 @@ ApplicationWindow {
         property real value: 0
         property real liveValue: 0
         property real dragStart: 0
+        property double lastTapAt: 0
         property real resetValue: (from + to) / 2
         property string valueText: ""
         property string entryUnit: "linear"
@@ -3389,6 +3410,12 @@ ApplicationWindow {
         Component.onCompleted: knob.liveValue = knob.value
 
         function bump() { valueTimer.restart() }
+        function resetToDefault() {
+            knob.liveValue = knob.resetValue
+            knob.dragStart = knob.resetValue
+            knob.moved(knob.resetValue)
+            knob.bump()
+        }
         function entryLabel() {
             if (entryUnit === "pan") return "pan"
             if (entryUnit === "db") return "trim"
@@ -3464,10 +3491,15 @@ ApplicationWindow {
 
         TapHandler {
             acceptedModifiers: Qt.NoModifier
-            onDoubleTapped: {
-                knob.liveValue = knob.resetValue
-                knob.moved(knob.resetValue)
-                knob.bump()
+            onPressedChanged: {
+                if (!pressed) return
+                var now = Date.now()
+                var interval = Qt.styleHints
+                    ? Qt.styleHints.mouseDoubleClickInterval : 400
+                if (knob.lastTapAt > 0 && now - knob.lastTapAt < interval) {
+                    knob.resetToDefault()
+                }
+                knob.lastTapAt = now
             }
         }
 

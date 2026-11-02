@@ -89,6 +89,10 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ### Fixed
 
+- **Fader and knob double-click reset is immediate.** The vertical fader and
+  knob now detect the second press themselves and reset on press, matching the
+  horizontal trim/send sliders, instead of waiting for the delayed
+  `TapHandler.onDoubleTapped` gesture.
 - **Restart at the next bar now starts on the bar itself.** The engine used to
   emit `START` just after the previous bar's last clock pulse, one 24th note
   before the new bar; recorder takes and launcher loops therefore began one
