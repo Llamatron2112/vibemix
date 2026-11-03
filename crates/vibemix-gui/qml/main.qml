@@ -1464,7 +1464,8 @@ ApplicationWindow {
     }
 
     onClosing: (close) => {
-        if (root.forceClose || !backend.dirty) return
+        if (root.forceClose) return
+        if (!backend.dirty && !root.hasUnsavedLoops()) return
         close.accepted = false
         root.guardUnsaved(function() {
             root.forceClose = true
