@@ -733,6 +733,17 @@ impl Controller {
             self.engine.report_latency(&self.params);
             // Read (and log) the interface's capture latency for diagnostics.
             self.engine.report_input_latency();
+            // Log the optional startup latency probe result once it is ready.
+            if let Some(result) = self.engine.latency_test_report().take() {
+                tracing::info!(
+                    inject_frame = result.inject_frame,
+                    output_offset = result.out_peak_at.saturating_sub(result.inject_frame),
+                    output_peak = result.out_peak,
+                    input_offset = result.in_peak_at.saturating_sub(result.inject_frame),
+                    input_peak = result.in_peak,
+                    "latency test: impulse played on master output; offsets are frames from injection"
+                );
+            }
             let pdc_limited = self.params.pdc_limited();
             if pdc_limited != self.pdc_limited_reported {
                 if pdc_limited {

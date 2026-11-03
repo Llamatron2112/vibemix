@@ -560,6 +560,90 @@ impl PreviewRuntime {
     }
 }
 
+/// Results of the optional startup latency probe (env `VIBEMIX_LATENCY_TEST`).
+/// The audio thread writes these once the capture window is full; the control
+/// thread logs them.
+#[derive(Default)]
+pub struct LatencyTestReport {
+    done: AtomicBool,
+    inject_frame: AtomicU64,
+    out_peak_at: AtomicU64,
+    in_peak_at: AtomicU64,
+    out_peak: AtomicU32,
+    in_peak: AtomicU32,
+}
+
+pub struct LatencyTestResult {
+    pub inject_frame: u64,
+    pub out_peak_at: u64,
+    pub in_peak_at: u64,
+    pub out_peak: f32,
+    pub in_peak: f32,
+}
+
+impl LatencyTestReport {
+    /// Returns the result once (and clears the done flag).
+    pub fn take(&self) -> Option<LatencyTestResult> {
+        if !self.done.swap(false, Ordering::AcqRel) {
+            return None;
+        }
+        Some(LatencyTestResult {
+            inject_frame: self.inject_frame.load(Ordering::Relaxed),
+            out_peak_at: self.out_peak_at.load(Ordering::Relaxed),
+            in_peak_at: self.in_peak_at.load(Ordering::Relaxed),
+            out_peak: f32::from_bits(self.out_peak.load(Ordering::Relaxed)),
+            in_peak: f32::from_bits(self.in_peak.load(Ordering::Relaxed)),
+        })
+    }
+}
+
+/// Audio-thread state for the startup latency probe: plays a short tone burst
+/// on the master output and records where its peak shows up in the master
+/// output and in the inputs (for an interface loopback).
+struct LatencyTest {
+    /// Absolute frame the probe starts at (aligned down to a block).
+    inject_frame: u64,
+    /// Tone burst samples to add to the master output.
+    burst: Box<[f32]>,
+    burst_pos: usize,
+    started: bool,
+    captured: usize,
+    total_frames: usize,
+    out_peak: f32,
+    out_peak_at: u64,
+    in_peak: f32,
+    in_peak_at: u64,
+}
+
+impl LatencyTest {
+    fn new(sample_rate: usize) -> Self {
+        let sample_rate = sample_rate.max(1);
+        // ~2 ms of a 1 kHz tone: broadband enough to survive the interface and
+        // easy to spot as a peak.
+        let burst_len = ((sample_rate as f32 * 0.002) as usize).max(8);
+        let burst = (0..burst_len)
+            .map(|i| {
+                let phase = std::f32::consts::TAU * 1000.0 * i as f32 / sample_rate as f32;
+                phase.sin() * 0.8
+            })
+            .collect::<Vec<f32>>()
+            .into_boxed_slice();
+        Self {
+            // ~1 s after the graph starts, so ports and clocks have settled.
+            inject_frame: sample_rate as u64,
+            burst,
+            burst_pos: 0,
+            started: false,
+            captured: 0,
+            total_frames: (sample_rate as f32 * 2.0) as usize,
+            out_peak: 0.0,
+            out_peak_at: 0,
+            in_peak: 0.0,
+            in_peak_at: 0,
+        }
+    }
+}
+
 struct MixerGraph {
     params: Arc<SharedParams>,
     meters: Arc<SharedMeters>,
@@ -672,6 +756,8 @@ struct MixerGraph {
     shared_recorder: Arc<SharedRecorder>,
     loop_slots: Vec<Option<LoopPlayback>>,
     loop_garbage: Producer<Box<[f32]>>,
+    latency_test: Option<LatencyTest>,
+    latency_test_report: Arc<LatencyTestReport>,
     /// Per-slot pitch-preserving time-stretch for tempo-synced loop playback.
     stretches: Vec<SoundTouch>,
     /// Interleaved staging for stretched loop output (`capacity * 2` floats).
@@ -1591,6 +1677,86 @@ impl MixerGraph {
         self.process_one_bus(0, scope, frames);
     }
 
+    /// Optional startup latency probe (see [`LatencyTest`]): adds a tone burst
+    /// to the master output and tracks where its peak lands in the master
+    /// output and in the audio inputs (for an interface loopback).
+    fn run_latency_test(&mut self, scope: &ProcessScope, frames: usize) {
+        let Some(test) = self.latency_test.as_mut() else {
+            return;
+        };
+        if !test.started && self.abs_frames >= test.inject_frame {
+            test.started = true;
+            test.inject_frame = self.abs_frames;
+        }
+        if !test.started {
+            return;
+        }
+        // Add the burst to the master output.
+        if test.burst_pos < test.burst.len() {
+            let n = (test.burst.len() - test.burst_pos).min(frames);
+            if let Some(ports) = self.buses.get_mut(0).and_then(Option::as_mut) {
+                let out_l = ports.out_l.as_mut_slice(scope);
+                let out_r = ports.out_r.as_mut_slice(scope);
+                for i in 0..n {
+                    let value = test.burst[test.burst_pos + i];
+                    out_l[i] += value;
+                    out_r[i] += value;
+                }
+            }
+            test.burst_pos += n;
+        }
+        if test.captured >= test.total_frames {
+            return;
+        }
+        let n = frames.min(test.total_frames - test.captured);
+        let base = self.abs_frames;
+        for i in 0..n {
+            let at = base + i as u64;
+            if let Some(ports) = self.buses.get_mut(0).and_then(Option::as_mut) {
+                let out_l = ports.out_l.as_mut_slice(scope);
+                let out_r = ports.out_r.as_mut_slice(scope);
+                let value = out_l[i].abs().max(out_r[i].abs());
+                if value > test.out_peak {
+                    test.out_peak = value;
+                    test.out_peak_at = at;
+                }
+            }
+            let mut value = 0.0f32;
+            for strip in self.strips.iter().flatten() {
+                value = value
+                    .max(strip.in_l.as_slice(scope)[i].abs())
+                    .max(strip.in_r.as_slice(scope)[i].abs());
+            }
+            for ret in self.bus_returns.iter().flatten() {
+                value = value
+                    .max(ret.in_l.as_slice(scope)[i].abs())
+                    .max(ret.in_r.as_slice(scope)[i].abs());
+            }
+            if value > test.in_peak {
+                test.in_peak = value;
+                test.in_peak_at = at;
+            }
+        }
+        test.captured += n;
+        if test.captured >= test.total_frames {
+            let report = &self.latency_test_report;
+            report
+                .inject_frame
+                .store(test.inject_frame, Ordering::Relaxed);
+            report
+                .out_peak_at
+                .store(test.out_peak_at, Ordering::Relaxed);
+            report.in_peak_at.store(test.in_peak_at, Ordering::Relaxed);
+            report
+                .out_peak
+                .store(test.out_peak.to_bits(), Ordering::Relaxed);
+            report
+                .in_peak
+                .store(test.in_peak.to_bits(), Ordering::Relaxed);
+            report.done.store(true, Ordering::Release);
+        }
+    }
+
     /// Whether the transport just started or was explicitly restarted. In
     /// both cases a running launcher loop must be relaunched on the bar so it
     /// cannot stay at an arbitrary phase from a preview started while stopped.
@@ -2340,6 +2506,7 @@ impl ProcessHandler for MixerGraph {
         };
         self.mix_loops(frames, beats_before, beats_per_bar, playing, current_bpm);
         self.process_buses(scope, frames);
+        self.run_latency_test(scope, frames);
         self.build_record_mix(frames);
         // Keep the take's automatic trim current if a plugin changes its
         // latency while the recorder is armed or recording. Set it before the
@@ -2428,6 +2595,7 @@ pub struct JackEngine {
     garbage_order: Consumer<RetiredOrder>,
     take_rx: Consumer<RecordedTake>,
     loop_garbage_rx: Consumer<Box<[f32]>>,
+    latency_test_report: Arc<LatencyTestReport>,
     shared_recorder: Arc<SharedRecorder>,
     shared_loops: Arc<SharedLoops>,
     midi_stats: Arc<MidiStats>,
@@ -2583,6 +2751,11 @@ impl JackEngine {
         let shared_loops = Arc::new(SharedLoops::new(MAX_LOOPS));
         let midi_stats = Arc::new(MidiStats::default());
         let pending_period = Arc::new(AtomicU32::new(0));
+        let latency_test_report = Arc::new(LatencyTestReport::default());
+        let latency_test = std::env::var("VIBEMIX_LATENCY_TEST")
+            .map(|value| !value.is_empty() && value != "0")
+            .unwrap_or(false)
+            .then(|| LatencyTest::new(sample_rate as usize));
         let scratch = ScratchBuffers::new(capacity, strip_count, bus_count);
 
         let graph = MixerGraph {
@@ -2691,6 +2864,8 @@ impl JackEngine {
             shared_recorder: Arc::clone(&shared_recorder),
             loop_slots: (0..MAX_LOOPS).map(|_| None).collect(),
             loop_garbage,
+            latency_test,
+            latency_test_report: Arc::clone(&latency_test_report),
             stretches: (0..MAX_LOOPS)
                 .map(|_| {
                     let mut st = SoundTouch::new();
@@ -2740,6 +2915,7 @@ impl JackEngine {
             garbage_order,
             take_rx,
             loop_garbage_rx,
+            latency_test_report,
             shared_recorder: Arc::clone(&shared_recorder),
             shared_loops: Arc::clone(&shared_loops),
             midi_stats,
@@ -3913,6 +4089,10 @@ impl JackEngine {
                 "interface capture latency"
             );
         }
+    }
+
+    pub fn latency_test_report(&self) -> &LatencyTestReport {
+        &self.latency_test_report
     }
 
     pub fn drain_garbage(&mut self) {
