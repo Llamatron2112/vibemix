@@ -285,7 +285,10 @@ pub struct MixerModel {
     #[serde(default)]
     pub clock: ClockSettings,
     /// Loop slots (metadata; the audio lives in the WAV files).
-    #[serde(default)]
+    ///
+    /// Not written to sessions: recorded loops are not saved with the session
+    /// yet, so ignore them on save (old sessions that contain them still load).
+    #[serde(default, skip_serializing)]
     pub loops: Vec<crate::recorder::LoopSlot>,
     /// External JACK ports feeding the engine's MIDI input. `None` means no
     /// patch information was saved (connections are left alone).
