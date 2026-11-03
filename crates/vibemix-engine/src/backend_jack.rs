@@ -1806,25 +1806,25 @@ impl MixerGraph {
                 }
                 continue;
             };
-            let start = if loop_slot.pending {
+            let (start, just_started) = if loop_slot.pending {
                 if let Some(end) = loop_slot.phase_end.take() {
                     let frames = loop_slot.frames.max(1);
                     let elapsed = abs_frames.saturating_sub(end) as usize % frames;
                     loop_slot.start_at(elapsed);
-                    0
+                    (0, true)
                 } else if loop_slot.quantized && playing {
                     let Some(offset) = bar else {
                         shared_loops.publish(index, 0.0, false, true);
                         continue;
                     };
                     loop_slot.start();
-                    offset
+                    (offset, true)
                 } else {
                     loop_slot.start();
-                    0
+                    (0, true)
                 }
             } else if loop_slot.playing {
-                0
+                (0, false)
             } else {
                 shared_loops.publish(index, 0.0, false, false);
                 if let Some(line) = loop_delays.get_mut(index) {
@@ -1832,6 +1832,13 @@ impl MixerGraph {
                 }
                 continue;
             };
+            // A (re)start must begin from a clean stretch pipeline, otherwise
+            // audio buffered from the previous run would replay.
+            if just_started {
+                if let Some(st) = stretches.get_mut(index) {
+                    st.clear();
+                }
+            }
 
             let [loop_l, loop_r] = loop_scratch;
             loop_l[..frames].fill(0.0);
