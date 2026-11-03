@@ -33,6 +33,7 @@ jobs:
             qt6-base-dev qt6-declarative-dev \
             libx11-dev libgl-dev \
             lv2-dev liblilv-dev libserd-dev libsord-dev libsratom-dev libsuil-dev \
+            libsoundtouch-dev clang libclang-dev \
             libjack-jackd2-dev
 
       - uses: dtolnay/rust-toolchain@stable
@@ -110,6 +111,7 @@ jobs:
             libx11-dev libgl-dev \
             qt6-base-dev qt6-declarative-dev \
             lv2-dev liblilv-dev libserd-dev libsord-dev libsratom-dev libsuil-dev \
+            libsoundtouch-dev clang libclang-dev \
             libjack-jackd2-dev
 
       - name: Install Rust

@@ -51,6 +51,7 @@ jobs:
             qt6-quickcontrols2-devel qt6-quickdialogs2-devel \
             qt6-declarative-tools qt6-declarative-imports \
             lv2-devel liblilv-0-devel serd-devel sord-devel sratom-devel suil-devel \
+            soundtouch-devel clang libclang-devel \
             pipewire-libjack-0_3-devel
 
       - name: Install Rust

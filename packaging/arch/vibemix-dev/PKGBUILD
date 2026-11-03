@@ -26,6 +26,7 @@ depends=(
   'jack'
   'qt6-base'
   'qt6-declarative'
+  'soundtouch'
 )
 optdepends=(
   'gtk3: host GTK3 plugin UIs'
@@ -49,6 +50,8 @@ makedepends=(
   'jack'
   'qt6-base'
   'qt6-declarative'
+  'soundtouch'
+  'clang'
 )
 provides=(
   'vibemix'
