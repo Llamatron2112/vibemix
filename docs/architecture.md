@@ -676,15 +676,16 @@ exists.
   the pulse `loop_beats × 24` later, so the loop length comes from the clock's
   frames rather than a rounded BPM calculation.
 - A finished take is handed back through an `rtrb` queue. The control thread
-  trims it and always applies the automatic offset (JACK buffer + plugin
-  latency up to the tap; for a bus output this includes the send compensation
-  and the bus inserts), then the manual offset. Transient detection runs on the
-  analysis worker for the editor's markers, but its result never nudges the
-  take automatically: there is no automatic first-transient snap, and the take
-  starts at the latency-corrected bar position. The audio thread keeps the
+  bakes the automatic latency offset (JACK buffer + plugin latency up to the
+  tap; for a bus output this includes the send compensation and the bus inserts)
+  into the buffer by rotating it, so the stored loop is content-first and needs
+  no latency offset at playback (which time-stretch would otherwise mis-scale).
+  The manual nudge is then a plain circular rotation. Transient detection runs
+  on the analysis worker for the editor's markers, but its result never nudges
+  the take automatically: there is no automatic first-transient snap, and the
+  take starts at the latency-corrected bar position. The audio thread keeps the
   automatic offset current while the recorder is armed, so a plugin latency
-  change mid-take is reflected in the finished take. All offsets are a circular
-  rotation: `out[i] = in[(i + nudge) mod frames]`.
+  change mid-take is reflected in the finished take.
 - With **auto-swap** enabled, a finished take is installed and started
   immediately at the phase elapsed since its recording end, so the handoff does
   not wait for a bar. The recorded strip/bus sources are muted at the same
@@ -692,9 +693,9 @@ exists.
   the loop in the mixer. If the transport is already stopped when the take is
   processed, the take is deleted, nothing is muted, and no history entry is
   created.
-- The launcher installs the raw buffer through the command queue and keeps the
-  rotation as a playback offset (`(pos + offset) mod frames`); nudging sends a
-  lightweight offset update, so a playing loop keeps running. Each loop is
+- The launcher installs the baked buffer through the command queue and keeps the
+  manual nudge as a playback offset (`(pos + offset) mod frames`); nudging sends
+  a lightweight offset update, so a playing loop keeps running. Each loop is
   mixed into its own output bus (master by default), delayed by that bus's PDC
   target and faded on start/stop. Quantized playback starts on the next bar;
   stop is immediate. Starting or restarting the transport relaunches playing

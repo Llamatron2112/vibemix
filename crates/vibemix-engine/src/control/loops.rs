@@ -588,15 +588,23 @@ impl Controller {
             self.recorder_dirty = true;
             return;
         };
-        // Latency compensation is always applied. Automatic first-transient
-        // snapping is not: transients are still detected for the editor, but
-        // the take starts at the latency-corrected bar position.
-        let base = latency_frames as i64;
+        // Latency compensation is baked into the buffer rather than kept as a
+        // playback rotation: a source-frame latency offset would be mis-scaled
+        // by time-stretch. Rotating here makes the stored loop content-first
+        // ("ear accurate"), so playback only applies the content-domain manual
+        // nudge. Automatic first-transient snapping is not applied.
+        let base = latency_frames as usize;
         let manual = self.model.recorder.nudge_samples;
-        let total = base + manual;
         let sensitivity = self.model.recorder.transient_sensitivity;
         let generation = self.next_loop_generation;
         self.next_loop_generation = self.next_loop_generation.wrapping_add(1);
+        let mut baked = Vec::with_capacity(frames * 2);
+        for j in 0..frames {
+            let src = (j + base) % frames;
+            baked.push(buffer[src * 2]);
+            baked.push(buffer[src * 2 + 1]);
+        }
+        let buffer = baked.into_boxed_slice();
         let raw: Arc<[f32]> = Arc::from(&buffer[..frames * 2]);
         let bpm = self
             .engine
@@ -611,8 +619,8 @@ impl Controller {
             sample_rate,
             loop_beats,
             bpm,
-            nudge_samples: total,
-            base_nudge: base,
+            nudge_samples: manual,
+            base_nudge: 0,
             transient_nudge: 0,
             manual_nudge: manual,
             transient_sensitivity: sensitivity,
@@ -632,7 +640,7 @@ impl Controller {
             slot_index,
             buffer,
             frames,
-            total,
+            manual,
             slot.output_bus.0 as usize,
             slot.one_shot,
             slot.bpm,
