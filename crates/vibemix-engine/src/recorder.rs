@@ -5,6 +5,7 @@
 //! buffers back to the control thread, so the audio callback never allocates.
 
 use rtrb::Producer;
+use soundtouch::SoundTouch;
 use vibemix_lv2::MidiEvent;
 
 use crate::params::{RecorderState, SharedRecorder};
@@ -384,6 +385,13 @@ pub struct LoopPlayback {
     pub stopping: bool,
     /// Smoothed output level (follows `gain`, `mute` and `stopping`).
     level: f32,
+    /// Tempo the loop was recorded at (BPM); 0 = unknown, play at 1x.
+    pub bpm: f32,
+    /// Fractional source-consumption accumulator for the time-stretch feed.
+    feed_frac: f64,
+    /// Source frames fed since the last start, for one-shot end detection when
+    /// time-stretching.
+    fed_since_start: f64,
 }
 
 impl LoopPlayback {
@@ -403,7 +411,20 @@ impl LoopPlayback {
             one_shot: false,
             stopping: false,
             level: 1.0,
+            bpm: 0.0,
+            feed_frac: 0.0,
+            fed_since_start: 0.0,
         }
+    }
+
+    /// Sets the tempo the loop was recorded at, so playback can stretch to the
+    /// live tempo.
+    pub fn set_bpm(&mut self, bpm: f32) {
+        self.bpm = if bpm.is_finite() && bpm > 0.0 {
+            bpm
+        } else {
+            0.0
+        };
     }
 
     /// Change the rotation without touching the buffer or playback state.
@@ -433,6 +454,8 @@ impl LoopPlayback {
         self.phase_end = None;
         self.stopping = false;
         self.level = self.target();
+        self.feed_frac = 0.0;
+        self.fed_since_start = 0.0;
     }
 
     /// Asks the loop to stop; it fades out over a few ms and then goes idle.
@@ -501,6 +524,111 @@ impl LoopPlayback {
                     self.pos = 0;
                 }
             }
+        }
+        if self.stopping && self.level == 0.0 {
+            self.playing = false;
+            self.stopping = false;
+        }
+    }
+
+    /// Tempo ratio (live / recorded) used to stretch this loop, defaulting to
+    /// 1x when either tempo is unknown.
+    fn tempo_for(&self, current_bpm: f32) -> f32 {
+        let ratio = if self.bpm > 0.0 && current_bpm > 0.0 {
+            current_bpm / self.bpm
+        } else {
+            1.0
+        };
+        if ratio.is_finite() && ratio > 0.0 {
+            ratio
+        } else {
+            1.0
+        }
+    }
+
+    fn stop_oneshot(&mut self) {
+        self.playing = false;
+        self.pending = false;
+        self.stopping = false;
+        self.pos = 0;
+    }
+
+    /// Feeds `count` source frames into the stretch, wrapping and applying the
+    /// rotation offset. Reads the buffer in place (never copies or allocates).
+    fn feed_source(&mut self, mut count: usize, stretch: &mut SoundTouch) {
+        while count > 0 {
+            let read = (self.pos + self.offset) % self.frames;
+            let n = count.min(self.frames - read);
+            stretch.put_samples(&self.buffer[read * 2..(read + n) * 2], n);
+            self.pos = (self.pos + n) % self.frames;
+            count -= n;
+        }
+    }
+
+    /// Mix this loop through a pitch-preserving time-stretch so it tracks
+    /// `current_bpm`. The source buffer is only read, never modified. `stretch`
+    /// is a per-slot SoundTouch configured for two channels; `scratch` holds at
+    /// least `frames * 2` interleaved floats for the stretched output.
+    #[allow(clippy::too_many_arguments)]
+    pub fn mix_stretched(
+        &mut self,
+        out_l: &mut [f32],
+        out_r: &mut [f32],
+        start: usize,
+        frames: usize,
+        coeff: f32,
+        current_bpm: f32,
+        stretch: &mut SoundTouch,
+        scratch: &mut [f32],
+    ) {
+        if !self.playing || self.frames == 0 {
+            return;
+        }
+        let from = start.min(frames);
+        let count = frames - from;
+        if count == 0 {
+            return;
+        }
+        let tempo = self.tempo_for(current_bpm);
+        let (level_start, level_end) = {
+            let target = self.target();
+            crate::dsp::smooth_step(&mut self.level, target, coeff)
+        };
+        let advance = count as f64 * tempo as f64 + self.feed_frac;
+        let to_feed = advance.floor() as usize;
+        self.feed_frac = advance - to_feed as f64;
+
+        if level_start == 0.0 && level_end == 0.0 {
+            // Silent (muted or stopped): keep the grid by consuming the source
+            // at the live tempo, and drop the stretch pipeline so a later
+            // unmute starts clean.
+            self.fed_since_start += to_feed as f64;
+            self.pos = (self.pos + to_feed % self.frames) % self.frames;
+            stretch.clear();
+            if self.one_shot && self.fed_since_start >= self.frames as f64 {
+                self.stop_oneshot();
+            }
+            if self.stopping && self.level == 0.0 {
+                self.playing = false;
+                self.stopping = false;
+            }
+            return;
+        }
+
+        stretch.set_tempo(tempo as f64);
+        self.feed_source(to_feed, stretch);
+        self.fed_since_start += to_feed as f64;
+
+        let got = stretch.receive_samples(&mut scratch[..count * 2], count);
+        let step = (level_end - level_start) / count.max(1) as f32;
+        for i in 0..got {
+            let level = level_start + step * i as f32;
+            out_l[from + i] += scratch[i * 2] * level;
+            out_r[from + i] += scratch[i * 2 + 1] * level;
+        }
+
+        if self.one_shot && self.fed_since_start >= self.frames as f64 {
+            self.stop_oneshot();
         }
         if self.stopping && self.level == 0.0 {
             self.playing = false;
@@ -853,5 +981,40 @@ mod tests {
         // The take reports its real one-beat length, not the configured two.
         assert!((take.loop_beats - 1.0).abs() < 1e-6);
         assert_eq!(shared.state(), RecorderState::Idle);
+    }
+
+    #[test]
+    fn stretched_playback_consumes_source_at_the_tempo_ratio() {
+        let frames = 4800;
+        let buffer: Vec<f32> = (0..frames * 2).map(|i| (i % 7) as f32 * 0.1).collect();
+        let original = buffer.clone();
+        let mut playback = LoopPlayback::new(buffer.into_boxed_slice(), frames);
+        playback.set_bpm(120.0);
+        playback.start();
+
+        let mut stretch = SoundTouch::new();
+        stretch.set_channels(2);
+        stretch.set_sample_rate(48_000);
+        let mut scratch = vec![0.0f32; 2048 * 2];
+        let mut out_l = [0.0f32; 1024];
+        let mut out_r = [0.0f32; 1024];
+
+        // At 240 BPM the loop runs at 2x, so each 1024-frame block consumes
+        // 2048 source frames.
+        for _ in 0..3 {
+            playback.mix_stretched(
+                &mut out_l,
+                &mut out_r,
+                0,
+                1024,
+                1.0,
+                240.0,
+                &mut stretch,
+                &mut scratch,
+            );
+        }
+        assert_eq!(playback.pos, (3 * 2048) % frames);
+        // The source is only read, never modified.
+        assert_eq!(&playback.buffer[..], original.as_slice());
     }
 }

@@ -38,6 +38,7 @@ rosc = "0.10"
 rtrb = "0.3"
 jack = "0.13"
 hound = "3"
+soundtouch = "0.5"
 
 [profile.release]
 lto = true

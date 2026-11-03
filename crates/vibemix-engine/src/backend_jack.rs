@@ -7,6 +7,7 @@ use jack::{
     NotificationHandler, Port, ProcessHandler, ProcessScope, RawMidi, Unowned,
 };
 use rtrb::{Consumer, Producer};
+use soundtouch::{Setting, SoundTouch};
 use vibemix_core::model::{BusConnections, MixerModel, PluginFormat, PluginSlot, StripConnections};
 use vibemix_core::recorder::{RecorderSourceKind, RecorderTap};
 use vibemix_lv2::{
@@ -437,6 +438,7 @@ pub enum EngineCommand {
         offset: i64,
         bus: usize,
         one_shot: bool,
+        bpm: f32,
     },
     /// Change the playback rotation in place, keeping the loop running.
     LoopOffset {
@@ -670,6 +672,10 @@ struct MixerGraph {
     shared_recorder: Arc<SharedRecorder>,
     loop_slots: Vec<Option<LoopPlayback>>,
     loop_garbage: Producer<Box<[f32]>>,
+    /// Per-slot pitch-preserving time-stretch for tempo-synced loop playback.
+    stretches: Vec<SoundTouch>,
+    /// Interleaved staging for stretched loop output (`capacity * 2` floats).
+    stretch_scratch: Box<[f32]>,
     /// Informs the control thread that the period grew past the fixed
     /// capacity and scratch buffers must be resized (see `ResizeBuffers`).
     pending_period: Arc<AtomicU32>,
@@ -690,6 +696,15 @@ struct MixerGraph {
     /// Dry editor audition: loop plus reference/metronome, mixed after the
     /// master chain so bus PDC cannot shift their relative timing.
     preview: Option<PreviewRuntime>,
+}
+
+/// Approximate latency the SoundTouch time-stretch adds to a loop, in frames.
+/// SoundTouch reports its initial pipeline fill and nominal output sequence;
+/// average streaming latency is `initial - output/2` (see its docs).
+fn stretch_latency_frames(stretch: &SoundTouch) -> f32 {
+    let initial = stretch.get_setting(Setting::InitialLatency).max(0) as f32;
+    let output = stretch.get_setting(Setting::NominalOutputSequence).max(0) as f32;
+    (initial - output * 0.5).max(0.0)
 }
 
 impl MixerGraph {
@@ -926,6 +941,7 @@ impl MixerGraph {
                     offset,
                     bus,
                     one_shot,
+                    bpm,
                 } => {
                     if slot < self.loop_slots.len() {
                         if let Some(old) = self.loop_slots[slot].take() {
@@ -935,7 +951,11 @@ impl MixerGraph {
                         playback.set_offset(offset);
                         playback.output_bus = bus.min(self.bus_chains.len().saturating_sub(1));
                         playback.one_shot = one_shot;
+                        playback.set_bpm(bpm);
                         self.loop_slots[slot] = Some(playback);
+                        if let Some(stretch) = self.stretches.get_mut(slot) {
+                            stretch.clear();
+                        }
                         if let Some(line) = self.loop_delays.get_mut(slot) {
                             line.invalidate();
                         }
@@ -1751,7 +1771,14 @@ impl MixerGraph {
     /// Mix launcher playback into the master input. Quantized slots start on
     /// the next bar boundary in this block; without a running clock they start
     /// immediately.
-    fn mix_loops(&mut self, frames: usize, beats_before: f64, beats_per_bar: f32, playing: bool) {
+    fn mix_loops(
+        &mut self,
+        frames: usize,
+        beats_before: f64,
+        beats_per_bar: f32,
+        playing: bool,
+        current_bpm: f32,
+    ) {
         let bar = bar_boundary_offset(self.transport_midi.as_slice(), beats_before, beats_per_bar);
         let Self {
             loop_slots,
@@ -1765,6 +1792,8 @@ impl MixerGraph {
             gain_coeff,
             delay_coeff,
             abs_frames,
+            stretches,
+            stretch_scratch,
             ..
         } = self;
         let bus_count = bus_accum.len();
@@ -1807,16 +1836,59 @@ impl MixerGraph {
             let [loop_l, loop_r] = loop_scratch;
             loop_l[..frames].fill(0.0);
             loop_r[..frames].fill(0.0);
-            loop_slot.mix(
-                &mut loop_l[..frames],
-                &mut loop_r[..frames],
-                start,
-                frames,
-                *gain_coeff,
-            );
+
+            // Time-stretch to the live tempo when the loop's recorded tempo
+            // differs from it; at 1x the direct path stays exact and
+            // latency-free.
+            let ratio = if loop_slot.bpm > 0.0 && current_bpm > 0.0 {
+                current_bpm / loop_slot.bpm
+            } else {
+                1.0
+            };
+            let stretched = ratio.is_finite() && ratio > 0.0 && (ratio - 1.0).abs() > 1.0e-4;
+            if stretched {
+                if let Some(st) = stretches.get_mut(index) {
+                    loop_slot.mix_stretched(
+                        &mut loop_l[..frames],
+                        &mut loop_r[..frames],
+                        start,
+                        frames,
+                        *gain_coeff,
+                        current_bpm,
+                        st,
+                        &mut stretch_scratch[..frames * 2],
+                    );
+                } else {
+                    loop_slot.mix(
+                        &mut loop_l[..frames],
+                        &mut loop_r[..frames],
+                        start,
+                        frames,
+                        *gain_coeff,
+                    );
+                }
+            } else {
+                loop_slot.mix(
+                    &mut loop_l[..frames],
+                    &mut loop_r[..frames],
+                    start,
+                    frames,
+                    *gain_coeff,
+                );
+            }
 
             let bus = loop_slot.output_bus.min(bus_count.saturating_sub(1));
-            let target = latency.loop_delay(bus) as f32;
+            // The stretch filter delays its output; fold that into the loop's
+            // PDC delay so the audible loop stays on the bar.
+            let stretch_latency = if stretched {
+                stretches
+                    .get(index)
+                    .map(stretch_latency_frames)
+                    .unwrap_or(0.0)
+            } else {
+                0.0
+            };
+            let target = (latency.loop_delay(bus) as f32 - stretch_latency).max(0.0);
             let (delay_start, delay_end) =
                 dsp::smooth_step(&mut loop_delay_smooth[index], target, *delay_coeff);
             let [delayed_l, delayed_r] = &mut *send_scratch;
@@ -2254,7 +2326,12 @@ impl ProcessHandler for MixerGraph {
         self.transport_playing = playing;
 
         self.process_strips(scope, frames, paused);
-        self.mix_loops(frames, beats_before, beats_per_bar, playing);
+        let current_bpm = if master_mode {
+            self.master.bpm()
+        } else {
+            self.clock.bpm
+        };
+        self.mix_loops(frames, beats_before, beats_per_bar, playing, current_bpm);
         self.process_buses(scope, frames);
         self.build_record_mix(frames);
         // Keep the take's automatic trim current if a plugin changes its
@@ -2604,6 +2681,22 @@ impl JackEngine {
             shared_recorder: Arc::clone(&shared_recorder),
             loop_slots: (0..MAX_LOOPS).map(|_| None).collect(),
             loop_garbage,
+            stretches: (0..MAX_LOOPS)
+                .map(|_| {
+                    let mut st = SoundTouch::new();
+                    st.set_channels(2);
+                    st.set_sample_rate(sample_rate as u32);
+                    // Pre-size the internal FIFO here (control thread) so that
+                    // feeding faster than we drain (tempo ratio > 1) never grows
+                    // it in the audio callback. `clear` keeps the allocation.
+                    let reserve = (capacity * 4).max(4096);
+                    let silence = vec![0.0f32; reserve * 2];
+                    st.put_samples(&silence, reserve);
+                    st.clear();
+                    st
+                })
+                .collect(),
+            stretch_scratch: vec![0.0; capacity * 2].into_boxed_slice(),
             pending_period: Arc::clone(&pending_period),
         };
 
@@ -2723,6 +2816,7 @@ impl JackEngine {
             .map_err(|_| anyhow!("engine command queue full"))
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn set_loop(
         &mut self,
         slot: usize,
@@ -2731,6 +2825,7 @@ impl JackEngine {
         offset: i64,
         bus: usize,
         one_shot: bool,
+        bpm: f32,
     ) -> Result<()> {
         self.commands
             .push(EngineCommand::SetLoop {
@@ -2740,6 +2835,7 @@ impl JackEngine {
                 offset,
                 bus,
                 one_shot,
+                bpm,
             })
             .map_err(|_| anyhow!("engine command queue full"))
     }

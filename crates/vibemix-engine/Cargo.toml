@@ -26,4 +26,5 @@ rosc = { workspace = true }
 rtrb = { workspace = true }
 jack = { workspace = true }
 hound = { workspace = true }
+soundtouch = { workspace = true }
 libc = "0.2"

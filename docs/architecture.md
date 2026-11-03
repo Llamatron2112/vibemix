@@ -702,13 +702,23 @@ exists.
   stay at an arbitrary phase. Buffers are retired through a garbage queue, so
   no allocation or free happens on the audio thread. The engine publishes each
   slot's progress/playing/queued state at meter rate.
+- Playback follows the live tempo. Each loop keeps the BPM it was recorded at;
+  when the transport tempo differs, the launcher streams it through a
+  pitch-preserving SoundTouch time-stretch (one per slot, created and pre-sized
+  at engine start) at ratio `live / recorded`, so the loop keeps its musical
+  length instead of drifting. At 1× it takes the bit-exact direct path, which
+  also keeps latency at zero. The stretch's group delay is folded into the
+  loop's PDC delay, and its FIFO is pre-sized on the control thread so the
+  audio callback never allocates. The source buffer is only read, never
+  rewritten.
 - WAV files are written by the I/O worker at 16-bit, 24-bit or 32-bit
   float to the path chosen in the GUI's save dialog (default
   `VIBEMIX_CONFIG_DIR/loops/`). The chosen directory is remembered in the
-  session, and the export can be normalized to -1 dBFS. The session stores loop
-  metadata, output bus and paths. Saved loops are read and analysed on the I/O
-  worker; a pending slot keeps its saved metadata visible until the file is
-  installed. Removing a loop's output bus retargets it to master.
+  session, and the export can be normalized to -1 dBFS. Loops themselves are
+  not stored in the session yet (skipped on save). Saved loops are read and
+  analysed on the I/O worker; a pending slot keeps its saved metadata visible
+  until the file is installed. Removing a loop's output bus retargets it to
+  master.
 - The editor renders a new WAV from the current visual rotation without
   changing the live loop; one-shot loops export a selected start/end range and
   play once in the mixer. Align mode stops the transport and auditions the loop

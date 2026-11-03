@@ -412,6 +412,7 @@ impl Controller {
                                 pending.slot.nudge_samples,
                                 pending.slot.output_bus.0 as usize,
                                 pending.slot.one_shot,
+                                pending.slot.bpm,
                             ) {
                                 tracing::warn!(%error, "failed to install loaded loop");
                             } else {
@@ -634,6 +635,7 @@ impl Controller {
             total,
             slot.output_bus.0 as usize,
             slot.one_shot,
+            slot.bpm,
         ) {
             tracing::warn!(%error, "failed to install recorded loop");
             self.recorder_status.message = error.to_string();
