@@ -1032,6 +1032,13 @@ ApplicationWindow {
         for (var i = 0; i < loops.length; i++) if (loops[i].id === id) return loops[i]
         return null
     }
+    // A loop with no WAV path was recorded but never exported, so it lives only
+    // in memory and would be lost when the session is closed.
+    function hasUnsavedLoops() {
+        var loops = root.loopList()
+        for (var i = 0; i < loops.length; i++) if (!loops[i].path) return true
+        return false
+    }
     function recorderSettings() {
         var r = mix.recorder || ({})
         return {
@@ -1407,6 +1414,13 @@ ApplicationWindow {
         return backend.session_dir.length > 0 ? "file://" + backend.session_dir : "file:///"
     }
     function guardUnsaved(action) {
+        // Recorded loops are not saved with the session, so warn about them
+        // first; discarding them continues to the session-changes check.
+        if (root.hasUnsavedLoops()) {
+            pendingAction = action
+            unsavedLoopsDialog.open()
+            return
+        }
         if (!backend.dirty) {
             action()
             return
@@ -2161,6 +2175,24 @@ ApplicationWindow {
             root.saveAction(after)
         }
         onDiscarded: root.runPending()
+        onRejected: root.pendingAction = null
+    }
+
+    Dialog {
+        id: unsavedLoopsDialog
+        title: "Unsaved loops"
+        modal: true
+        anchors.centerIn: parent
+        standardButtons: Dialog.Discard | Dialog.Cancel
+        Label {
+            text: "This session has loops that were recorded but not saved to disk. Continue and discard them?"
+            color: root.textColor
+            font.pixelSize: 11
+        }
+        onDiscarded: {
+            if (backend.dirty) dirtyDialog.open()
+            else root.runPending()
+        }
         onRejected: root.pendingAction = null
     }
 
