@@ -68,6 +68,12 @@ pub struct RecorderSettings {
     /// Manual nudge in samples on top of the automatic offsets.
     #[serde(default)]
     pub nudge_samples: i64,
+    /// Manual input latency in samples: the delay between a clock beat and the
+    /// machine's audio reaching the recorder's sources (interface ADC plus the
+    /// machine's own clock-to-audio latency). It is trimmed from a take and
+    /// delayed back on playback. 0 disables the compensation.
+    #[serde(default)]
+    pub input_latency: u32,
     /// Optional seam crossfade applied on playback/export.
     #[serde(default)]
     pub crossfade_ms: f32,
@@ -110,6 +116,7 @@ impl Default for RecorderSettings {
             transient: false,
             transient_sensitivity: default_sensitivity(),
             nudge_samples: 0,
+            input_latency: 0,
             crossfade_ms: 0.0,
             auto_swap: false,
         }
@@ -143,6 +150,11 @@ pub struct LoopSlot {
     /// User part of `nudge_samples`.
     #[serde(default)]
     pub manual_nudge: i64,
+    /// Input latency (samples) trimmed from this take at capture. Playback is
+    /// delayed by the same amount, so the loop stays in sync while its stored
+    /// content is content-first.
+    #[serde(default)]
+    pub input_latency: u32,
     /// Transient-detector sensitivity used for this loop, 0..1.
     #[serde(default = "default_sensitivity")]
     pub transient_sensitivity: f32,

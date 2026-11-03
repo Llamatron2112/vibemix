@@ -410,6 +410,7 @@ impl Controller {
                                 raw.to_vec().into_boxed_slice(),
                                 loaded.frames,
                                 pending.slot.nudge_samples,
+                                pending.slot.input_latency,
                                 pending.slot.output_bus.0 as usize,
                                 pending.slot.one_shot,
                                 pending.slot.bpm,
@@ -592,8 +593,12 @@ impl Controller {
         // playback rotation: a source-frame latency offset would be mis-scaled
         // by time-stretch. Rotating here makes the stored loop content-first
         // ("ear accurate"), so playback only applies the content-domain manual
-        // nudge. Automatic first-transient snapping is not applied.
-        let base = latency_frames as usize;
+        // nudge. The manual input latency (interface ADC + the machine's
+        // clock-to-audio delay) is trimmed here too and delayed back on
+        // playback, so the loop stays aligned with the live machines.
+        // Automatic first-transient snapping is not applied.
+        let input_latency = self.model.recorder.input_latency;
+        let base = latency_frames as usize + input_latency as usize;
         let manual = self.model.recorder.nudge_samples;
         let sensitivity = self.model.recorder.transient_sensitivity;
         let generation = self.next_loop_generation;
@@ -623,6 +628,7 @@ impl Controller {
             base_nudge: 0,
             transient_nudge: 0,
             manual_nudge: manual,
+            input_latency,
             transient_sensitivity: sensitivity,
             normalize: false,
             peaks: Vec::new(),
@@ -641,6 +647,7 @@ impl Controller {
             buffer,
             frames,
             manual,
+            input_latency,
             slot.output_bus.0 as usize,
             slot.one_shot,
             slot.bpm,

@@ -436,6 +436,9 @@ pub enum EngineCommand {
         buffer: Box<[f32]>,
         frames: usize,
         offset: i64,
+        /// Manual input latency trimmed from this take; playback is delayed by
+        /// the same amount so the loop stays in sync with the machines.
+        input_latency: u32,
         bus: usize,
         one_shot: bool,
         bpm: f32,
@@ -1025,6 +1028,7 @@ impl MixerGraph {
                     buffer,
                     frames,
                     offset,
+                    input_latency,
                     bus,
                     one_shot,
                     bpm,
@@ -1035,6 +1039,7 @@ impl MixerGraph {
                         }
                         let mut playback = LoopPlayback::new(buffer, frames);
                         playback.set_offset(offset);
+                        playback.input_latency = input_latency;
                         playback.output_bus = bus.min(self.bus_chains.len().saturating_sub(1));
                         playback.one_shot = one_shot;
                         playback.set_bpm(bpm);
@@ -2052,7 +2057,9 @@ impl MixerGraph {
 
             let bus = loop_slot.output_bus.min(bus_count.saturating_sub(1));
             // The stretch filter delays its output; fold that into the loop's
-            // PDC delay so the audible loop stays on the bar.
+            // PDC delay so the audible loop stays on the bar. The manual input
+            // latency trimmed from the take is delayed back here too, so a
+            // content-first loop still lands on the same beat as the machines.
             let stretch_latency = if stretched {
                 stretches
                     .get(index)
@@ -2061,9 +2068,23 @@ impl MixerGraph {
             } else {
                 0.0
             };
-            let target = (latency.loop_delay(bus) as f32 - stretch_latency).max(0.0);
-            let (delay_start, delay_end) =
-                dsp::smooth_step(&mut loop_delay_smooth[index], target, *delay_coeff);
+            let target = (latency.loop_delay(bus) as f32 + loop_slot.input_latency as f32
+                - stretch_latency)
+                .max(0.0);
+            // A fresh start primes the delay line so the restored input latency
+            // is correct from the first sample; jumping straight to the target
+            // also avoids a ~40 ms pitch slide on the first launch.
+            let (delay_start, delay_end) = if just_started {
+                if let Some(line) = loop_delays.get_mut(index) {
+                    line.invalidate();
+                }
+                if let Some(smooth) = loop_delay_smooth.get_mut(index) {
+                    *smooth = target;
+                }
+                (target, target)
+            } else {
+                dsp::smooth_step(&mut loop_delay_smooth[index], target, *delay_coeff)
+            };
             let [delayed_l, delayed_r] = &mut *send_scratch;
             loop_delays[index].process_ramp(
                 &loop_scratch[0][..frames],
@@ -3012,6 +3033,7 @@ impl JackEngine {
         buffer: Box<[f32]>,
         frames: usize,
         offset: i64,
+        input_latency: u32,
         bus: usize,
         one_shot: bool,
         bpm: f32,
@@ -3022,6 +3044,7 @@ impl JackEngine {
                 buffer,
                 frames,
                 offset,
+                input_latency,
                 bus,
                 one_shot,
                 bpm,

@@ -378,6 +378,9 @@ pub struct LoopPlayback {
     pub quantized: bool,
     /// Start immediately at the phase elapsed since this absolute frame.
     pub phase_end: Option<u64>,
+    /// Manual input latency trimmed from the take. Playback is delayed by this
+    /// many frames so the content-first loop stays in sync with the machines.
+    pub input_latency: u32,
     pub gain: f32,
     pub mute: bool,
     /// Bus this loop is mixed into (0 = master).
@@ -408,6 +411,7 @@ impl LoopPlayback {
             pending: false,
             quantized: true,
             phase_end: None,
+            input_latency: 0,
             gain: 1.0,
             mute: false,
             output_bus: 0,

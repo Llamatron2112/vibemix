@@ -681,13 +681,19 @@ exists.
   bakes the automatic latency offset (JACK buffer + plugin latency up to the
   tap; for a bus output this includes the send compensation and the bus inserts)
   into the buffer by rotating it, so the stored loop is content-first and needs
-  no latency offset at playback (which time-stretch would otherwise mis-scale).
-  The manual nudge is then a plain circular rotation. Transient detection runs
-  on the analysis worker for the editor's markers, but its result never nudges
-  the take automatically: there is no automatic first-transient snap, and the
-  take starts at the latency-corrected bar position. The audio thread keeps the
-  automatic offset current while the recorder is armed, so a plugin latency
-  change mid-take is reflected in the finished take.
+  no plugin latency offset at playback (which time-stretch would otherwise
+  mis-scale).
+  The manual **input latency** setting (samples; interface ADC plus the
+  machine's own clock-to-audio delay) is trimmed the same way and recorded on
+  the loop, then delayed back after playback by the same amount, so a
+  content-first loop still lands on the machines' beat. It is one constant per
+  setup (through the clock, all machines share the tempo-dependent part), and 0
+  disables it. The manual nudge is then a plain circular rotation. Transient
+  detection runs on the analysis worker for the editor's markers, but its result
+  never nudges the take automatically: there is no automatic first-transient
+  snap, and the take starts at the latency-corrected bar position. The audio
+  thread keeps the automatic offset current while the recorder is armed, so a
+  plugin latency change mid-take is reflected in the finished take.
 - With **auto-swap** enabled, a finished take is installed and started
   immediately at the phase elapsed since its recording end, so the handoff does
   not wait for a bar. The recorded strip/bus sources are muted at the same

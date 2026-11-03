@@ -1053,6 +1053,7 @@ ApplicationWindow {
             transient: r.transient !== false,
             transient_sensitivity: (r.transient_sensitivity !== undefined) ? r.transient_sensitivity : 0.5,
             nudge_samples: r.nudge_samples || 0,
+            input_latency: r.input_latency || 0,
             crossfade_ms: r.crossfade_ms || 0,
             auto_swap: r.auto_swap === true
         }
@@ -1061,6 +1062,11 @@ ApplicationWindow {
         var settings = root.recorderSettings()
         settings[key] = value
         backend.setRecorderSettings(JSON.stringify(settings))
+    }
+    function inputLatencyMs() {
+        var samples = root.recorderSettings().input_latency || 0
+        var rate = backend.sample_rate > 0 ? backend.sample_rate : 48000
+        return (samples * 1000 / rate).toFixed(2) + " ms"
     }
     function sendRecorderAction(action) {
         backend.recorderAction(JSON.stringify(action))
@@ -1807,6 +1813,34 @@ ApplicationWindow {
                                         Layout.preferredWidth: 88
                                         value: Math.round(root.beatsPerBar())
                                         onValueModified: backend.setBeatsPerBar(value)
+                                    }
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: "input latency"
+                                        color: root.textColor
+                                        font.pixelSize: 11
+                                        ToolTip.visible: inputLatencyHover.hovered
+                                        ToolTip.delay: 300
+                                        ToolTip.text: "Delay between a clock beat and the machine's audio reaching the mixer (interface ADC + the machine's own latency). Trimmed from new takes and delayed back on playback. Set it once, e.g. ~300."
+                                        HoverHandler { id: inputLatencyHover }
+                                    }
+                                    SpinBox {
+                                        from: 0
+                                        to: 8192
+                                        stepSize: 1
+                                        Layout.preferredWidth: 88
+                                        value: root.recorderSettings().input_latency
+                                        onValueModified: root.updateRecorderSetting("input_latency", value)
+                                    }
+                                    Label {
+                                        text: root.inputLatencyMs()
+                                        color: root.mutedText
+                                        font.pixelSize: 9
                                     }
                                 }
 
