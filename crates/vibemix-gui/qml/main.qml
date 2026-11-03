@@ -1032,12 +1032,16 @@ ApplicationWindow {
         for (var i = 0; i < loops.length; i++) if (loops[i].id === id) return loops[i]
         return null
     }
-    // A loop with no WAV path was recorded but never exported, so it lives only
-    // in memory and would be lost when the session is closed.
-    function hasUnsavedLoops() {
-        var loops = root.loopList()
-        for (var i = 0; i < loops.length; i++) if (!loops[i].path) return true
-        return false
+    // Loops are not stored in the session, so closing the session loses them.
+    function hasLoops() {
+        return root.loopList().length > 0
+    }
+    function closeConfirmMessage() {
+        var dirty = backend.dirty
+        var loops = root.hasLoops()
+        if (dirty && loops) return "This session has unsaved changes and loops. Save the changes before closing? (Loops are not stored in the session.)"
+        if (dirty) return "This session has unsaved changes. Save before closing?"
+        return "This session has loops. They are not stored in the session and will be lost. Close anyway?"
     }
     function recorderSettings() {
         var r = mix.recorder || ({})
@@ -1414,19 +1418,12 @@ ApplicationWindow {
         return backend.session_dir.length > 0 ? "file://" + backend.session_dir : "file:///"
     }
     function guardUnsaved(action) {
-        // Recorded loops are not saved with the session, so warn about them
-        // first; discarding them continues to the session-changes check.
-        if (root.hasUnsavedLoops()) {
-            pendingAction = action
-            unsavedLoopsDialog.open()
-            return
-        }
-        if (!backend.dirty) {
+        if (!backend.dirty && !root.hasLoops()) {
             action()
             return
         }
         pendingAction = action
-        dirtyDialog.open()
+        closeConfirmDialog.open()
     }
     function runPending() {
         var action = pendingAction
@@ -1465,7 +1462,7 @@ ApplicationWindow {
 
     onClosing: (close) => {
         if (root.forceClose) return
-        if (!backend.dirty && !root.hasUnsavedLoops()) return
+        if (!backend.dirty && !root.hasLoops()) return
         close.accepted = false
         root.guardUnsaved(function() {
             root.forceClose = true
@@ -2160,13 +2157,15 @@ ApplicationWindow {
     }
 
     Dialog {
-        id: dirtyDialog
-        title: "Unsaved changes"
+        id: closeConfirmDialog
+        title: backend.dirty ? "Unsaved changes" : "Close session"
         modal: true
         anchors.centerIn: parent
-        standardButtons: Dialog.Save | Dialog.Discard | Dialog.Cancel
+        standardButtons: backend.dirty
+            ? (Dialog.Save | Dialog.Discard | Dialog.Cancel)
+            : (Dialog.Discard | Dialog.Cancel)
         Label {
-            text: "This session has unsaved changes. Save before continuing?"
+            text: root.closeConfirmMessage()
             color: root.textColor
             font.pixelSize: 11
         }
@@ -2176,24 +2175,6 @@ ApplicationWindow {
             root.saveAction(after)
         }
         onDiscarded: root.runPending()
-        onRejected: root.pendingAction = null
-    }
-
-    Dialog {
-        id: unsavedLoopsDialog
-        title: "Unsaved loops"
-        modal: true
-        anchors.centerIn: parent
-        standardButtons: Dialog.Discard | Dialog.Cancel
-        Label {
-            text: "This session has loops that were recorded but not saved to disk. Continue and discard them?"
-            color: root.textColor
-            font.pixelSize: 11
-        }
-        onDiscarded: {
-            if (backend.dirty) dirtyDialog.open()
-            else root.runPending()
-        }
         onRejected: root.pendingAction = null
     }
 
