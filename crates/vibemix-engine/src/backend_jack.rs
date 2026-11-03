@@ -2456,6 +2456,9 @@ pub struct JackEngine {
     client_name: String,
     auto_connect: bool,
     pending_missing: Vec<MissingConnection>,
+    /// Last interface capture latency read from the input ports, so it is only
+    /// logged when it changes.
+    last_input_latency: u32,
 }
 
 impl JackEngine {
@@ -2760,6 +2763,7 @@ impl JackEngine {
             client_name: client_name.to_string(),
             auto_connect,
             pending_missing: Vec::new(),
+            last_input_latency: u32::MAX,
         };
         engine.sync_port_names(model);
         engine.pending_missing = engine.restore_connections(model);
@@ -3881,6 +3885,33 @@ impl JackEngine {
             if let Some(slot) = self.reported_bus_latency.get_mut(bus) {
                 *slot = latency;
             }
+        }
+    }
+
+    /// Reads the interface's capture latency from the audio input ports. The
+    /// engine otherwise only knows its own period; PipeWire sets the port
+    /// capture latency from the interface ADC + graph, which is the real input
+    /// latency (often far larger than the period). Logged when it changes so it
+    /// can be compared with the period.
+    pub fn report_input_latency(&mut self) {
+        let mut max: u32 = 0;
+        for (left, right) in self.strip_ports.iter().flatten() {
+            let (_, left_max) = left.get_latency_range(LatencyType::Capture);
+            let (_, right_max) = right.get_latency_range(LatencyType::Capture);
+            max = max.max(left_max).max(right_max);
+        }
+        for (left, right) in self.bus_return_ports.iter().flatten() {
+            let (_, left_max) = left.get_latency_range(LatencyType::Capture);
+            let (_, right_max) = right.get_latency_range(LatencyType::Capture);
+            max = max.max(left_max).max(right_max);
+        }
+        if max != self.last_input_latency {
+            self.last_input_latency = max;
+            tracing::info!(
+                input_latency_frames = max,
+                jack_buffer_frames = self.buffer_size(),
+                "interface capture latency"
+            );
         }
     }
 

@@ -731,6 +731,8 @@ impl Controller {
 
             // Publish output latency to JACK so other clients can compensate.
             self.engine.report_latency(&self.params);
+            // Read (and log) the interface's capture latency for diagnostics.
+            self.engine.report_input_latency();
             let pdc_limited = self.params.pdc_limited();
             if pdc_limited != self.pdc_limited_reported {
                 if pdc_limited {
