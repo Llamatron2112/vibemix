@@ -672,9 +672,11 @@ exists.
   is armed or recording. Removing a strip or bus drops the matching source.
 - The control thread allocates the capture buffer and sends it through the
   engine command queue. The audio thread fills it from the first bar boundary
-  (the `START` event or a `CLOCK` landing on a multiple of `beats_per_bar`) to
-  the pulse `loop_beats × 24` later, so the loop length comes from the clock's
-  frames rather than a rounded BPM calculation.
+  (the first `CLOCK` after `START`, which is beat 0, or a `CLOCK` landing on a
+  multiple of `beats_per_bar`) to the pulse `loop_beats × 24` later, so the loop
+  length comes from the clock's frames rather than a rounded BPM calculation.
+  `START` itself is only the pre-roll: MIDI machines begin on the first clock
+  after it, so the take starts on that clock too.
 - A finished take is handed back through an `rtrb` queue. The control thread
   bakes the automatic latency offset (JACK buffer + plugin latency up to the
   tap; for a bus output this includes the send compensation and the bus inserts)
@@ -824,10 +826,14 @@ slave mode it is silent for clock but can forward start/stop.
   `send_transport` forwards incoming START/STOP to `MidiOut`.
 - **Master clock:** a fixed-point phase accumulator advances 24 PPQN one sample
   at a time (`phase += millibpm`, overflow = pulse), so pulse spacing is exact
-  and drift-free. The phase is reset on stop; play always emits `START`, stop
-  emits `STOP`. Clock and transport events are merged into the block's MIDI
-  list and written to `MidiOut` at their sample offsets. The tempo is stored as
-  integer millibpm and saved in the session (`[clock] master/bpm`).
+  and drift-free. The first clock after `START` is beat 0, matching how MIDI
+  machines start on the first clock (the pre-roll reads as `-1/24`). The phase
+  is reset on stop; play always emits `START`, stop emits `STOP`. A scheduled
+  restart emits `START` immediately before the bar's clock, so a machine that
+  starts on the first clock after `START` restarts on that bar. Clock and
+  transport events are merged into the block's MIDI list and written to
+  `MidiOut` at their sample offsets. The tempo is stored as integer millibpm and
+  saved in the session (`[clock] master/bpm`).
 - **Control surface:** incoming CC is matched against a per-session binding table
   (fixed, lock-free, applied on the audio thread) and drives strip fader (gain),
   pan, mute, solo, bus fader (gain), bus mute, send gain/delay, and plugin

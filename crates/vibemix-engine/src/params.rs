@@ -1201,7 +1201,10 @@ impl SharedClock {
         self.locked.store(locked, Ordering::Relaxed);
         self.playing.store(playing, Ordering::Relaxed);
         self.bpm.store(bpm.to_bits(), Ordering::Relaxed);
-        self.beats.store(beats.to_bits(), Ordering::Relaxed);
+        // The pre-roll between START and the first clock is negative; report
+        // it as the bar start so the UI never shows beat/bar -1.
+        self.beats
+            .store(beats.max(0.0).to_bits(), Ordering::Relaxed);
         self.frames.store(frames, Ordering::Relaxed);
         self.jitter_bpm
             .store(jitter_bpm.to_bits(), Ordering::Relaxed);

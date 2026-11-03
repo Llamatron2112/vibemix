@@ -2396,8 +2396,10 @@ impl ProcessHandler for MixerGraph {
             }
 
             // Scheduled START in the gap after the last pulse of the current
-            // bar. The slave clock resets when it processes the injected
-            // START; the next clock pulse is the new bar's first tick.
+            // bar. Place it just *before* the bar's first clock so a machine
+            // that starts on the first clock after START begins on that pulse;
+            // the slave clock resets when it processes the START and the next
+            // clock is the new bar's beat 0.
             if restart_requested && self.clock.playing {
                 self.slave_restart_pending = true;
             }
@@ -2411,7 +2413,7 @@ impl ProcessHandler for MixerGraph {
                     beats_per_bar as f64,
                     frames,
                 ) {
-                    let start = MidiEvent::new(offset as i64, &[START]);
+                    let start = MidiEvent::new(offset.saturating_sub(1) as i64, &[START]);
                     self.midi.push(start);
                     self.transport_midi.push(start);
                     self.master_midi.push(start);

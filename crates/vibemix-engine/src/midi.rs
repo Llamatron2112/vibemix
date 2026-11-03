@@ -250,7 +250,9 @@ impl Clock {
                 }
                 START => {
                     self.playing = true;
-                    self.beats = 0.0;
+                    // The first clock after START is beat 0, so START leaves
+                    // the clock one tick behind the new bar.
+                    self.beats = -1.0 / 24.0;
                     self.frames_since_start = 0;
                     self.last_pulse_abs = -1;
                     self.interval_avg = 0.0;
@@ -260,7 +262,7 @@ impl Clock {
                 CONTINUE => self.playing = true,
                 STOP => self.playing = false,
                 RESET => {
-                    self.beats = 0.0;
+                    self.beats = -1.0 / 24.0;
                     self.frames_since_start = 0;
                 }
                 _ => {}
@@ -287,16 +289,19 @@ impl Clock {
 
     pub fn position(&self) -> TimePosition {
         let beats_per_bar = self.beats_per_bar as f64;
+        // Clamp the pre-roll between START and the first clock to the bar start
+        // instead of showing a negative beat/bar.
+        let beats = self.beats.max(0.0);
         let bar = if beats_per_bar > 0.0 {
-            (self.beats / beats_per_bar).floor() as i64
+            (beats / beats_per_bar).floor() as i64
         } else {
             0
         };
         TimePosition {
             frame: self.frames_since_start as i64,
-            beat: self.beats,
+            beat: beats,
             bar,
-            bar_beat: (self.beats % beats_per_bar) as f32,
+            bar_beat: (beats % beats_per_bar) as f32,
             beats_per_minute: self.bpm,
             beats_per_bar: self.beats_per_bar,
             speed: if self.playing { 1.0 } else { 0.0 },
@@ -411,11 +416,14 @@ impl MasterClock {
     }
 
     fn beats_at(&self, sample_rate: u32) -> f64 {
-        if sample_rate == 0 {
+        if sample_rate == 0 || !self.playing {
             return 0.0;
         }
         let den = 2500u64 * sample_rate as u64;
-        self.pulses as f64 / 24.0 + (self.phase as f64 / den as f64) / 24.0
+        // MIDI machines start on the first clock after `START`, so that first
+        // clock is beat 0. The `- 1` shifts our count by one tick; during the
+        // pre-roll (no clock yet) the position runs from -1/24 up to 0.
+        (self.pulses as f64 - 1.0) / 24.0 + (self.phase as f64 / den as f64) / 24.0
     }
 
     /// Build a plugin transport position for the block that starts at `beats`.
@@ -431,6 +439,9 @@ impl MasterClock {
         } else {
             4.0
         };
+        // The pre-roll before the first clock is negative; show it as the
+        // start of the bar rather than bar -1.
+        let beats = beats.max(0.0);
         TimePosition {
             frame: frames as i64,
             beat: beats,
@@ -450,6 +461,9 @@ impl MasterClock {
     /// `exact_beats` includes the fractional phase and is for plugin time.
     /// A stop resets the position to zero, so the next play always sends
     /// `START`.
+    ///
+    /// The first clock after `START` is beat 0 (the machines' convention), so
+    /// before that clock both beat values are `-1/24` (the pre-roll).
     pub fn process(
         &mut self,
         frames: usize,
@@ -491,7 +505,7 @@ impl MasterClock {
         }
 
         let beats_before = self.beats_at(sample_rate);
-        let pulse_beats = self.pulses as f64 / 24.0;
+        let pulse_beats = (self.pulses as f64 - 1.0) / 24.0;
         let frames_before = self.frames_since_start;
         let den = 2500u64 * sample_rate as u64;
         let increment = self.bpm_milli as u64;
@@ -522,16 +536,24 @@ impl MasterClock {
                     // modulo also keeps the loop live for pathological rates.
                     self.phase %= den;
                     self.pulses += 1;
-                    out.push(MidiEvent::new((frame - 1) as i64, &[CLOCK]));
+                    let at = (frame - 1) as i64;
 
-                    // The bar pulse just fired. Put START on the same frame so
-                    // every consumer that treats START as bar 1 starts on the
-                    // audible downbeat, not one clock pulse early.
-                    if self.restart_pending && self.pulses % ppb == 0 {
+                    // A restart belongs on the first clock of the new bar
+                    // (pulse 1, 1 + ppb, ...). Emit `START` *before* that
+                    // clock: a machine that starts on the first clock after
+                    // `START` then begins on this exact pulse.
+                    let restart_here = self.restart_pending && (self.pulses - 1) % ppb == 0;
+                    if restart_here {
+                        out.push(MidiEvent::new(at, &[START]));
+                    }
+                    out.push(MidiEvent::new(at, &[CLOCK]));
+
+                    if restart_here {
                         self.restart_pending = false;
                         self.force_transport = true;
-                        out.push(MidiEvent::new((frame - 1) as i64, &[START]));
-                        self.pulses = 0;
+                        // The pulse just emitted is beat 0 of the new bar; the
+                        // next clock is beat 1/24.
+                        self.pulses = 1;
                         self.frames_since_start = 0;
                     }
                 }
@@ -585,29 +607,31 @@ mod tests {
         let mut master = MasterClock::new();
         let mut out = MidiBlock::default();
 
-        // Play from zero: START at frame 0, then no pulse at frame 0.
+        // Play from zero: START at frame 0, then no pulse at frame 0. START is
+        // the pre-roll; the first clock (one tick later) is beat 0.
         let (beats, pulse_beats, frames) = master.process(0, sample_rate, true, 120_000, &mut out);
-        assert_eq!(beats, 0.0);
-        assert_eq!(pulse_beats, 0.0);
+        assert!((beats + 1.0 / 24.0).abs() < 1.0e-9, "beats={beats}");
+        assert!((pulse_beats + 1.0 / 24.0).abs() < 1.0e-9);
         assert_eq!(frames, 0);
         assert_eq!(out.as_slice()[0].as_slice(), &[START]);
 
-        // One second at 120 BPM is 2 beats = 48 pulses, one every 1000 frames.
+        // One second at 120 BPM is 48 pulses, one every 1000 frames; the first
+        // lands at frame 999 and is beat 0.
         out.clear();
         let (beats, pulse_beats, frames) =
             master.process(48_000, sample_rate, true, 120_000, &mut out);
-        assert_eq!(beats, 0.0);
-        assert_eq!(pulse_beats, 0.0);
+        assert!((beats + 1.0 / 24.0).abs() < 1.0e-9, "beats={beats}");
+        assert!((pulse_beats + 1.0 / 24.0).abs() < 1.0e-9);
         assert_eq!(frames, 0);
         assert_eq!(out.len(), 48);
         assert_eq!(out.get(0).time, 999);
         assert_eq!(out.get(47).time, 47_999);
-        assert!((master.beats_at(sample_rate) - 2.0).abs() < 1.0e-9);
+        assert!((master.beats_at(sample_rate) - 47.0 / 24.0).abs() < 1.0e-9);
 
-        // The next block starts at the pulse-aligned beat 2.0, not a fraction.
+        // The next block starts at pulse-aligned beat 47/24.
         out.clear();
         let (_, pulse_beats, _) = master.process(0, sample_rate, true, 120_000, &mut out);
-        assert_eq!(pulse_beats, 2.0);
+        assert!((pulse_beats - 47.0 / 24.0).abs() < 1.0e-9);
 
         // Stop resets the position and emits STOP.
         out.clear();
@@ -623,6 +647,27 @@ mod tests {
         out.clear();
         master.process(0, sample_rate, true, 120_000, &mut out);
         assert_eq!(out.as_slice()[0].as_slice(), &[START]);
+    }
+
+    #[test]
+    fn first_clock_after_start_is_beat_zero() {
+        let sample_rate = 48_000;
+        let mut master = MasterClock::new();
+        let mut out = MidiBlock::default();
+
+        // START alone leaves the transport in the pre-roll.
+        let (_, pulse_beats, _) = master.process(0, sample_rate, true, 120_000, &mut out);
+        assert!((pulse_beats + 1.0 / 24.0).abs() < 1.0e-9);
+
+        // One tick later the first clock fires and is beat 0.
+        out.clear();
+        master.process(1_000, sample_rate, true, 120_000, &mut out);
+        assert_eq!(out.len(), 1);
+        assert_eq!(out.get(0).as_slice(), &[CLOCK]);
+        assert_eq!(master.beats_at(sample_rate), 0.0);
+
+        let (_, pulse_beats, _) = master.process(0, sample_rate, true, 120_000, &mut out);
+        assert_eq!(pulse_beats, 0.0);
     }
 
     #[test]
@@ -642,14 +687,18 @@ mod tests {
 
         let mut start_frames = Vec::new();
         let mut clock_frames = Vec::new();
+        let mut ordered: Vec<(u64, u8)> = Vec::new();
         let mut abs = 48_000u64;
         for _ in 0..120 {
             out.clear();
             master.process(1000, sample_rate, true, 120_000, &mut out);
             for event in out.as_slice() {
-                match event.as_slice() {
-                    [START] => start_frames.push(abs + event.time as u64),
-                    [CLOCK] => clock_frames.push(abs + event.time as u64),
+                let at = abs + event.time as u64;
+                let bytes = event.as_slice();
+                ordered.push((at, bytes[0]));
+                match bytes {
+                    [START] => start_frames.push(at),
+                    [CLOCK] => clock_frames.push(at),
                     _ => {}
                 }
             }
@@ -662,6 +711,17 @@ mod tests {
         let before = clock_frames.iter().copied().filter(|&f| f < start).max();
         let after = clock_frames.iter().copied().filter(|&f| f > start).min();
         assert_eq!(at_start, 1, "START shares the bar clock pulse");
+        // START comes first so a machine that starts on the first clock after
+        // START begins on this bar.
+        let start_index = ordered
+            .iter()
+            .position(|&(at, status)| at == start && status == START)
+            .expect("START in order");
+        assert_eq!(
+            ordered[start_index + 1],
+            (start, CLOCK),
+            "START precedes the bar clock"
+        );
         assert_eq!(
             before,
             Some(start - 1000),
@@ -716,13 +776,14 @@ mod tests {
             pulses += out.len();
         }
         assert_eq!(pulses, 480);
-        assert!((master.beats_at(sample_rate) - 20.0).abs() < 1.0e-9);
+        // Beat 0 is the first clock, so 10 s of clocks ends at 479/24 beats.
+        assert!((master.beats_at(sample_rate) - 479.0 / 24.0).abs() < 1.0e-9);
 
         // Half a second at 60 BPM adds 12 pulses (0.5 beat).
         out.clear();
         master.process(24_000, sample_rate, true, 60_000, &mut out);
         assert_eq!(out.len(), 12);
-        assert!((master.beats_at(sample_rate) - 20.5).abs() < 1.0e-9);
+        assert!((master.beats_at(sample_rate) - 491.0 / 24.0).abs() < 1.0e-9);
     }
 
     /// The reference one-frame-at-a-time pulse generator the closed-form
@@ -875,9 +936,18 @@ mod tests {
         clock.beats = 10.0;
         clock.frames_since_start = 12345;
         clock.process_block(&[MidiEvent::new(0, &[START])], 0);
-        assert_eq!(clock.beats, 0.0);
+        // START is the pre-roll: the first clock after it is beat 0.
+        assert!((clock.beats + 1.0 / 24.0).abs() < 1.0e-9);
         assert_eq!(clock.frames_since_start, 0);
         assert!(clock.playing);
+    }
+
+    #[test]
+    fn slave_first_clock_after_start_is_beat_zero() {
+        let mut clock = Clock::new(48000.0, 4.0);
+        clock.process_block(&[MidiEvent::new(0, &[START])], 0);
+        clock.process_block(&[MidiEvent::new(0, &[CLOCK])], 1000);
+        assert_eq!(clock.beats, 0.0);
     }
 
     #[test]

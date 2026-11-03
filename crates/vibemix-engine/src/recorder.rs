@@ -45,8 +45,10 @@ fn is_bar(beats: f64, beats_per_bar: f64) -> bool {
 
 /// Offset of the first bar boundary in this block, if any.
 ///
-/// `START` is a bar 1 by definition; otherwise a `CLOCK` landing on a multiple
-/// of `beats_per_bar` marks the boundary. Used to quantize loop launches.
+/// A `CLOCK` landing on a multiple of `beats_per_bar` marks the boundary.
+/// `START` is only the pre-roll: the first clock after it is beat 0 (and so a
+/// bar boundary), matching how MIDI machines start on the first clock. Used to
+/// quantize loop launches.
 pub fn bar_boundary_offset(
     events: &[MidiEvent],
     beats_before: f64,
@@ -56,7 +58,7 @@ pub fn bar_boundary_offset(
     let mut beats = beats_before;
     for event in events {
         match status(event) {
-            START => return Some(event.time.max(0) as usize),
+            START => beats = -1.0 / 24.0,
             CLOCK => {
                 beats += 1.0 / 24.0;
                 if is_bar(beats, bpb) {
@@ -219,10 +221,11 @@ impl Recorder {
             let offset = event.time.max(0) as usize;
             match status(event) {
                 START => {
-                    beats = 0.0;
+                    // MIDI machines start on the first clock after START, so
+                    // START is the pre-roll: the take begins on that clock
+                    // (beat 0) instead of on START itself.
+                    beats = -1.0 / 24.0;
                     if !started {
-                        start_off = Some(offset);
-                        started = true;
                         pulses = 0;
                     }
                 }
@@ -721,8 +724,12 @@ mod tests {
 
     #[test]
     fn bar_boundary_finds_start_and_clock() {
+        // START is the pre-roll; the first clock after it is the bar boundary.
+        let events = [MidiEvent::new(2, &[START]), MidiEvent::new(5, &[CLOCK])];
+        assert_eq!(bar_boundary_offset(&events, 0.0, 4.0), Some(5));
+        // A START with no following clock does not launch anything yet.
         let events = [MidiEvent::new(2, &[START])];
-        assert_eq!(bar_boundary_offset(&events, 0.0, 4.0), Some(2));
+        assert_eq!(bar_boundary_offset(&events, 0.0, 4.0), None);
 
         // One pulse before a 4/4 bar boundary: 95 pulses = 3.9583 beats.
         let events = [MidiEvent::new(7, &[CLOCK])];
@@ -852,6 +859,7 @@ mod tests {
         let right = [1.0, 2.0, 3.0, 4.0];
         let events = [
             MidiEvent::new(0, &[START]),
+            MidiEvent::new(1, &[CLOCK]),
             MidiEvent::new(2, &[CLOCK]),
             MidiEvent::new(3, &[CLOCK]),
         ];
@@ -893,6 +901,7 @@ mod tests {
         let right = [1.0, 2.0, 3.0, 4.0];
         let events = [
             MidiEvent::new(0, &[START]),
+            MidiEvent::new(1, &[CLOCK]),
             MidiEvent::new(2, &[CLOCK]),
             MidiEvent::new(3, &[CLOCK]),
         ];
@@ -911,12 +920,59 @@ mod tests {
         );
 
         let take = take_rx.pop().expect("take");
-        assert_eq!(take.frames, 3);
-        assert!((take.buffer[0] - 0.1).abs() < 1e-6);
-        assert!((take.buffer[1] - 1.0).abs() < 1e-6);
-        assert!((take.buffer[4] - 0.3).abs() < 1e-6);
-        assert!((take.buffer[5] - 3.0).abs() < 1e-6);
+        assert_eq!(take.frames, 2);
+        assert!((take.buffer[0] - 0.2).abs() < 1e-6);
+        assert!((take.buffer[1] - 2.0).abs() < 1e-6);
+        assert!((take.buffer[2] - 0.3).abs() < 1e-6);
+        assert!((take.buffer[3] - 3.0).abs() < 1e-6);
         assert_eq!(shared.state(), RecorderState::Idle);
+    }
+
+    #[test]
+    fn take_starts_on_the_first_clock_after_start() {
+        let shared = SharedRecorder::new();
+        let (mut take_tx, mut take_rx) = rtrb::RingBuffer::<RecordedTake>::new(2);
+        let (mut garbage_tx, _garbage_rx) = rtrb::RingBuffer::<Box<[f32]>>::new(2);
+        let mut recorder = Recorder::new();
+        recorder.arm(
+            vec![0.0; 8 * 2].into_boxed_slice(),
+            8,
+            4,
+            2,
+            0,
+            1.0,
+            &shared,
+        );
+
+        let left = [0.1, 0.2, 0.3, 0.4];
+        let right = [1.0, 2.0, 3.0, 4.0];
+        // START at frame 0 is only the pre-roll; the take must begin on the
+        // first clock (frame 1), not on START.
+        let events = [
+            MidiEvent::new(0, &[START]),
+            MidiEvent::new(1, &[CLOCK]),
+            MidiEvent::new(2, &[CLOCK]),
+            MidiEvent::new(3, &[CLOCK]),
+        ];
+        recorder.process(
+            0,
+            4,
+            &events,
+            0.0,
+            4.0,
+            &left,
+            &right,
+            48_000,
+            &shared,
+            &mut take_tx,
+            &mut garbage_tx,
+        );
+
+        let take = take_rx.pop().expect("take");
+        assert_eq!(take.frames, 2);
+        // The first captured frame is the clock's, not START's.
+        assert!((take.buffer[0] - 0.2).abs() < 1e-6);
+        assert!((take.buffer[1] - 2.0).abs() < 1e-6);
     }
 
     #[test]
@@ -940,11 +996,12 @@ mod tests {
         let left = [0.1f32; 64];
         let right = [0.2f32; 64];
 
-        // Block 1: START begins the take at frame 0.
+        // Block 1: START at frame 0 is the pre-roll; the take begins on the
+        // first clock at frame 1.
         recorder.process(
             0,
             2,
-            &[MidiEvent::new(0, &[START])],
+            &[MidiEvent::new(0, &[START]), MidiEvent::new(1, &[CLOCK])],
             0.0,
             1.0,
             &left[..2],
@@ -976,8 +1033,8 @@ mod tests {
         );
 
         let take = take_rx.pop().expect("bar-stopped take");
-        // 2 frames from the first block + 23 up to the boundary.
-        assert_eq!(take.frames, 25);
+        // 1 frame from the first block + 23 up to the boundary.
+        assert_eq!(take.frames, 24);
         // The take reports its real one-beat length, not the configured two.
         assert!((take.loop_beats - 1.0).abs() < 1e-6);
         assert_eq!(shared.state(), RecorderState::Idle);
