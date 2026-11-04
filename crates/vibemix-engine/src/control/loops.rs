@@ -404,7 +404,6 @@ impl Controller {
                             pending.slot.peaks = loaded.peaks;
                             pending.slot.playing = false;
                             let raw: Arc<[f32]> = Arc::from(loaded.raw);
-                            pending.slot.raw_hash = vibemix_core::recorder::content_hash(&raw);
                             if let Err(error) = self.engine.set_loop(
                                 index,
                                 raw.to_vec().into_boxed_slice(),
@@ -655,8 +654,6 @@ impl Controller {
             playing: false,
             saved: false,
             one_shot: false,
-            reference: false,
-            raw_hash: vibemix_core::recorder::content_hash(&buffer[..frames * 2]),
             export: vibemix_core::recorder::LoopExport::default(),
         };
         if let Err(error) = self.engine.set_loop(
@@ -913,21 +910,6 @@ impl Controller {
                     self.loops_dirty = true;
                 }
             }
-            RecorderAction::SetLoopReference { slot, reference } => {
-                if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
-                    runtime.slot.reference = reference;
-                    self.rebuild_model_loops();
-                    self.loops_dirty = true;
-                } else if let Some(pending) = self
-                    .pending_loop_loads
-                    .iter_mut()
-                    .find(|pending| pending.index == slot as usize)
-                {
-                    pending.slot.reference = reference;
-                    self.rebuild_model_loops();
-                    self.loops_dirty = true;
-                }
-            }
             RecorderAction::SetLoopExport { slot, export } => {
                 if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
                     runtime.slot.export = export;
@@ -955,26 +937,12 @@ impl Controller {
                 start,
                 end,
                 gain,
-                reference,
                 metronome,
                 bpm,
                 beats_per_bar,
                 subdivision,
                 click_gain,
             } => {
-                let reference = reference.and_then(|reference| {
-                    self.loops
-                        .get(reference.slot as usize)
-                        .and_then(Option::as_ref)
-                        .map(|_| crate::backend_jack::PreviewReference {
-                            slot: reference.slot as usize,
-                            offset: reference.offset,
-                            one_shot: reference.one_shot,
-                            start: reference.start,
-                            end: reference.end,
-                            gain: reference.gain,
-                        })
-                });
                 let spec = crate::backend_jack::PreviewSpec {
                     slot: slot as usize,
                     offset,
@@ -982,7 +950,6 @@ impl Controller {
                     start,
                     end,
                     gain,
-                    reference,
                     metronome,
                     bpm,
                     beats_per_bar,

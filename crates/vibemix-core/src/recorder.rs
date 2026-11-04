@@ -183,33 +183,9 @@ pub struct LoopSlot {
     /// Play once and stop instead of wrapping at the loop end.
     #[serde(default)]
     pub one_shot: bool,
-    /// Offer this loop as a timing reference in the export/align editor.
-    #[serde(default)]
-    pub reference: bool,
-    /// Stable hash of the raw sample content, for reference signatures.
-    #[serde(default)]
-    pub raw_hash: u64,
     /// Persistent, non-destructive export settings.
     #[serde(default)]
     pub export: LoopExport,
-}
-
-/// A reference loop captured at alignment time. The signature makes a later
-/// edit/re-render of the reference visible to loops that used it.
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
-pub struct LoopReference {
-    #[serde(default)]
-    pub id: u32,
-    #[serde(default)]
-    pub raw_hash: u64,
-    #[serde(default)]
-    pub one_shot: bool,
-    #[serde(default)]
-    pub export_offset: i64,
-    #[serde(default)]
-    pub export_start: u64,
-    #[serde(default)]
-    pub export_end: u64,
 }
 
 /// Persistent export settings. `offset` is the circular rotation for loop
@@ -222,20 +198,6 @@ pub struct LoopExport {
     pub start: u64,
     #[serde(default)]
     pub end: u64,
-    #[serde(default)]
-    pub reference: Option<LoopReference>,
-}
-
-/// FNV-1a over the raw sample bits, used to detect a changed reference loop.
-pub fn content_hash(samples: &[f32]) -> u64 {
-    let mut hash = 0xcbf2_9ce4_8422_2325u64;
-    for sample in samples {
-        for byte in sample.to_bits().to_le_bytes() {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x0000_0100_0000_01b3);
-        }
-    }
-    hash
 }
 
 fn default_gain() -> f32 {
@@ -379,11 +341,6 @@ pub enum RecorderAction {
         slot: u32,
         one_shot: bool,
     },
-    /// Offer this loop as a timing reference.
-    SetLoopReference {
-        slot: u32,
-        reference: bool,
-    },
     /// Persist non-destructive export settings.
     SetLoopExport {
         slot: u32,
@@ -404,11 +361,11 @@ pub enum RecorderAction {
         start: u64,
         #[serde(default)]
         end: u64,
-        /// Stored alongside the new file for later align/preview use.
+        /// Stored alongside the new file for later export/preview use.
         #[serde(default)]
         export: LoopExport,
     },
-    /// Dry audition of a loop plus a metronome or reference loop.
+    /// Dry audition of a loop plus a metronome.
     LoopPreview {
         slot: u32,
         #[serde(default)]
@@ -422,8 +379,6 @@ pub enum RecorderAction {
         #[serde(default = "default_gain")]
         gain: f32,
         #[serde(default)]
-        reference: Option<PreviewReference>,
-        #[serde(default)]
         metronome: bool,
         #[serde(default = "default_preview_bpm")]
         bpm: f32,
@@ -435,21 +390,6 @@ pub enum RecorderAction {
         click_gain: f32,
     },
     LoopPreviewStop,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
-pub struct PreviewReference {
-    pub slot: u32,
-    #[serde(default)]
-    pub offset: i64,
-    #[serde(default)]
-    pub one_shot: bool,
-    #[serde(default)]
-    pub start: u64,
-    #[serde(default)]
-    pub end: u64,
-    #[serde(default = "default_gain")]
-    pub gain: f32,
 }
 
 fn default_preview_bpm() -> f32 {
@@ -805,7 +745,7 @@ mod tests {
 
     #[test]
     fn loop_render_action_parses_from_the_editor_json() {
-        let json = r#"{"action":"loop_render","slot":0,"path":"/tmp/x.wav","bit_depth":32,"normalize":false,"one_shot":true,"offset":100,"start":0,"end":1000,"export":{"offset":100,"start":0,"end":1000,"reference":null}}"#;
+        let json = r#"{"action":"loop_render","slot":0,"path":"/tmp/x.wav","bit_depth":32,"normalize":false,"one_shot":true,"offset":100,"start":0,"end":1000,"export":{"offset":100,"start":0,"end":1000}}"#;
         let action: RecorderAction = serde_json::from_str(json).expect("parse loop_render");
         match action {
             RecorderAction::LoopRender {
@@ -820,6 +760,17 @@ mod tests {
             }
             _ => panic!("wrong action"),
         }
+    }
+
+    #[test]
+    fn old_loop_metadata_with_reference_fields_still_loads() {
+        // Loops are not saved with sessions, but old data may still contain the
+        // removed reference/raw_hash fields; serde ignores unknown fields.
+        let json = r#"{"id":0,"frames":100,"reference":true,"raw_hash":42,"export":{"offset":3,"start":0,"end":100,"reference":{"id":1,"raw_hash":7}}}"#;
+        let slot: LoopSlot = serde_json::from_str(json).expect("old loop metadata");
+        assert_eq!(slot.frames, 100);
+        assert_eq!(slot.export.offset, 3);
+        assert_eq!(slot.export.end, 100);
     }
 
     #[test]

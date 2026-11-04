@@ -730,15 +730,16 @@ exists.
   master.
 - The editor renders a new WAV from the current visual rotation without
   changing the live loop; one-shot loops export a selected start/end range and
-  play once in the mixer. Align mode stops the transport and auditions the loop
-  dry with a sample-accurate click or another loop marked as a reference. The
-  reference's id, raw-content hash and export offset are stored with the
-  dependent loop's export settings, and a changed/missing reference is flagged.
-  The grid subdivides adaptively with zoom (up to 1/16) and can snap.
-- Loop cards start/stop playback on left click and expose edit, save, mute and
-  output-bus selection on right click; delete asks for confirmation. Each card
-  shows a whole-loop envelope, playback progress or queued state, a compact
-  volume slider and its output bus.
+  play once in the mixer. The manual nudge is staged: drag/±/SpinBox preview it,
+  Export writes the displayed waveform, and Commit applies it to the live loop
+  while Cancel (or closing the window) discards it. Preview auditions the loop
+  dry against a sample-accurate metronome. The grid subdivides adaptively with
+  zoom (up to 1/16) and can snap.
+- Loop cards start/stop playback from the waveform preview: a normal click
+  launches quantized and stops at the loop end, Shift+click does both instantly.
+  The right-click menu exposes edit, export, mute and output-bus selection;
+  delete asks for confirmation. Each card shows a whole-loop envelope, playback
+  progress or queued state, a compact volume slider and its output bus.
 - The record settings live in a non-modal popover on the top-bar record dot:
   loop length and unit, beats per bar, bit depth and the save folder.
 - The editor requests an envelope for the visible window on demand; the scan

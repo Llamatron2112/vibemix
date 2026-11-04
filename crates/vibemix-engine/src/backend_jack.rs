@@ -508,16 +508,6 @@ struct BusReturnPorts {
 }
 
 #[derive(Debug, Clone, Copy)]
-pub struct PreviewReference {
-    pub slot: usize,
-    pub offset: i64,
-    pub one_shot: bool,
-    pub start: u64,
-    pub end: u64,
-    pub gain: f32,
-}
-
-#[derive(Debug, Clone, Copy)]
 pub struct PreviewSpec {
     pub slot: usize,
     pub offset: i64,
@@ -525,7 +515,6 @@ pub struct PreviewSpec {
     pub start: u64,
     pub end: u64,
     pub gain: f32,
-    pub reference: Option<PreviewReference>,
     pub metronome: bool,
     pub bpm: f32,
     pub beats_per_bar: f32,
@@ -538,8 +527,6 @@ struct PreviewRuntime {
     spec: PreviewSpec,
     new_pos: usize,
     new_done: bool,
-    ref_pos: usize,
-    ref_done: bool,
     frames_to_click: f32,
     click_index: u64,
     click_env: f32,
@@ -553,8 +540,6 @@ impl PreviewRuntime {
             spec,
             new_pos: 0,
             new_done: false,
-            ref_pos: 0,
-            ref_done: false,
             frames_to_click: 0.0,
             click_index: 0,
             click_env: 0.0,
@@ -1853,49 +1838,6 @@ impl MixerGraph {
             } else {
                 preview.new_done = true;
             }
-        }
-
-        if let Some(reference) = spec.reference {
-            if !preview.ref_done {
-                if let Some(Some(slot)) = loop_slots.get(reference.slot) {
-                    let n = slot.frames;
-                    if n > 0 {
-                        let (start, length) = if reference.one_shot {
-                            let start = (reference.start as usize).min(n - 1);
-                            let end = if reference.end == 0 || reference.end as usize > n {
-                                n
-                            } else {
-                                reference.end as usize
-                            };
-                            let end = end.max(start + 1);
-                            (start, end - start)
-                        } else {
-                            (0, n)
-                        };
-                        let base = (reference.offset.rem_euclid(n as i64) as usize + start) % n;
-                        for i in 0..frames {
-                            let read = (base + preview.ref_pos) % n;
-                            left[i] += slot.buffer[read * 2] * reference.gain;
-                            right[i] += slot.buffer[read * 2 + 1] * reference.gain;
-                            preview.ref_pos += 1;
-                            if preview.ref_pos >= length {
-                                if reference.one_shot {
-                                    preview.ref_done = true;
-                                    preview.ref_pos = 0;
-                                    break;
-                                }
-                                preview.ref_pos = 0;
-                            }
-                        }
-                    } else {
-                        preview.ref_done = true;
-                    }
-                } else {
-                    preview.ref_done = true;
-                }
-            }
-        } else {
-            preview.ref_done = true;
         }
 
         if spec.metronome {

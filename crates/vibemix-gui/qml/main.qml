@@ -1153,8 +1153,7 @@ ApplicationWindow {
         var exportSettings = {
             offset: root.loopSaveOffset,
             start: root.loopSaveStart,
-            end: root.loopSaveEnd,
-            reference: null
+            end: root.loopSaveEnd
         }
         root.sendRecorderAction({
             action: "loop_render",
@@ -6694,8 +6693,7 @@ ApplicationWindow {
                     // `commit()`, and Export reads the displayed total directly.
                     offset: slot.nudge_samples,
                     start: Math.round(selectionStart),
-                    end: Math.round(selectionEnd),
-                    reference: null
+                    end: Math.round(selectionEnd)
                 }
             })
         }
@@ -6711,8 +6709,7 @@ ApplicationWindow {
             var exportSettings = {
                 offset: previewOffset,
                 start: Math.round(selectionStart),
-                end: Math.round(selectionEnd),
-                reference: null
+                end: Math.round(selectionEnd)
             }
             root.sendRecorderAction({
                 action: "set_loop_export",
@@ -6727,7 +6724,6 @@ ApplicationWindow {
                 start: Math.round(selectionStart),
                 end: Math.round(selectionEnd),
                 gain: 1.0,
-                reference: null,
                 metronome: true,
                 bpm: slot.bpm > 1 ? slot.bpm : root.clockInfo().bpm,
                 beats_per_bar: root.beatsPerBar(),
