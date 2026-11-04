@@ -6725,6 +6725,11 @@ ApplicationWindow {
             }
             editorWave.requestPaint()
         }
+        function setGridDiv(value) {
+            gridDiv = Math.max(0, Math.min(64, Math.round(value)))
+            ruler.requestPaint()
+            editorWave.requestPaint()
+        }
         function gridSubdivision() {
             if (gridDiv > 0) return gridDiv
             var slot = currentSlot()
@@ -7540,6 +7545,15 @@ ApplicationWindow {
                         }
                         return best
                     }
+                    /// Display frame of the closest transient to `frame`, within
+                    /// `maxPx`, or -1. Used to snap the one-shot limit markers.
+                    function nearestTransientDisplay(frame, maxPx) {
+                        var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
+                        var px = (frame - loopEditor.viewStart) / span * width
+                        var raw = nearestTransient(px, maxPx)
+                        if (raw < 0) return -1
+                        return transientDisplayAt(raw)
+                    }
 
                     ToolTip.visible: containsMouse && !pressed
                     ToolTip.delay: 500
@@ -7618,6 +7632,12 @@ ApplicationWindow {
                             var spanM = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                             var frameM = loopEditor.viewStart
                                 + (mouse.x / Math.max(1, width)) * spanM
+                            // In snap mode the one-shot limit markers snap to
+                            // the nearest transient marker.
+                            if (loopEditor.snapGrid) {
+                                var snapFrame = nearestTransientDisplay(frameM, 8)
+                                if (snapFrame >= 0) frameM = snapFrame
+                            }
                             if (dragMarker === "start") {
                                 loopEditor.selectionStart = Math.max(
                                     0, Math.min(loopEditor.selectionEnd - 1, frameM))
@@ -7956,22 +7976,31 @@ ApplicationWindow {
                         color: root.mutedText
                         font.pixelSize: 10
                     }
-                    SpinBox {
-                        from: 0
-                        to: 64
-                        editable: true
-                        Layout.preferredWidth: 74
-                        value: loopEditor.gridDiv
-                        onValueModified: {
-                            loopEditor.gridDiv = value
-                            ruler.requestPaint()
-                            editorWave.requestPaint()
+                    FlatButton {
+                        text: "−"
+                        implicitWidth: 26
+                        onClicked: loopEditor.setGridDiv(loopEditor.gridDiv - 1)
+                    }
+                    TextField {
+                        id: gridField
+                        Layout.preferredWidth: 48
+                        horizontalAlignment: TextInput.AlignHCenter
+                        validator: IntValidator { bottom: 0; top: 64 }
+                        placeholderText: "auto"
+                        text: loopEditor.gridDiv === 0 ? "" : String(loopEditor.gridDiv)
+                        onEditingFinished: {
+                            var typed = parseInt(text)
+                            loopEditor.setGridDiv(isNaN(typed) ? 0 : typed)
+                            // Typing breaks the binding; restore it.
+                            text = Qt.binding(function() {
+                                return loopEditor.gridDiv === 0 ? "" : String(loopEditor.gridDiv)
+                            })
                         }
                     }
-                    Label {
-                        text: loopEditor.gridDiv === 0 ? "auto" : ("1/" + loopEditor.gridDiv)
-                        color: root.mutedText
-                        font.pixelSize: 10
+                    FlatButton {
+                        text: "+"
+                        implicitWidth: 26
+                        onClicked: loopEditor.setGridDiv(loopEditor.gridDiv + 1)
                     }
                 }
                 CheckBox {
