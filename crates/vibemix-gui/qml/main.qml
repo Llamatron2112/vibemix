@@ -1055,8 +1055,25 @@ ApplicationWindow {
             nudge_samples: r.nudge_samples || 0,
             input_latency: r.input_latency || 0,
             crossfade_ms: r.crossfade_ms || 0,
-            auto_swap: r.auto_swap === true
+            auto_swap: r.auto_swap === true,
+            default_output_bus: r.default_output_bus || 0
         }
+    }
+    function busOptionIds() {
+        var buses = mix.buses || []
+        var ids = [0]
+        for (var i = 0; i < buses.length; i++) {
+            if (buses[i].id !== 0) ids.push(buses[i].id)
+        }
+        return ids
+    }
+    function busOptionLabels() {
+        var buses = mix.buses || []
+        var labels = ["Master"]
+        for (var i = 0; i < buses.length; i++) {
+            if (buses[i].id !== 0) labels.push(buses[i].name || ("bus " + buses[i].id))
+        }
+        return labels
     }
     function updateRecorderSetting(key, value) {
         var settings = root.recorderSettings()
@@ -1841,6 +1858,38 @@ ApplicationWindow {
                                         text: root.inputLatencyMs()
                                         color: root.mutedText
                                         font.pixelSize: 9
+                                    }
+                                }
+
+                                RowLayout {
+                                    Layout.fillWidth: true
+                                    spacing: 6
+                                    Label {
+                                        Layout.fillWidth: true
+                                        text: "output bus"
+                                        color: root.textColor
+                                        font.pixelSize: 11
+                                        ToolTip.visible: defaultBusHover.hovered
+                                        ToolTip.delay: 300
+                                        ToolTip.text: "Bus that newly recorded loops play into. Existing loops keep their own bus."
+                                        HoverHandler { id: defaultBusHover }
+                                    }
+                                    ComboBox {
+                                        Layout.preferredWidth: 130
+                                        font.pixelSize: 11
+                                        model: root.busOptionLabels()
+                                        currentIndex: {
+                                            var ids = root.busOptionIds()
+                                            var id = root.recorderSettings().default_output_bus || 0
+                                            var index = ids.indexOf(id)
+                                            return index >= 0 ? index : 0
+                                        }
+                                        onActivated: function(index) {
+                                            var ids = root.busOptionIds()
+                                            if (index >= 0 && index < ids.length) {
+                                                root.updateRecorderSetting("default_output_bus", ids[index])
+                                            }
+                                        }
                                     }
                                 }
 

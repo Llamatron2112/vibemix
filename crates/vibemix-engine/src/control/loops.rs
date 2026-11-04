@@ -624,6 +624,15 @@ impl Controller {
             .clock()
             .snapshot(self.engine.sample_rate() as f32)
             .bpm;
+        // New loops go to the configured default bus, falling back to master if
+        // the session no longer has that bus.
+        let output_bus = self
+            .model
+            .buses
+            .iter()
+            .find(|bus| bus.id.0 == self.model.recorder.default_output_bus)
+            .map(|bus| bus.id)
+            .unwrap_or(BusId(0));
         let slot = LoopSlot {
             id: slot_index as u32,
             name: format!("loop {}", slot_index + 1),
@@ -641,7 +650,7 @@ impl Controller {
             normalize: false,
             peaks: Vec::new(),
             gain: 1.0,
-            output_bus: BusId(0),
+            output_bus,
             mute: false,
             playing: false,
             saved: false,

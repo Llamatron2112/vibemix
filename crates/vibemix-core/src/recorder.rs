@@ -80,6 +80,10 @@ pub struct RecorderSettings {
     /// After a take, mute its sources and launch the new loop at the next bar.
     #[serde(default)]
     pub auto_swap: bool,
+    /// Output bus for newly recorded loops (0 = master). Existing loops keep
+    /// their own bus.
+    #[serde(default)]
+    pub default_output_bus: u32,
 }
 
 fn default_bit_depth() -> u8 {
@@ -119,6 +123,7 @@ impl Default for RecorderSettings {
             input_latency: 0,
             crossfade_ms: 0.0,
             auto_swap: false,
+            default_output_bus: 0,
         }
     }
 }
