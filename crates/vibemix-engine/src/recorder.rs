@@ -502,11 +502,13 @@ impl LoopPlayback {
             crate::dsp::smooth_step(&mut self.level, target, coeff)
         };
         if level_start == 0.0 && level_end == 0.0 {
+            // Silent (muted or stopped): keep advancing the grid and only end
+            // a one-shot once its full source length has elapsed, matching the
+            // stretched path instead of stopping on the first silent block.
             self.pos = (self.pos + count) % self.frames;
-            if self.one_shot {
-                self.playing = false;
-                self.pending = false;
-                self.pos = 0;
+            self.fed_since_start += count as f64;
+            if self.one_shot && self.fed_since_start >= self.frames as f64 {
+                self.stop_oneshot();
             }
         } else {
             let step = (level_end - level_start) / count.max(1) as f32;
@@ -626,6 +628,10 @@ impl LoopPlayback {
         self.feed_source(to_feed, stretch);
         self.fed_since_start += to_feed as f64;
 
+        // `receive_samples` can return fewer frames than requested while the
+        // pipeline is filling or the tempo is moving; the remaining output
+        // stays silent (the caller zeroed it). The pipeline's group delay is
+        // compensated through `stretch_latency_frames`.
         let got = stretch.receive_samples(&mut scratch[..count * 2], count);
         let step = (level_end - level_start) / count.max(1) as f32;
         for i in 0..got {
@@ -709,6 +715,21 @@ mod tests {
         assert_eq!(&l[4..], &[0.0, 0.0, 0.0, 0.0]);
         assert!(!playback.playing);
         assert_eq!(playback.pos, 0);
+    }
+
+    #[test]
+    fn muted_one_shot_stops_after_its_length() {
+        let mut playback = loop_with(&[1.0; 8]);
+        playback.one_shot = true;
+        playback.mute = true;
+        playback.level = 0.0;
+        let (mut l, mut r) = ([0.0f32; 4], [0.0f32; 4]);
+        // The first half is silent but still consumes the one-shot.
+        playback.mix(&mut l, &mut r, 0, 4, 1.0);
+        assert!(l.iter().all(|s| *s == 0.0));
+        assert!(playback.playing, "still within the one-shot length");
+        playback.mix(&mut l, &mut r, 0, 4, 1.0);
+        assert!(!playback.playing, "stopped after the full length");
     }
 
     #[test]

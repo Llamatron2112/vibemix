@@ -67,16 +67,34 @@ impl MidiBlock {
     }
 
     /// Stable insertion sort by frame offset, used when generated clock events
-    /// are merged with incoming MIDI.
+    /// are merged with incoming MIDI. Events at the same frame keep their
+    /// insertion order except that a transport `START`/`CONTINUE` is placed
+    /// before a `CLOCK`: a machine starts on the first clock after `START`, so
+    /// both sharing a frame must still start on that clock.
     pub fn sort_by_time(&mut self) {
         for index in 1..self.count {
             let event = self.events[index];
             let mut position = index;
-            while position > 0 && self.events[position - 1].time > event.time {
+            while position > 0 && Self::event_before(&event, &self.events[position - 1]) {
                 self.events[position] = self.events[position - 1];
                 position -= 1;
             }
             self.events[position] = event;
+        }
+    }
+
+    fn event_before(a: &MidiEvent, b: &MidiEvent) -> bool {
+        if a.time != b.time {
+            return a.time < b.time;
+        }
+        Self::transport_rank(a) < Self::transport_rank(b)
+    }
+
+    fn transport_rank(event: &MidiEvent) -> u8 {
+        match event.as_slice().first().copied() {
+            Some(START) | Some(CONTINUE) => 0,
+            Some(CLOCK) => 1,
+            _ => 1,
         }
     }
 }
@@ -522,6 +540,7 @@ impl MasterClock {
                 self.phase %= den;
             }
             let mut frame = 0usize;
+            let mut restarted_at: Option<usize> = None;
             while frame < frames {
                 let advance = (den - self.phase).div_ceil(increment) as usize;
                 if frame + advance > frames {
@@ -554,12 +573,19 @@ impl MasterClock {
                         // The pulse just emitted is beat 0 of the new bar; the
                         // next clock is beat 1/24.
                         self.pulses = 1;
-                        self.frames_since_start = 0;
+                        restarted_at = Some(at as usize);
                     }
                 }
             }
+            // The restart resets the transport at its in-block frame; count
+            // only the frames that elapsed after it, not the whole block.
+            self.frames_since_start = match restarted_at {
+                Some(at) => frames.saturating_sub(at) as u64,
+                None => self.frames_since_start + frames as u64,
+            };
+        } else {
+            self.frames_since_start += frames as u64;
         }
-        self.frames_since_start += frames as u64;
         (beats_before, pulse_beats, frames_before)
     }
 }
@@ -583,6 +609,26 @@ mod tests {
         // Clearing the block keeps the cumulative drop counter.
         block.clear();
         assert_eq!(block.dropped(), 2);
+    }
+
+    #[test]
+    fn start_sorts_before_a_clock_at_the_same_frame() {
+        let mut block = MidiBlock::default();
+        block.push(MidiEvent::new(5, &[CLOCK]));
+        block.push(MidiEvent::new(5, &[START]));
+        block.sort_by_time();
+        assert_eq!(block.get(0).as_slice(), &[START]);
+        assert_eq!(block.get(1).as_slice(), &[CLOCK]);
+
+        // Otherwise equal-time events keep their insertion order.
+        let mut block = MidiBlock::default();
+        block.push(MidiEvent::new(1, &[CLOCK]));
+        block.push(MidiEvent::new(1, &[CLOCK]));
+        block.push(MidiEvent::new(0, &[CLOCK]));
+        block.sort_by_time();
+        assert_eq!(block.get(0).time, 0);
+        assert_eq!(block.get(1).time, 1);
+        assert_eq!(block.get(2).time, 1);
     }
 
     #[test]
@@ -735,6 +781,40 @@ mod tests {
             "{}",
             master.beats_at(sample_rate)
         );
+    }
+
+    #[test]
+    fn restart_advances_frames_from_the_restart_point() {
+        let sample_rate = 48_000;
+        let mut master = MasterClock::new();
+        let mut out = MidiBlock::default();
+        // One clock per 1000-frame block at 120 BPM.
+        master.process(0, sample_rate, true, 120_000, &mut out);
+        for _ in 0..48 {
+            out.clear();
+            master.process(1000, sample_rate, true, 120_000, &mut out);
+        }
+        master.request_restart();
+
+        let mut start_offset = None;
+        for _ in 0..200 {
+            out.clear();
+            master.process(1000, sample_rate, true, 120_000, &mut out);
+            if let Some(event) = out
+                .as_slice()
+                .iter()
+                .find(|event| event.as_slice() == [START])
+            {
+                start_offset = Some(event.time.max(0) as u64);
+                break;
+            }
+        }
+        let offset = start_offset.expect("scheduled restart");
+        // The next block starts only `1000 - offset` frames after the restart,
+        // not a whole block later.
+        out.clear();
+        let (_, _, frames_at_start) = master.process(1000, sample_rate, true, 120_000, &mut out);
+        assert_eq!(frames_at_start, 1000 - offset);
     }
 
     #[test]

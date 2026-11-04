@@ -77,6 +77,8 @@ pub struct SharedParams {
     pdc_frames: AtomicU32,
     /// Automatic compensation hit the send-delay capacity and is incomplete.
     pdc_limited: AtomicBool,
+    /// A send, route or PDC toggle changed since the plan was last computed.
+    pdc_dirty: AtomicBool,
     /// Actual latency at each bus output port (frames), for JACK reporting.
     bus_out_latency: Vec<AtomicU32>,
 }
@@ -155,6 +157,7 @@ impl SharedParams {
             pdc_enabled: AtomicBool::new(true),
             pdc_frames: AtomicU32::new(0),
             pdc_limited: AtomicBool::new(false),
+            pdc_dirty: AtomicBool::new(true),
             bus_out_latency: (0..bus_count).map(|_| AtomicU32::new(0)).collect(),
         }
     }
@@ -165,6 +168,18 @@ impl SharedParams {
 
     pub fn set_pdc_enabled(&self, value: bool) {
         self.pdc_enabled.store(value, Ordering::Relaxed);
+        self.note_pdc_dirty();
+    }
+
+    /// Marks the compensation plan stale after a send, route or PDC change.
+    fn note_pdc_dirty(&self) {
+        self.pdc_dirty.store(true, Ordering::Relaxed);
+    }
+
+    /// Returns and clears the stale flag, so the audio thread recomputes the
+    /// plan only when one of its inputs actually changed.
+    pub fn take_pdc_dirty(&self) -> bool {
+        self.pdc_dirty.swap(false, Ordering::Relaxed)
     }
 
     pub fn pdc_frames(&self) -> u32 {
@@ -356,6 +371,7 @@ impl SharedParams {
 
     pub fn set_bus_active(&self, bus: usize, value: bool) {
         set_bool(&self.bus_active, bus, value);
+        self.note_pdc_dirty();
     }
 
     pub fn bus_gain(&self, bus: usize) -> f32 {
@@ -380,6 +396,7 @@ impl SharedParams {
 
     pub fn set_bus_mix_master(&self, bus: usize, value: bool) {
         set_bool(&self.bus_mix_master, bus, value);
+        self.note_pdc_dirty();
     }
 
     pub fn bus_return(&self, bus: usize) -> bool {
@@ -418,6 +435,7 @@ impl SharedParams {
         if let Some(slot) = self.send_gain.get(strip).and_then(|sends| sends.get(bus)) {
             slot.store(value.clamp(0.0, 4.0).to_bits(), Ordering::Relaxed);
         }
+        self.note_pdc_dirty();
     }
 
     pub fn send_delay(&self, strip: usize, bus: usize) -> f32 {
@@ -437,6 +455,7 @@ impl SharedParams {
                 Ordering::Relaxed,
             );
         }
+        self.note_pdc_dirty();
     }
 
     pub fn send_pre_fader(&self, strip: usize, bus: usize) -> bool {
@@ -455,6 +474,7 @@ impl SharedParams {
         {
             slot.store(value, Ordering::Relaxed);
         }
+        self.note_pdc_dirty();
     }
 
     fn sidechain_slots(

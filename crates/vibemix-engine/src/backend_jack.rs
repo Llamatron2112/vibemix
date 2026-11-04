@@ -1386,7 +1386,8 @@ impl MixerGraph {
     fn update_latency(&mut self, frames: usize) {
         let refresh_every = ((self.sample_rate * 0.1) as usize).max(frames.max(1));
         self.latency_accum = self.latency_accum.saturating_add(frames);
-        if self.latency_dirty || self.latency_accum >= refresh_every {
+        let refreshed = self.latency_dirty || self.latency_accum >= refresh_every;
+        if refreshed {
             self.latency_accum = 0;
             self.latency_dirty = false;
             let params = &self.params;
@@ -1410,6 +1411,14 @@ impl MixerGraph {
         for bus in 0..self.buses.len() {
             self.pdc_bus_active[bus] = self.params.bus_active(bus);
             self.pdc_bus_mix[bus] = self.params.bus_mix_master(bus);
+        }
+
+        // The plan only changes when the chain latencies refresh or a send,
+        // route or PDC toggle was written from the control thread; skip the
+        // per-block recompute otherwise.
+        let params_dirty = self.params.take_pdc_dirty();
+        if !refreshed && !params_dirty {
+            return;
         }
 
         let max_frames = self.max_pdc_frames;
@@ -2068,9 +2077,16 @@ impl MixerGraph {
             } else {
                 0.0
             };
+            // Clamp the total delay to what the line can hold; the plan already
+            // limits PDC, and this keeps an oversized manual latency from
+            // silently ending up shorter than the amount trimmed from the take.
+            let line_max = loop_delays
+                .get(index)
+                .map(|line| line.max_samples() as f32)
+                .unwrap_or(f32::MAX);
             let target = (latency.loop_delay(bus) as f32 + loop_slot.input_latency as f32
                 - stretch_latency)
-                .max(0.0);
+                .clamp(0.0, line_max);
             // A fresh start primes the delay line so the restored input latency
             // is correct from the first sample; jumping straight to the target
             // also avoids a ~40 ms pitch slide on the first launch.
@@ -2437,7 +2453,11 @@ impl ProcessHandler for MixerGraph {
                     let start = MidiEvent::new(offset.saturating_sub(1) as i64, &[START]);
                     self.midi.push(start);
                     self.transport_midi.push(start);
-                    self.master_midi.push(start);
+                    // Forward the restart START only when transport sending is
+                    // enabled, like every other transport message.
+                    if send_transport {
+                        self.master_midi.push(start);
+                    }
                     self.midi.sort_by_time();
                     self.transport_midi.sort_by_time();
                     self.master_midi.sort_by_time();
@@ -2454,8 +2474,8 @@ impl ProcessHandler for MixerGraph {
             self.position = self.clock.position();
             self.shared_clock.publish(&self.clock);
 
-            // MIDI-transport thru (no clock) in slave mode, plus any explicit
-            // restart START (which ignores the send toggle).
+            // MIDI-transport thru (no clock) in slave mode, plus an explicit
+            // restart START when transport sending is enabled.
             let mut writer = self.midi_out.writer(scope);
             for index in 0..self.master_midi.len() {
                 let event = self.master_midi.get(index);
@@ -2534,6 +2554,9 @@ impl ProcessHandler for MixerGraph {
         // Keep the take's automatic trim current if a plugin changes its
         // latency while the recorder is armed or recording. Set it before the
         // block is captured so a take that ends here uses this block's value.
+        // The JACK period is only a conservative baseline: the manual
+        // `input_latency` setting supplies the interface ADC + machine part, so
+        // this term is not meant to be the full capture latency on its own.
         self.recorder
             .set_latency(self.buffer_size as u32 + self.source_latency_frames());
         self.recorder.process(

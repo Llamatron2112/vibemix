@@ -597,7 +597,15 @@ impl Controller {
         // clock-to-audio delay) is trimmed here too and delayed back on
         // playback, so the loop stays aligned with the live machines.
         // Automatic first-transient snapping is not applied.
-        let input_latency = self.model.recorder.input_latency;
+        // Bound the manual latency so the total rotation stays within one loop:
+        // the value stored on the loop is exactly what was trimmed and is
+        // re-delayed at playback, so the two can never disagree.
+        let input_latency = {
+            let max_manual = frames
+                .saturating_sub(1)
+                .saturating_sub(latency_frames as usize);
+            (self.model.recorder.input_latency as usize).min(max_manual) as u32
+        };
         let base = latency_frames as usize + input_latency as usize;
         let manual = self.model.recorder.nudge_samples;
         let sensitivity = self.model.recorder.transient_sensitivity;
