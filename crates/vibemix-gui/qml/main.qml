@@ -254,7 +254,6 @@ ApplicationWindow {
     property int loopSaveOffset: 0
     property int loopSaveStart: 0
     property int loopSaveEnd: 0
-    property var loopSaveReference: null
     property var meterSource: ({})
     property var busMeterSource: ({})
     property bool sliderHovered: false
@@ -1109,11 +1108,7 @@ ApplicationWindow {
     function nudgeLoop(delta) {
         var slot = root.loopById(loopEditor.slotId)
         if (!slot) return
-        var manual = loopEditor.displayManual() + delta
-        loopEditor.dragManual = manual
-        loopEditor.applying = true
-        root.sendRecorderAction({ action: "set_nudge", slot: slot.id, manual: manual })
-        editorWave.requestPaint()
+        loopEditor.setPendingManual(loopEditor.displayManual() + delta)
     }
     function startLoop(slot, quantized) {
         root.sendRecorderAction({ action: "loop_play", slot: slot.id, quantized: quantized })
@@ -1131,8 +1126,7 @@ ApplicationWindow {
         var start = (slot.export && slot.export.start !== undefined) ? slot.export.start : 0
         var end = (slot.export && slot.export.end) ? slot.export.end : slot.frames
         if (loopEditor.visible && loopEditor.slotId === slot.id) {
-            offset = loopEditor.alignMode
-                ? loopEditor.exportOffset : Math.round(loopEditor.displayTotal())
+            offset = Math.round(loopEditor.displayTotal())
             if (oneShot) {
                 start = Math.round(loopEditor.selectionStart)
                 end = Math.round(loopEditor.selectionEnd)
@@ -1145,9 +1139,6 @@ ApplicationWindow {
         root.loopSaveOffset = offset
         root.loopSaveStart = start
         root.loopSaveEnd = end
-        root.loopSaveReference = loopEditor.visible && loopEditor.slotId === slot.id
-            ? loopEditor.referenceSignature()
-            : (slot.export ? slot.export.reference : null)
         var folder = root.loopFolder()
         var base = String(slot.name || "loop").replace(/[^A-Za-z0-9_-]+/g, "-")
         if (base.length === 0) base = "loop"
@@ -1163,7 +1154,7 @@ ApplicationWindow {
             offset: root.loopSaveOffset,
             start: root.loopSaveStart,
             end: root.loopSaveEnd,
-            reference: root.loopSaveReference
+            reference: null
         }
         root.sendRecorderAction({
             action: "loop_render",
@@ -6368,7 +6359,7 @@ ApplicationWindow {
                                         onTriggered: loopEditor.openFor(loopData.id)
                                     }
                                     MenuItem {
-                                        text: "Save…"
+                                        text: "Export…"
                                         onTriggered: root.saveLoop(
                                             loopData,
                                             root.recorderSettings().bit_depth,
@@ -6386,16 +6377,6 @@ ApplicationWindow {
                                             action: "set_loop_one_shot",
                                             slot: loopData.id,
                                             one_shot: !(loopData.one_shot === true)
-                                        })
-                                    }
-                                    MenuItem {
-                                        text: "Timing reference"
-                                        checkable: true
-                                        checked: loopData.reference === true
-                                        onTriggered: root.sendRecorderAction({
-                                            action: "set_loop_reference",
-                                            slot: loopData.id,
-                                            reference: !(loopData.reference === true)
                                         })
                                     }
                                     MenuSeparator { }
@@ -6455,13 +6436,6 @@ ApplicationWindow {
                                             text: "1×"
                                             color: root.accentColor
                                             font.pixelSize: 9
-                                            font.bold: true
-                                        }
-                                        Label {
-                                            visible: loopData.reference === true
-                                            text: "REF"
-                                            color: "#f9a825"
-                                            font.pixelSize: 8
                                             font.bold: true
                                         }
                                     }
@@ -6576,12 +6550,15 @@ ApplicationWindow {
         property int slotId: -1
         property real selectionStart: 0
         property real selectionEnd: 0
-        property bool alignMode: false
-        property int referenceId: -1
         property bool previewPlaying: false
         property int gridDiv: 0
         property bool snapGrid: false
-        property int exportOffset: 0
+        /// Manual nudge staged in this editor session. Committed to the loop
+        /// only by `commit()`; `close()` discards it.
+        property int pendingManual: 0
+        /// Adopt the next engine-committed nudge (the "zero seam" action)
+        /// into the staged value.
+        property bool adoptCommitted: false
         property int clickDiv: 1
         property int ghostOffset: 0
         property bool ghostVisible: false
@@ -6618,36 +6595,38 @@ ApplicationWindow {
             return slot ? slot.manual_nudge : 0
         }
         function displayManual() {
-            return (dragging || applying) ? dragManual : currentManual()
+            return dragging ? dragManual : pendingManual
         }
         function displayTotal() {
             var slot = currentSlot()
             if (!slot) return 0
             return slot.base_nudge + slot.transient_nudge + displayManual()
         }
-        function exportOffsetMod() {
-            var slot = currentSlot()
-            var frames = slot && slot.frames ? slot.frames : 1
-            return ((exportOffset % frames) + frames) % frames
+        /// Stage a manual nudge and refresh the preview without committing it.
+        function setPendingManual(value) {
+            pendingManual = Math.round(value)
+            dragManual = pendingManual
+            applying = true
+            requestWaveform(Math.round(displayTotal()))
+            editorWave.requestPaint()
+            ruler.requestPaint()
         }
-        function exportOffsetText() {
+        /// Apply the staged nudge to the loop and close.
+        function commit() {
             var slot = currentSlot()
-            var ms = slot && slot.sample_rate > 0 ? exportOffset * 1000 / slot.sample_rate : 0
-            return exportOffset + " smp (" + (ms >= 0 ? "+" : "") + ms.toFixed(2) + " ms)"
+            if (slot && pendingManual !== slot.manual_nudge) {
+                root.sendRecorderAction({ action: "set_nudge", slot: slot.id, manual: pendingManual })
+            }
+            close()
+        }
+        /// Close discarding the staged nudge (it was never applied).
+        function cancel() {
+            close()
         }
         function restartPreview() {
             if (!previewPlaying) return
             stopPreview(true)
             startPreview()
-        }
-        function setExportOffset(value) {
-            exportOffset = Math.round(value)
-            requestWaveform(null)
-            editorWave.requestPaint()
-            ruler.requestPaint()
-            // The click is anchored to the export start; moving the offset
-            // changes where that start lands. Re-phase the preview at once.
-            restartPreview()
         }
         function displayTotalMod() {
             var slot = currentSlot()
@@ -6690,52 +6669,6 @@ ApplicationWindow {
             }
             editorWave.requestPaint()
         }
-        function toggleReference() {
-            var slot = currentSlot()
-            if (!slot) return
-            root.sendRecorderAction({
-                action: "set_loop_reference",
-                slot: slot.id,
-                reference: !(slot.reference === true)
-            })
-        }
-        function referenceLoops() {
-            var loops = root.loopList()
-            var out = []
-            for (var i = 0; i < loops.length; i++) {
-                if (loops[i].id !== slotId && loops[i].reference === true) out.push(loops[i])
-            }
-            return out
-        }
-        function referenceChoices() {
-            var out = [{ id: -1, name: "metronome" }]
-            var refs = referenceLoops()
-            for (var i = 0; i < refs.length; i++) out.push(refs[i])
-            return out
-        }
-        function referenceLabel() {
-            if (referenceId < 0) return "metronome"
-            var ref = root.loopById(referenceId)
-            return ref ? ref.name : "missing reference"
-        }
-        function referenceStale() {
-            var slot = currentSlot()
-            if (!slot || !slot.export || !slot.export.reference) return 0
-            var sig = slot.export.reference
-            var ref = root.loopById(sig.id)
-            if (!ref) return 2
-            var refExportSet = ref.export && ref.export.end > 0
-            var refOffset = refExportSet ? ref.export.offset : ref.nudge_samples
-            var refStart = refExportSet ? ref.export.start : 0
-            var refEnd = refExportSet ? ref.export.end : ref.frames
-            if ((ref.raw_hash || 0) !== (sig.raw_hash || 0)
-                || (ref.one_shot === true) !== (sig.one_shot === true)
-                || refOffset !== sig.export_offset
-                || refStart !== sig.export_start
-                || refEnd !== sig.export_end)
-                return 1
-            return 0
-        }
         function gridSubdivision() {
             if (gridDiv > 0) return gridDiv
             var slot = currentSlot()
@@ -6750,34 +6683,19 @@ ApplicationWindow {
             if (pxPerBeat > 40) return 2
             return 1
         }
-        function referenceSignature() {
-            if (referenceId < 0) return null
-            var ref = root.loopById(referenceId)
-            if (!ref) return null
-            var set = ref.export && ref.export.end > 0
-            return {
-                id: ref.id,
-                raw_hash: ref.raw_hash || 0,
-                one_shot: ref.one_shot === true,
-                export_offset: set ? ref.export.offset : ref.nudge_samples,
-                export_start: set ? ref.export.start : 0,
-                export_end: set ? ref.export.end : ref.frames
-            }
-        }
         function storeExportSettings() {
             var slot = currentSlot()
             if (!slot) return
-            var offset = alignMode
-                ? exportOffset
-                : (slot.export && slot.export.end > 0 ? slot.export.offset : slot.nudge_samples)
             root.sendRecorderAction({
                 action: "set_loop_export",
                 slot: slot.id,
                 export: {
-                    offset: offset,
+                    // The committed nudge: staging lives in the editor until
+                    // `commit()`, and Export reads the displayed total directly.
+                    offset: slot.nudge_samples,
                     start: Math.round(selectionStart),
                     end: Math.round(selectionEnd),
-                    reference: referenceSignature()
+                    reference: null
                 }
             })
         }
@@ -6789,17 +6707,12 @@ ApplicationWindow {
                 return
             }
             if (root.clockInfo().playing) backend.setClockPlaying(false)
-            var ref = referenceId >= 0 ? root.loopById(referenceId) : null
-            var sig = referenceSignature()
-            var refOffset = sig ? sig.export_offset : 0
-            var refStart = sig ? sig.export_start : 0
-            var refEnd = sig ? sig.export_end : (ref ? ref.frames : 0)
-            var previewOffset = alignMode ? exportOffset : Math.round(displayTotal())
+            var previewOffset = Math.round(displayTotal())
             var exportSettings = {
                 offset: previewOffset,
                 start: Math.round(selectionStart),
                 end: Math.round(selectionEnd),
-                reference: sig
+                reference: null
             }
             root.sendRecorderAction({
                 action: "set_loop_export",
@@ -6814,17 +6727,9 @@ ApplicationWindow {
                 start: Math.round(selectionStart),
                 end: Math.round(selectionEnd),
                 gain: 1.0,
-                reference: ref ? {
-                    slot: ref.id,
-                    offset: refOffset,
-                    one_shot: ref.one_shot === true,
-                    start: refStart,
-                    end: refEnd,
-                    gain: 1.0
-                } : null,
-                metronome: !ref,
-                bpm: ref && ref.bpm > 1 ? ref.bpm
-                    : (slot.bpm > 1 ? slot.bpm : root.clockInfo().bpm),
+                reference: null,
+                metronome: true,
+                bpm: slot.bpm > 1 ? slot.bpm : root.clockInfo().bpm,
                 beats_per_bar: root.beatsPerBar(),
                 subdivision: clickDiv,
                 click_gain: 0.5
@@ -6858,7 +6763,8 @@ ApplicationWindow {
             var full = view.start === 0 && view.end === slot.frames
             var requested = nudge
             if (requested === undefined || requested === null) {
-                requested = loopEditor.alignMode ? loopEditor.exportOffset : null
+                // The editor always previews the staged nudge.
+                requested = Math.round(displayTotal())
             }
             root.sendRecorderAction({
                 action: "waveform",
@@ -7011,16 +6917,7 @@ ApplicationWindow {
         function snapTransient(raw) {
             var slot = currentSlot()
             if (!slot) return
-            if (alignMode) {
-                var frames = Math.max(1, slot.frames)
-                setExportOffset(((raw % frames) + frames) % frames)
-                storeExportSettings()
-                return
-            }
-            dragManual = raw - slot.base_nudge - slot.transient_nudge
-            applying = true
-            root.sendRecorderAction({ action: "snap_transient", slot: slot.id, frame: raw })
-            editorWave.requestPaint()
+            setPendingManual(raw - slot.base_nudge - slot.transient_nudge)
         }
         function snapFirstTransient() {
             var frame = firstTransientFrame()
@@ -7029,7 +6926,9 @@ ApplicationWindow {
         function snapSeam() {
             var slot = currentSlot()
             if (!slot) return
-            applying = true
+            // The engine computes this from the raw samples; adopt its result
+            // into the staged nudge when the model refreshes.
+            adoptCommitted = true
             root.sendRecorderAction({ action: "snap_seam", slot: slot.id })
         }
         function commitSensitivity() {
@@ -7045,6 +6944,8 @@ ApplicationWindow {
         function openFor(id) {
             stopPreview(true)
             slotId = id
+            pendingManual = (root.loopById(id) || {}).manual_nudge || 0
+            adoptCommitted = false
             waveNudge = displayTotalMod()
             editorPeaks = []
             basePeaks = []
@@ -7060,13 +6961,8 @@ ApplicationWindow {
                 ? openedSlot.export.start : 0
             selectionEnd = openedSlot && openedSlot.export && openedSlot.export.end
                 ? openedSlot.export.end : (openedSlot ? openedSlot.frames : 0)
-            referenceId = openedSlot && openedSlot.export && openedSlot.export.reference
-                ? openedSlot.export.reference.id : -1
-            exportOffset = openedSlot && openedSlot.export && openedSlot.export.end > 0
-                ? openedSlot.export.offset
-                : (openedSlot ? openedSlot.nudge_samples : 0)
             cursorFrame = -1
-            dragManual = 0
+            dragManual = pendingManual
             dragging = false
             navigating = false
             applying = false
@@ -7117,6 +7013,13 @@ ApplicationWindow {
             }
             function onLoopsChanged() {
                 if (loopEditor.visible && !loopEditor.dragging && !loopEditor.navigating) {
+                    if (loopEditor.adoptCommitted) {
+                        // "zero seam" committed a nudge; mirror it as staged.
+                        loopEditor.adoptCommitted = false
+                        var slot = loopEditor.currentSlot()
+                        loopEditor.pendingManual = slot ? slot.manual_nudge : 0
+                        loopEditor.dragManual = loopEditor.pendingManual
+                    }
                     loopEditor.requestWaveform(null)
                 }
             }
@@ -7126,7 +7029,7 @@ ApplicationWindow {
         flags: Qt.Window
         transientParent: root
         onClosing: {
-            if (loopEditor.alignMode) loopEditor.storeExportSettings()
+            // Closing without Commit discards the staged manual nudge.
             loopEditor.stopPreview(true)
         }
         onVisibleChanged: {
@@ -7481,9 +7384,7 @@ ApplicationWindow {
                     onTriggered: {
                         if (!loopEditor.visible) return
                         if (loopEditor.dragging) {
-                            loopEditor.requestWaveform(loopEditor.alignMode
-                                ? loopEditor.exportOffset
-                                : loopEditor.displayTotal())
+                            loopEditor.requestWaveform(loopEditor.displayTotal())
                         }
                     }
                 }
@@ -7521,7 +7422,6 @@ ApplicationWindow {
                     property real pressViewStart: 0
                     property real pressViewEnd: 0
                     property int pressManual: 0
-                    property int pressExport: 0
                     property int pressTotal: 0
                     property int pressAnchorRaw: 0
                     property int snapDelta: 0
@@ -7558,15 +7458,11 @@ ApplicationWindow {
                             loopEditor.navigating = false
                             loopEditor.dragging = false
                             loopEditor.applying = false
-                            pressExport = loopEditor.exportOffset
                             return
                         }
                         if (mouse.modifiers & Qt.AltModifier) {
                             pressManual = loopEditor.displayManual()
-                            pressExport = loopEditor.exportOffset
-                            pressTotal = loopEditor.alignMode
-                                ? loopEditor.exportOffset
-                                : Math.round(loopEditor.displayTotal())
+                            pressTotal = Math.round(loopEditor.displayTotal())
                             var framesAtPress = Math.max(1, slot.frames)
                             var spanAtPress = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                             var displayAtPress = loopEditor.viewStart
@@ -7580,10 +7476,7 @@ ApplicationWindow {
                             loopEditor.ghostVisible = false
                             loopEditor.snapTarget = -1
                             loopEditor.anchorDisplay = displayAtPress
-                            loopEditor.requestWaveform(
-                                loopEditor.alignMode
-                                    ? loopEditor.exportOffset
-                                    : loopEditor.displayTotal())
+                            loopEditor.requestWaveform(loopEditor.displayTotal())
                             requestTimer.start()
                         } else {
                             loopEditor.navigating = true
@@ -7633,13 +7526,8 @@ ApplicationWindow {
                                     ? -Math.round(dx)
                                     : -Math.round(dx * span / Math.max(1, width))
                                 var freeTotal
-                                if (loopEditor.alignMode) {
-                                    loopEditor.exportOffset = pressExport + delta
-                                    freeTotal = loopEditor.exportOffset
-                                } else {
-                                    loopEditor.dragManual = pressManual + delta
-                                    freeTotal = Math.round(loopEditor.displayTotal())
-                                }
+                                loopEditor.dragManual = pressManual + delta
+                                freeTotal = Math.round(loopEditor.displayTotal())
                                 var framesD = Math.max(1, slot.frames)
                                 var freeMod = ((freeTotal % framesD) + framesD) % framesD
                                 var anchorFree = ((pressAnchorRaw - freeMod)
@@ -7686,7 +7574,7 @@ ApplicationWindow {
                         }
                         editorWave.requestPaint()
                     }
-                    onReleased: {
+                    onReleased: function(mouse) {
                         requestTimer.stop()
                         var slot = loopEditor.currentSlot()
                         if (dragMarker !== "") {
@@ -7700,26 +7588,9 @@ ApplicationWindow {
                         }
                         if (loopEditor.dragging) {
                             loopEditor.dragging = false
-                            if (loopEditor.alignMode) {
-                                if (loopEditor.snapGrid && loopEditor.ghostVisible)
-                                    loopEditor.exportOffset += snapDelta
-                                loopEditor.setExportOffset(loopEditor.exportOffset)
-                                loopEditor.storeExportSettings()
-                            } else {
-                                if (loopEditor.snapGrid && loopEditor.ghostVisible)
-                                    loopEditor.dragManual += snapDelta
-                                if (slot && loopEditor.dragManual !== slot.manual_nudge) {
-                                    loopEditor.applying = true
-                                    root.sendRecorderAction({
-                                        action: "set_nudge",
-                                        slot: slot.id,
-                                        manual: loopEditor.dragManual
-                                    })
-                                } else {
-                                    loopEditor.applying = false
-                                }
-                                loopEditor.requestWaveform(null)
-                            }
+                            if (loopEditor.snapGrid && loopEditor.ghostVisible)
+                                loopEditor.dragManual += snapDelta
+                            loopEditor.setPendingManual(loopEditor.dragManual)
                         } else if (loopEditor.navigating) {
                             settleTimer.stop()
                             loopEditor.navigating = false
@@ -7770,7 +7641,7 @@ ApplicationWindow {
                         var delta = wheel.angleDelta.y
                         if (delta === 0) return
                         var factor = Math.pow(1.25, -delta / 120)
-                        loopEditor.zoomBy(factor, mouse.x / Math.max(1, width), true)
+                        loopEditor.zoomBy(factor, wheel.x / Math.max(1, width), true)
                         wheel.accepted = true
                     }
                 }
@@ -7891,32 +7762,6 @@ ApplicationWindow {
 
             RowLayout {
                 Layout.fillWidth: true
-                visible: loopEditor.alignMode
-                spacing: 4
-                Label {
-                    text: "export"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                FlatButton { text: "-100"; implicitWidth: 40; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset - 100) }
-                FlatButton { text: "-10"; implicitWidth: 36; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset - 10) }
-                FlatButton { text: "-1"; implicitWidth: 30; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset - 1) }
-                Label {
-                    Layout.fillWidth: true
-                    text: loopEditor.exportOffsetText()
-                    color: root.textColor
-                    font.pixelSize: 11
-                    font.family: "monospace"
-                    horizontalAlignment: Text.AlignHCenter
-                }
-                FlatButton { text: "+1"; implicitWidth: 30; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset + 1) }
-                FlatButton { text: "+10"; implicitWidth: 36; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset + 10) }
-                FlatButton { text: "+100"; implicitWidth: 40; onClicked: loopEditor.setExportOffset(loopEditor.exportOffset + 100) }
-            }
-
-            RowLayout {
-                Layout.fillWidth: true
-                visible: !loopEditor.alignMode
                 spacing: 4
                 Label {
                     text: "nudge"
@@ -7941,7 +7786,6 @@ ApplicationWindow {
 
             RowLayout {
                 Layout.fillWidth: true
-                visible: !loopEditor.alignMode
                 spacing: 4
                 Label {
                     text: "manual"
@@ -7953,17 +7797,7 @@ ApplicationWindow {
                     to: 10000000
                     editable: true
                     value: loopEditor.displayManual()
-                    onValueModified: {
-                        loopEditor.dragManual = value
-                        loopEditor.applying = true
-                        var slot = loopEditor.currentSlot()
-                        if (slot) root.sendRecorderAction({
-                            action: "set_nudge",
-                            slot: slot.id,
-                            manual: value
-                        })
-                        editorWave.requestPaint()
-                    }
+                    onValueModified: loopEditor.setPendingManual(value)
                 }
                 Item { Layout.fillWidth: true }
                 Label {
@@ -7975,7 +7809,6 @@ ApplicationWindow {
 
             Label {
                 Layout.fillWidth: true
-                visible: !loopEditor.alignMode
                 text: {
                     var slot = root.loopById(loopEditor.slotId)
                     if (!slot) return ""
@@ -7996,34 +7829,6 @@ ApplicationWindow {
                         return slot ? slot.one_shot === true : false
                     }
                     onToggled: loopEditor.toggleOneShot()
-                }
-                CheckBox {
-                    text: "reference"
-                    checked: {
-                        var slot = root.loopById(loopEditor.slotId)
-                        return slot ? slot.reference === true : false
-                    }
-                    onToggled: loopEditor.toggleReference()
-                }
-                CheckBox {
-                    text: "align"
-                    checked: loopEditor.alignMode
-                    onToggled: {
-                        loopEditor.alignMode = checked
-                        if (checked) {
-                            var slot = root.loopById(loopEditor.slotId)
-                            if (slot) {
-                                loopEditor.exportOffset =
-                                    slot.export && slot.export.end > 0
-                                        ? slot.export.offset : slot.nudge_samples
-                            }
-                            loopEditor.requestWaveform(null)
-                        } else {
-                            loopEditor.storeExportSettings()
-                            loopEditor.stopPreview()
-                            loopEditor.requestWaveform(null)
-                        }
-                    }
                 }
                 FlatButton {
                     text: loopEditor.gridDiv === 0
@@ -8046,29 +7851,7 @@ ApplicationWindow {
 
             RowLayout {
                 Layout.fillWidth: true
-                visible: loopEditor.alignMode
                 spacing: 4
-                Label {
-                    text: "reference"
-                    color: root.textColor
-                    font.pixelSize: 11
-                }
-                ComboBox {
-                    Layout.fillWidth: true
-                    font.pixelSize: 11
-                    textRole: "name"
-                    model: loopEditor.referenceChoices()
-                    currentIndex: {
-                        var choices = loopEditor.referenceChoices()
-                        for (var i = 0; i < choices.length; i++)
-                            if (choices[i].id === loopEditor.referenceId) return i
-                        return 0
-                    }
-                    onActivated: {
-                        loopEditor.referenceId = model[index].id
-                        loopEditor.restartPreview()
-                    }
-                }
                 FlatButton {
                     text: loopEditor.previewPlaying ? "stop" : "preview"
                     onClicked: loopEditor.startPreview()
@@ -8082,18 +7865,7 @@ ApplicationWindow {
                         loopEditor.restartPreview()
                     }
                 }
-                Label {
-                    Layout.fillWidth: true
-                    text: {
-                        var state = loopEditor.referenceStale()
-                        if (state === 2) return "reference missing"
-                        if (state === 1) return "reference changed"
-                        return ""
-                    }
-                    color: "#f9a825"
-                    font.pixelSize: 10
-                    elide: Text.ElideRight
-                }
+                Item { Layout.fillWidth: true }
             }
 
             RowLayout {
@@ -8216,7 +7988,7 @@ ApplicationWindow {
                     onToggled: loopEditor.saveNormalize = checked
                 }
                 FlatButton {
-                    text: "save…"
+                    text: "export"
                     onClicked: {
                         var slot = root.loopById(loopEditor.slotId)
                         if (!slot) return
@@ -8248,8 +8020,12 @@ ApplicationWindow {
                     }
                 }
                 FlatButton {
-                    text: "close"
-                    onClicked: loopEditor.close()
+                    text: "cancel"
+                    onClicked: loopEditor.cancel()
+                }
+                FlatButton {
+                    text: "commit"
+                    onClicked: loopEditor.commit()
                 }
             }
         }
