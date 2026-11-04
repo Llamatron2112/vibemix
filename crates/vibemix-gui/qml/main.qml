@@ -2149,9 +2149,6 @@ ApplicationWindow {
     Dialog {
         id: deleteLoopDialog
         property int slot: -1
-        /// Set when the dialog is opened from the loop editor, which must close
-        /// once the loop is deleted.
-        property bool closeEditorAfter: false
         title: "Delete loop"
         modal: true
         anchors.centerIn: parent
@@ -2186,7 +2183,57 @@ ApplicationWindow {
                             slot: deleteLoopDialog.slot
                         })
                         deleteLoopDialog.close()
-                        if (deleteLoopDialog.closeEditorAfter) loopEditor.close()
+                    }
+                }
+            }
+        }
+    }
+
+    // Confirmation for deleting a loop from the editor. The `Dialog` above is a
+    // popup owned by the main window, so it would render behind the separate
+    // editor window; this one is transient to the editor and stays above it.
+    Window {
+        id: editorDeleteDialog
+        property int slot: -1
+        modality: Qt.WindowModal
+        flags: Qt.Dialog
+        transientParent: loopEditor
+        visible: false
+        width: 300
+        height: 140
+        title: "Delete loop"
+        color: root.palette.window
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 10
+            spacing: 10
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.textColor
+                font.pixelSize: 11
+                text: "Delete this loop? This cannot be undone."
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                Item { Layout.fillWidth: true }
+                FlatButton {
+                    text: "cancel"
+                    onClicked: editorDeleteDialog.visible = false
+                }
+                FlatButton {
+                    text: "delete"
+                    onClicked: {
+                        root.sendRecorderAction({
+                            action: "loop_delete",
+                            slot: editorDeleteDialog.slot
+                        })
+                        editorDeleteDialog.visible = false
+                        loopEditor.close()
                     }
                 }
             }
@@ -6411,7 +6458,6 @@ ApplicationWindow {
                                         text: "Delete"
                                         onTriggered: {
                                             deleteLoopDialog.slot = loopData.id
-                                            deleteLoopDialog.closeEditorAfter = false
                                             deleteLoopDialog.open()
                                         }
                                     }
@@ -8017,9 +8063,8 @@ ApplicationWindow {
                     onClicked: {
                         var slot = root.loopById(loopEditor.slotId)
                         if (!slot) return
-                        deleteLoopDialog.slot = slot.id
-                        deleteLoopDialog.closeEditorAfter = true
-                        deleteLoopDialog.open()
+                        editorDeleteDialog.slot = slot.id
+                        editorDeleteDialog.visible = true
                     }
                 }
                 FlatButton {
