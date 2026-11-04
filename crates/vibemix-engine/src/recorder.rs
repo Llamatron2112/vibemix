@@ -387,6 +387,8 @@ pub struct LoopPlayback {
     pub output_bus: usize,
     /// Play once and stop instead of wrapping.
     pub one_shot: bool,
+    /// Stop at the next loop end instead of wrapping (a deferred stop).
+    stop_at_end: bool,
     /// Fading out before it stops, so a stop does not click.
     pub stopping: bool,
     /// Smoothed output level (follows `gain`, `mute` and `stopping`).
@@ -416,6 +418,7 @@ impl LoopPlayback {
             mute: false,
             output_bus: 0,
             one_shot: false,
+            stop_at_end: false,
             stopping: false,
             level: 1.0,
             bpm: 0.0,
@@ -460,6 +463,7 @@ impl LoopPlayback {
         self.pending = false;
         self.phase_end = None;
         self.stopping = false;
+        self.stop_at_end = false;
         self.level = self.target();
         self.feed_frac = 0.0;
         self.fed_since_start = 0.0;
@@ -468,8 +472,18 @@ impl LoopPlayback {
     /// Asks the loop to stop; it fades out over a few ms and then goes idle.
     pub fn stop(&mut self) {
         self.pending = false;
+        self.stop_at_end = false;
         if self.playing {
             self.stopping = true;
+        }
+    }
+
+    /// Asks the loop to stop at its next loop end. A queued (not yet playing)
+    /// loop is simply cancelled.
+    pub fn request_stop_at_end(&mut self) {
+        self.pending = false;
+        if self.playing {
+            self.stop_at_end = true;
         }
     }
 
@@ -505,10 +519,14 @@ impl LoopPlayback {
             // Silent (muted or stopped): keep advancing the grid and only end
             // a one-shot once its full source length has elapsed, matching the
             // stretched path instead of stopping on the first silent block.
-            self.pos = (self.pos + count) % self.frames;
+            let end = self.pos + count;
+            let wrapped = end >= self.frames;
+            self.pos = end % self.frames;
             self.fed_since_start += count as f64;
-            if self.one_shot && self.fed_since_start >= self.frames as f64 {
-                self.stop_oneshot();
+            if (self.one_shot && self.fed_since_start >= self.frames as f64)
+                || (self.stop_at_end && wrapped)
+            {
+                self.stop_now();
             }
         } else {
             let step = (level_end - level_start) / count.max(1) as f32;
@@ -523,11 +541,8 @@ impl LoopPlayback {
                 out_r[i] += self.buffer[index + 1] * level;
                 self.pos += 1;
                 if self.pos >= self.frames {
-                    if self.one_shot {
-                        self.playing = false;
-                        self.pending = false;
-                        self.stopping = false;
-                        self.pos = 0;
+                    if self.one_shot || self.stop_at_end {
+                        self.stop_now();
                         break;
                     }
                     self.pos = 0;
@@ -555,10 +570,13 @@ impl LoopPlayback {
         }
     }
 
-    fn stop_oneshot(&mut self) {
+    /// Stops immediately at the current loop boundary and resets the position.
+    /// Used for one-shot ends and a deferred (stop-at-end) stop.
+    fn stop_now(&mut self) {
         self.playing = false;
         self.pending = false;
         self.stopping = false;
+        self.stop_at_end = false;
         self.pos = 0;
     }
 
@@ -611,11 +629,15 @@ impl LoopPlayback {
             // Silent (muted or stopped): keep the grid by consuming the source
             // at the live tempo, and drop the stretch pipeline so a later
             // unmute starts clean.
+            let end = self.pos + to_feed;
+            let wrapped = end >= self.frames;
             self.fed_since_start += to_feed as f64;
-            self.pos = (self.pos + to_feed % self.frames) % self.frames;
+            self.pos = end % self.frames;
             stretch.clear();
-            if self.one_shot && self.fed_since_start >= self.frames as f64 {
-                self.stop_oneshot();
+            if (self.one_shot && self.fed_since_start >= self.frames as f64)
+                || (self.stop_at_end && wrapped)
+            {
+                self.stop_now();
             }
             if self.stopping && self.level == 0.0 {
                 self.playing = false;
@@ -640,8 +662,8 @@ impl LoopPlayback {
             out_r[from + i] += scratch[i * 2 + 1] * level;
         }
 
-        if self.one_shot && self.fed_since_start >= self.frames as f64 {
-            self.stop_oneshot();
+        if (self.one_shot || self.stop_at_end) && self.fed_since_start >= self.frames as f64 {
+            self.stop_now();
         }
         if self.stopping && self.level == 0.0 {
             self.playing = false;
@@ -730,6 +752,27 @@ mod tests {
         assert!(playback.playing, "still within the one-shot length");
         playback.mix(&mut l, &mut r, 0, 4, 1.0);
         assert!(!playback.playing, "stopped after the full length");
+    }
+
+    #[test]
+    fn stop_at_end_finishes_the_current_loop_then_stops() {
+        let mut playback = loop_with(&[1.0; 4]);
+        playback.request_stop_at_end();
+        let (mut l, mut r) = ([0.0f32; 4], [0.0f32; 4]);
+        // The current iteration still plays to its end, then stops.
+        playback.mix(&mut l, &mut r, 0, 4, 1.0);
+        assert_eq!(l, [1.0, 1.0, 1.0, 1.0]);
+        assert!(!playback.playing);
+        assert_eq!(playback.pos, 0);
+    }
+
+    #[test]
+    fn request_stop_at_end_cancels_a_queued_loop() {
+        let mut playback = LoopPlayback::new(vec![0.0; 8].into_boxed_slice(), 4);
+        playback.pending = true;
+        playback.request_stop_at_end();
+        assert!(!playback.pending);
+        assert!(!playback.playing);
     }
 
     #[test]

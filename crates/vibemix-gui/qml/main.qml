@@ -1118,8 +1118,8 @@ ApplicationWindow {
     function startLoop(slot, quantized) {
         root.sendRecorderAction({ action: "loop_play", slot: slot.id, quantized: quantized })
     }
-    function stopLoop(slot) {
-        root.sendRecorderAction({ action: "loop_stop", slot: slot.id })
+    function stopLoop(slot, atEnd) {
+        root.sendRecorderAction({ action: "loop_stop", slot: slot.id, at_end: atEnd === true })
     }
     function toggleLoopMute(slot) {
         root.sendRecorderAction({ action: "set_loop_mute", slot: slot.id, mute: !slot.mute })
@@ -6346,19 +6346,9 @@ ApplicationWindow {
 
                                 MouseArea {
                                     anchors.fill: parent
-                                    acceptedButtons: Qt.LeftButton | Qt.RightButton
+                                    acceptedButtons: Qt.RightButton
                                     preventStealing: false
-                                    onClicked: (mouse) => {
-                                        if (mouse.button === Qt.RightButton) {
-                                            loopMenu.popup()
-                                            return
-                                        }
-                                        if (loopState.playing || loopState.pending) {
-                                            root.stopLoop(loopData)
-                                        } else {
-                                            root.startLoop(loopData, true)
-                                        }
-                                    }
+                                    onClicked: loopMenu.popup()
                                 }
 
                                 Menu {
@@ -6367,7 +6357,7 @@ ApplicationWindow {
                                         text: loopState.playing || loopState.pending ? "Stop" : "Play"
                                         onTriggered: {
                                             if (loopState.playing || loopState.pending) {
-                                                root.stopLoop(loopData)
+                                                root.stopLoop(loopData, false)
                                             } else {
                                                 root.startLoop(loopData, true)
                                             }
@@ -6521,6 +6511,21 @@ ApplicationWindow {
                                             color: "#f9a825"
                                             font.pixelSize: 9
                                             font.bold: true
+                                        }
+                                        MouseArea {
+                                            anchors.fill: parent
+                                            acceptedButtons: Qt.LeftButton
+                                            onClicked: (mouse) => {
+                                                // Normal click: quantized start / stop at the
+                                                // loop end. Shift: instant start/stop.
+                                                var instant =
+                                                    (mouse.modifiers & Qt.ShiftModifier) !== 0
+                                                if (loopState.playing || loopState.pending) {
+                                                    root.stopLoop(loopData, !instant)
+                                                } else {
+                                                    root.startLoop(loopData, !instant)
+                                                }
+                                            }
                                         }
                                     }
 

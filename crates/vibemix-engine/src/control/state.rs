@@ -757,7 +757,7 @@ impl Controller {
             .and_then(Option::as_mut)
         {
             runtime.slot.playing = false;
-            let _ = self.engine.loop_stop(auto.slot as usize);
+            let _ = self.engine.loop_stop(auto.slot as usize, false);
         }
         self.rebuild_model_loops();
         self.loops_dirty = true;

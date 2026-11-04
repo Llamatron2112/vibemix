@@ -315,6 +315,10 @@ pub enum RecorderAction {
     },
     LoopStop {
         slot: u32,
+        /// Wait for the loop's next end before stopping instead of stopping
+        /// immediately.
+        #[serde(default)]
+        at_end: bool,
     },
     LoopDelete {
         slot: u32,

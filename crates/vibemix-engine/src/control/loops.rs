@@ -1002,10 +1002,10 @@ impl Controller {
                     self.loops_dirty = true;
                 }
             }
-            RecorderAction::LoopStop { slot } => {
+            RecorderAction::LoopStop { slot, at_end } => {
                 if let Some(runtime) = self.loops.get_mut(slot as usize).and_then(Option::as_mut) {
                     runtime.slot.playing = false;
-                    let _ = self.engine.loop_stop(slot as usize);
+                    let _ = self.engine.loop_stop(slot as usize, at_end);
                     self.rebuild_model_loops();
                     self.loops_dirty = true;
                 }

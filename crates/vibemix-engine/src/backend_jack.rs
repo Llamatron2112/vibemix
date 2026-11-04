@@ -473,6 +473,7 @@ pub enum EngineCommand {
     },
     LoopStop {
         slot: usize,
+        at_end: bool,
     },
     LoopGain {
         slot: usize,
@@ -1115,10 +1116,14 @@ impl MixerGraph {
                         loop_slot.phase_end = Some(end_frame);
                     }
                 }
-                EngineCommand::LoopStop { slot } => {
+                EngineCommand::LoopStop { slot, at_end } => {
                     if let Some(loop_slot) = self.loop_slots.get_mut(slot).and_then(Option::as_mut)
                     {
-                        loop_slot.stop();
+                        if at_end {
+                            loop_slot.request_stop_at_end();
+                        } else {
+                            loop_slot.stop();
+                        }
                     }
                 }
                 EngineCommand::LoopGain { slot, gain } => {
@@ -3128,9 +3133,9 @@ impl JackEngine {
             .map_err(|_| anyhow!("engine command queue full"))
     }
 
-    pub fn loop_stop(&mut self, slot: usize) -> Result<()> {
+    pub fn loop_stop(&mut self, slot: usize, at_end: bool) -> Result<()> {
         self.commands
-            .push(EngineCommand::LoopStop { slot })
+            .push(EngineCommand::LoopStop { slot, at_end })
             .map_err(|_| anyhow!("engine command queue full"))
     }
 
