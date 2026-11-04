@@ -7033,9 +7033,9 @@ ApplicationWindow {
         }
         visible: false
         width: 620
-        height: 620
+        height: 820
         minimumWidth: 460
-        minimumHeight: 520
+        minimumHeight: 700
         title: "loop editor"
         color: root.palette.window
 
