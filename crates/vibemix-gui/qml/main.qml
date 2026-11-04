@@ -6603,6 +6603,12 @@ ApplicationWindow {
         property bool previewPlaying: false
         property int gridDiv: 0
         property bool snapGrid: false
+        /// Height of the high-pass energy strip at the top of the waveform,
+        /// where transient markers can be grabbed.
+        readonly property int hfStripHeight: 30
+        /// Raw frame of the transient currently being grabbed (paint highlight),
+        /// or -1.
+        property int grabTransientFrame: -1
         /// Manual nudge staged in this editor session. Committed to the loop
         /// only by `commit()`; `close()` discards it.
         property int pendingManual: 0
@@ -7300,7 +7306,7 @@ ApplicationWindow {
                         // content is even when the amplitude waveform is saturated.
                         var hf = loopEditor.waveHf
                         if (hf.length > 1) {
-                            var hfHeight = 30
+                            var hfHeight = loopEditor.hfStripHeight
                             ctx.fillStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.20)
                             ctx.beginPath()
                             ctx.moveTo(0, 0)
@@ -7396,16 +7402,23 @@ ApplicationWindow {
                             if (display < viewStart - 1.0e-6 || display > viewEnd + 1.0e-6) continue
                             var tx = (display - viewStart) / span * width
                             var strength = Math.max(0.2, Math.min(1.0, marker.strength || 0.5))
-                            ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b, 0.25 + 0.55 * strength)
+                            var grabbed = loopEditor.dragging
+                                && loopEditor.grabTransientFrame === marker.frame
+                            ctx.strokeStyle = Qt.rgba(root.accentColor.r, root.accentColor.g, root.accentColor.b,
+                                grabbed ? 1.0 : 0.25 + 0.55 * strength)
+                            ctx.lineWidth = grabbed ? 2.0 : 1.0
                             ctx.beginPath()
                             ctx.moveTo(tx, 0)
                             ctx.lineTo(tx, height)
                             ctx.stroke()
+                            ctx.lineWidth = 1.0
                             ctx.fillStyle = root.accentColor
                             ctx.beginPath()
-                            ctx.moveTo(tx - 3, 0)
-                            ctx.lineTo(tx + 3, 0)
-                            ctx.lineTo(tx, 5)
+                            var half = grabbed ? 5 : 3
+                            var depth = grabbed ? 8 : 5
+                            ctx.moveTo(tx - half, 0)
+                            ctx.lineTo(tx + half, 0)
+                            ctx.lineTo(tx, depth)
                             ctx.closePath()
                             ctx.fill()
                         }
@@ -7476,6 +7489,10 @@ ApplicationWindow {
                     property string dragMarker: ""
                     property bool markerHover: false
                     readonly property int markerGrab: 7
+                    /// True while Alt-dragging a transient marker from the top
+                    /// HF strip.
+                    property bool grabbingTransient: false
+                    property int grabFrame: 0
 
                     function markerX(frame) {
                         var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
@@ -7489,10 +7506,44 @@ ApplicationWindow {
                         if (Math.abs(px - endX) <= markerGrab) return "end"
                         return ""
                     }
+                    /// Nudge used to map transient raw frames to the display.
+                    function transientTotal() {
+                        return loopEditor.waveStart < loopEditor.waveEnd
+                            ? loopEditor.waveNudge : loopEditor.displayTotal()
+                    }
+                    function transientDisplayAt(frame) {
+                        var slot = loopEditor.currentSlot()
+                        var frames = slot && slot.frames ? slot.frames : 1
+                        var total = transientTotal()
+                        return ((frame - total) % frames + frames) % frames
+                    }
+                    /// Closest visible transient marker to `px`, within `maxPx`,
+                    /// or -1.
+                    function nearestTransient(px, maxPx) {
+                        var slot = loopEditor.currentSlot()
+                        if (!slot) return -1
+                        var frames = Math.max(1, slot.frames)
+                        var span = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
+                        var total = transientTotal()
+                        var best = -1
+                        var bestDistance = maxPx
+                        for (var i = 0; i < loopEditor.waveTransients.length; i++) {
+                            var marker = loopEditor.waveTransients[i]
+                            var display = ((marker.frame - total) % frames + frames) % frames
+                            if (display < loopEditor.viewStart || display > loopEditor.viewEnd) continue
+                            var x = (display - loopEditor.viewStart) / span * width
+                            var distance = Math.abs(x - px)
+                            if (distance < bestDistance) {
+                                bestDistance = distance
+                                best = marker.frame
+                            }
+                        }
+                        return best
+                    }
 
                     ToolTip.visible: containsMouse && !pressed
                     ToolTip.delay: 500
-                    ToolTip.text: "drag: pan / vertical zoom · Alt-drag: nudge (Shift = 1 sample/px) · Ctrl+click transient: snap"
+                    ToolTip.text: "drag: pan / vertical zoom · Alt-drag: nudge (Shift = 1 sample/px) · Alt-drag the HF strip: grab a transient · Ctrl+click transient: snap"
 
                     onPressed: {
                         var slot = loopEditor.currentSlot()
@@ -7500,6 +7551,8 @@ ApplicationWindow {
                         pressX = mouse.x
                         pressY = mouse.y
                         moved = false
+                        grabbingTransient = false
+                        loopEditor.grabTransientFrame = -1
                         dragMarker = markerAt(mouse.x)
                         if (dragMarker !== "") {
                             loopEditor.navigating = false
@@ -7514,8 +7567,23 @@ ApplicationWindow {
                             var spanAtPress = Math.max(1, loopEditor.viewEnd - loopEditor.viewStart)
                             var displayAtPress = loopEditor.viewStart
                                 + (mouse.x / Math.max(1, width)) * spanAtPress
-                            pressAnchorRaw = ((Math.round(displayAtPress) + pressTotal)
-                                % framesAtPress + framesAtPress) % framesAtPress
+                            // Alt-dragging in the top HF strip grabs the closest
+                            // transient marker; with snap on it aligns that
+                            // marker to the grid instead of the cursor's anchor.
+                            if (mouse.y <= loopEditor.hfStripHeight) {
+                                var grabbed = nearestTransient(mouse.x, 12)
+                                if (grabbed >= 0) {
+                                    grabbingTransient = true
+                                    grabFrame = grabbed
+                                    loopEditor.grabTransientFrame = grabbed
+                                    displayAtPress = transientDisplayAt(grabbed)
+                                    editorWave.requestPaint()
+                                }
+                            }
+                            pressAnchorRaw = grabbingTransient
+                                ? grabFrame
+                                : ((Math.round(displayAtPress) + pressTotal)
+                                    % framesAtPress + framesAtPress) % framesAtPress
                             loopEditor.dragManual = pressManual
                             loopEditor.dragging = true
                             loopEditor.navigating = false
@@ -7635,6 +7703,8 @@ ApplicationWindow {
                         }
                         if (loopEditor.dragging) {
                             loopEditor.dragging = false
+                            grabbingTransient = false
+                            loopEditor.grabTransientFrame = -1
                             if (loopEditor.snapGrid && loopEditor.ghostVisible)
                                 loopEditor.dragManual += snapDelta
                             loopEditor.setPendingManual(loopEditor.dragManual)
@@ -7673,6 +7743,8 @@ ApplicationWindow {
                         settleTimer.stop()
                         loopEditor.dragging = false
                         loopEditor.navigating = false
+                        grabbingTransient = false
+                        loopEditor.grabTransientFrame = -1
                         dragMarker = ""
                         loopEditor.applying = false
                         loopEditor.ghostVisible = false
@@ -7877,16 +7949,29 @@ ApplicationWindow {
                     }
                     onToggled: loopEditor.toggleOneShot()
                 }
-                FlatButton {
-                    text: loopEditor.gridDiv === 0
-                        ? "grid auto"
-                        : ("grid 1/" + loopEditor.gridDiv)
-                    onClicked: {
-                        var values = [0, 2, 4, 8, 16]
-                        var at = values.indexOf(loopEditor.gridDiv)
-                        loopEditor.gridDiv = values[(at + 1) % values.length]
-                        ruler.requestPaint()
-                        editorWave.requestPaint()
+                RowLayout {
+                    spacing: 2
+                    Label {
+                        text: "grid"
+                        color: root.mutedText
+                        font.pixelSize: 10
+                    }
+                    SpinBox {
+                        from: 0
+                        to: 64
+                        editable: true
+                        Layout.preferredWidth: 74
+                        value: loopEditor.gridDiv
+                        onValueModified: {
+                            loopEditor.gridDiv = value
+                            ruler.requestPaint()
+                            editorWave.requestPaint()
+                        }
+                    }
+                    Label {
+                        text: loopEditor.gridDiv === 0 ? "auto" : ("1/" + loopEditor.gridDiv)
+                        color: root.mutedText
+                        font.pixelSize: 10
                     }
                 }
                 CheckBox {
