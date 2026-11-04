@@ -2149,6 +2149,9 @@ ApplicationWindow {
     Dialog {
         id: deleteLoopDialog
         property int slot: -1
+        /// Set when the dialog is opened from the loop editor, which must close
+        /// once the loop is deleted.
+        property bool closeEditorAfter: false
         title: "Delete loop"
         modal: true
         anchors.centerIn: parent
@@ -2183,6 +2186,7 @@ ApplicationWindow {
                             slot: deleteLoopDialog.slot
                         })
                         deleteLoopDialog.close()
+                        if (deleteLoopDialog.closeEditorAfter) loopEditor.close()
                     }
                 }
             }
@@ -6407,6 +6411,7 @@ ApplicationWindow {
                                         text: "Delete"
                                         onTriggered: {
                                             deleteLoopDialog.slot = loopData.id
+                                            deleteLoopDialog.closeEditorAfter = false
                                             deleteLoopDialog.open()
                                         }
                                     }
@@ -8011,8 +8016,10 @@ ApplicationWindow {
                     text: "delete"
                     onClicked: {
                         var slot = root.loopById(loopEditor.slotId)
-                        if (slot) root.sendRecorderAction({ action: "loop_delete", slot: slot.id })
-                        loopEditor.close()
+                        if (!slot) return
+                        deleteLoopDialog.slot = slot.id
+                        deleteLoopDialog.closeEditorAfter = true
+                        deleteLoopDialog.open()
                     }
                 }
                 FlatButton {

@@ -1782,6 +1782,14 @@ impl MixerGraph {
         }
     }
 
+    /// Stops every launcher slot (fading out playing loops and cancelling
+    /// queued ones) when the transport stops.
+    fn stop_loops(&mut self) {
+        for slot in self.loop_slots.iter_mut().flatten() {
+            slot.stop();
+        }
+    }
+
     /// Mix the dry editor audition (loop, optional reference and click)
     /// straight into the master output. Running after the master chain keeps
     /// the relative timing exact and free of bus PDC.
@@ -2483,6 +2491,11 @@ impl ProcessHandler for MixerGraph {
             accumulator[1][..frames].fill(0.0);
         }
 
+        // Starting (or restarting) the transport re-queues playing loops on the
+        // bar; stopping it stops them.
+        if self.transport_playing && !playing {
+            self.stop_loops();
+        }
         if Self::should_relaunch_loops(self.transport_playing, playing, restart_requested) {
             self.relaunch_loops();
         }
