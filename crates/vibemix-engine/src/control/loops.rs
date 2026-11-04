@@ -550,10 +550,178 @@ impl Controller {
             loop_beats: snapshot.loop_beats,
             loops_dir: loops_dir().to_string_lossy().into_owned(),
             message,
+            capture_state: self.capture_state.clone(),
+            capture_frames: self.capture_frames,
+            capture_overruns: self.capture_overruns,
+            capture_message: self.capture_message.clone(),
         };
         if status != self.recorder_status {
             self.recorder_status = status;
             self.recorder_dirty = true;
+        }
+    }
+
+    /// Start capturing the configured sources to separate WAV files.
+    pub(super) fn start_capture(&mut self) {
+        if self.capture.is_some() {
+            return;
+        }
+        let sources: Vec<RecorderSource> = self
+            .model
+            .recorder
+            .capture_sources
+            .iter()
+            .take(crate::backend_jack::MAX_CAPTURE_SOURCES)
+            .cloned()
+            .collect();
+        if sources.is_empty() {
+            self.capture_state = "idle".to_string();
+            self.capture_message = "select at least one capture source".to_string();
+            self.recorder_dirty = true;
+            return;
+        }
+        let channels = sources.len() * 2;
+        let rate = self.engine.sample_rate() as usize;
+        if rate == 0 {
+            return;
+        }
+        let capacity = (rate * channels * 2).clamp(1024, 16 * 1024 * 1024);
+        let (producer, consumer) = rtrb::RingBuffer::<f32>::new(capacity);
+        let shared = Arc::new(crate::params::SharedCapture::new());
+        let dir = if self.model.recorder.capture_dir.trim().is_empty() {
+            loops_dir()
+        } else {
+            PathBuf::from(self.model.recorder.capture_dir.trim())
+        };
+        let base = format!("capture-{}", timestamp_slug());
+        let names: Vec<String> = sources
+            .iter()
+            .map(|source| self.capture_source_name(source))
+            .collect();
+        let job = capture::CaptureJob {
+            consumer,
+            channels,
+            names,
+            sample_rate: rate as u32,
+            bit_depth: self.model.recorder.capture_bit_depth,
+            dir,
+            base,
+            shared: Arc::clone(&shared),
+        };
+        let handle = capture::spawn(job);
+        let packed = crate::backend_jack::CaptureSources::from_recorder(&sources);
+        if let Err(error) =
+            self.engine
+                .start_capture(producer, packed, channels, Arc::clone(&shared))
+        {
+            tracing::warn!(%error, "failed to start session capture");
+            // Let the writer drain and exit; the producer was dropped by the
+            // failed command push.
+            shared.set_stopped();
+            self.capture_message = error.to_string();
+            self.capture_state = "idle".to_string();
+            self.recorder_dirty = true;
+            return;
+        }
+        self.capture = Some(CaptureRuntime {
+            join: handle.join,
+            shared,
+            stopping: false,
+        });
+        self.capture_state = "recording".to_string();
+        self.capture_frames = 0;
+        self.capture_overruns = 0;
+        self.capture_message.clear();
+        self.recorder_dirty = true;
+    }
+
+    /// Stop the session capture; the writer finalizes the files.
+    pub(super) fn stop_capture(&mut self) {
+        let Some(runtime) = self.capture.as_mut() else {
+            return;
+        };
+        if runtime.stopping {
+            return;
+        }
+        if let Err(error) = self.engine.stop_capture() {
+            tracing::warn!(%error, "failed to stop session capture");
+        }
+        runtime.stopping = true;
+        self.capture_state = "stopping".to_string();
+        self.recorder_dirty = true;
+    }
+
+    /// Poll the capture writer, publishing progress and finishing the run.
+    pub(super) fn poll_capture(&mut self) {
+        let (frames, overruns, stopping, finished) = match self.capture.as_ref() {
+            Some(runtime) => (
+                runtime.shared.frames(),
+                runtime.shared.overruns(),
+                runtime.stopping,
+                runtime.join.is_finished(),
+            ),
+            None => return,
+        };
+        let mut changed = false;
+        if frames != self.capture_frames {
+            self.capture_frames = frames;
+            changed = true;
+        }
+        if overruns != self.capture_overruns {
+            self.capture_overruns = overruns;
+            changed = true;
+        }
+        if !finished {
+            let state = if stopping { "stopping" } else { "recording" };
+            if self.capture_state != state {
+                self.capture_state = state.to_string();
+                changed = true;
+            }
+        } else {
+            let runtime = self.capture.take().expect("capture runtime");
+            match runtime.join.join() {
+                Ok(Ok(paths)) => {
+                    self.capture_state = "saved".to_string();
+                    self.capture_message = format!("captured {} file(s)", paths.len());
+                    for path in &paths {
+                        tracing::info!(path = %path.display(), "session capture saved");
+                    }
+                }
+                Ok(Err(error)) => {
+                    self.capture_state = "idle".to_string();
+                    self.capture_message = format!("capture failed: {error}");
+                }
+                Err(_) => {
+                    self.capture_state = "idle".to_string();
+                    self.capture_message = "capture writer panicked".to_string();
+                }
+            }
+            changed = true;
+        }
+        if changed {
+            self.recorder_dirty = true;
+        }
+    }
+
+    fn capture_source_name(&self, source: &RecorderSource) -> String {
+        let id = source.id as usize;
+        match source.kind {
+            vibemix_core::recorder::RecorderSourceKind::Strip => self
+                .model
+                .strips
+                .iter()
+                .find(|strip| strip.id.0 as usize == id)
+                .map(|strip| strip.name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("strip-{id}")),
+            vibemix_core::recorder::RecorderSourceKind::Bus => self
+                .model
+                .buses
+                .iter()
+                .find(|bus| bus.id.0 as usize == id)
+                .map(|bus| bus.name.clone())
+                .filter(|name| !name.is_empty())
+                .unwrap_or_else(|| format!("bus-{id}")),
         }
     }
 
@@ -855,6 +1023,8 @@ impl Controller {
             RecorderAction::StopAtBar => {
                 let _ = self.engine.stop_recorder_at_bar();
             }
+            RecorderAction::CaptureStart => self.start_capture(),
+            RecorderAction::CaptureStop => self.stop_capture(),
             RecorderAction::SetNudge { slot, manual } => self.set_loop_nudge(slot, manual),
             RecorderAction::SetLoopGain { slot, gain } => {
                 let gain = gain.clamp(0.0, 4.0);

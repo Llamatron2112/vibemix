@@ -1483,3 +1483,54 @@ impl Default for SharedRecorder {
         Self::new()
     }
 }
+
+/// Session-capture status shared between the audio thread and the control
+/// thread. The writer thread sets `stopped` visibility through the same struct.
+pub struct SharedCapture {
+    /// Frames pushed into the capture ring by the audio thread.
+    frames: AtomicU64,
+    /// Blocks dropped because the ring was full (the writer fell behind).
+    overruns: AtomicU64,
+    /// Set by the audio thread once it has stopped pushing.
+    stopped: AtomicBool,
+}
+
+impl SharedCapture {
+    pub fn new() -> Self {
+        Self {
+            frames: AtomicU64::new(0),
+            overruns: AtomicU64::new(0),
+            stopped: AtomicBool::new(false),
+        }
+    }
+
+    pub fn note_frames(&self, frames: u64) {
+        self.frames.fetch_add(frames, Ordering::Relaxed);
+    }
+
+    pub fn note_overrun(&self) {
+        self.overruns.fetch_add(1, Ordering::Relaxed);
+    }
+
+    pub fn set_stopped(&self) {
+        self.stopped.store(true, Ordering::Release);
+    }
+
+    pub fn stopped(&self) -> bool {
+        self.stopped.load(Ordering::Acquire)
+    }
+
+    pub fn frames(&self) -> u64 {
+        self.frames.load(Ordering::Relaxed)
+    }
+
+    pub fn overruns(&self) -> u64 {
+        self.overruns.load(Ordering::Relaxed)
+    }
+}
+
+impl Default for SharedCapture {
+    fn default() -> Self {
+        Self::new()
+    }
+}

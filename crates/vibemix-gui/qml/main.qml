@@ -1055,8 +1055,43 @@ ApplicationWindow {
             input_latency: r.input_latency || 0,
             crossfade_ms: r.crossfade_ms || 0,
             auto_swap: r.auto_swap === true,
-            default_output_bus: r.default_output_bus || 0
+            default_output_bus: r.default_output_bus || 0,
+            capture_sources: r.capture_sources || [],
+            capture_bit_depth: (r.capture_bit_depth !== undefined) ? r.capture_bit_depth : 24,
+            capture_dir: r.capture_dir || ""
         }
+    }
+    function captureSourceList() {
+        return root.recorderSettings().capture_sources || []
+    }
+    function captureHasSource(kind, id) {
+        var list = root.captureSourceList()
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].kind === kind && list[i].id === id) return true
+        }
+        return false
+    }
+    function toggleCaptureSource(kind, id) {
+        var list = root.captureSourceList().slice()
+        var at = -1
+        for (var i = 0; i < list.length; i++) {
+            if (list[i].kind === kind && list[i].id === id) { at = i; break }
+        }
+        if (at >= 0) {
+            list.splice(at, 1)
+        } else {
+            list.push({ kind: kind, id: id, tap: kind === "bus" ? "output" : "post_fader" })
+        }
+        root.updateRecorderSetting("capture_sources", list)
+    }
+    function captureSeconds() {
+        var info = root.recorderInfo()
+        var rate = backend.sample_rate > 0 ? backend.sample_rate : 48000
+        return (info.capture_frames || 0) / rate
+    }
+    function captureBusy() {
+        var state = root.recorderInfo().capture_state
+        return state === "recording" || state === "stopping"
     }
     function busOptionIds() {
         var buses = mix.buses || []
@@ -1933,6 +1968,17 @@ ApplicationWindow {
                                     checked: root.recorderSettings().auto_swap
                                     onToggled: root.updateRecorderSetting("auto_swap", checked)
                                 }
+
+                                FlatButton {
+                                    Layout.fillWidth: true
+                                    text: root.captureBusy()
+                                        ? ("session capture · " + root.captureSeconds().toFixed(1) + " s")
+                                        : "session capture…"
+                                    onClicked: {
+                                        recordSettingsPopup.close()
+                                        captureDialog.visible = true
+                                    }
+                                }
                             }
                         }
                     }
@@ -2235,6 +2281,138 @@ ApplicationWindow {
                         editorDeleteDialog.visible = false
                         loopEditor.close()
                     }
+                }
+            }
+        }
+    }
+
+    // Direct-to-disk session capture: one WAV per selected source.
+    Window {
+        id: captureDialog
+        modality: Qt.ApplicationModal
+        flags: Qt.Dialog
+        transientParent: root
+        visible: false
+        width: 420
+        height: 560
+        title: "session capture"
+        color: root.palette.window
+
+        ColumnLayout {
+            anchors.fill: parent
+            anchors.margins: 10
+            spacing: 8
+
+            Label {
+                text: "capture sources"
+                color: root.textColor
+                font.pixelSize: 12
+                font.bold: true
+            }
+
+            ScrollView {
+                Layout.fillWidth: true
+                Layout.fillHeight: true
+                clip: true
+
+                ColumnLayout {
+                    width: captureDialog.availableWidth
+                    spacing: 2
+
+                    Repeater {
+                        model: mix.strips
+                        delegate: CheckBox {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            text: modelData.name || ("strip " + modelData.id)
+                            checked: root.captureHasSource("strip", modelData.id)
+                            onToggled: root.toggleCaptureSource("strip", modelData.id)
+                        }
+                    }
+                    Repeater {
+                        model: mix.buses
+                        delegate: CheckBox {
+                            required property var modelData
+                            Layout.fillWidth: true
+                            text: (modelData.name || ("bus " + modelData.id))
+                                + (modelData.id === 0 ? " (master)" : "")
+                            checked: root.captureHasSource("bus", modelData.id)
+                            onToggled: root.toggleCaptureSource("bus", modelData.id)
+                        }
+                    }
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                Label {
+                    text: "format"
+                    color: root.textColor
+                    font.pixelSize: 11
+                }
+                ComboBox {
+                    Layout.preferredWidth: 130
+                    font.pixelSize: 11
+                    model: ["16-bit", "24-bit", "32-bit float"]
+                    currentIndex: {
+                        var depth = root.recorderSettings().capture_bit_depth
+                        return depth === 16 ? 0 : (depth === 32 ? 2 : 1)
+                    }
+                    onActivated: {
+                        var depths = [16, 24, 32]
+                        root.updateRecorderSetting("capture_bit_depth", depths[index])
+                    }
+                }
+                Item { Layout.fillWidth: true }
+            }
+
+            Label {
+                Layout.fillWidth: true
+                text: "folder: " + root.loopFolder()
+                color: root.mutedText
+                font.pixelSize: 9
+                elide: Text.ElideMiddle
+            }
+
+            Label {
+                Layout.fillWidth: true
+                wrapMode: Text.WordWrap
+                color: root.textColor
+                font.pixelSize: 10
+                text: {
+                    var info = root.recorderInfo()
+                    var state = info.capture_state || "idle"
+                    var text = state + " · " + root.captureSeconds().toFixed(1) + " s"
+                    if ((info.capture_overruns || 0) > 0)
+                        text += " · " + info.capture_overruns + " overruns (disk behind)"
+                    if (info.capture_message) text += " · " + info.capture_message
+                    return text
+                }
+            }
+
+            RowLayout {
+                Layout.fillWidth: true
+                spacing: 6
+                Label {
+                    Layout.fillWidth: true
+                    text: "one WAV per selected source"
+                    color: root.mutedText
+                    font.pixelSize: 9
+                }
+                FlatButton {
+                    text: root.captureBusy() ? "stop" : "record"
+                    onClicked: {
+                        if (root.captureBusy()) {
+                            root.sendRecorderAction({ action: "capture_stop" })
+                        } else {
+                            root.sendRecorderAction({ action: "capture_start" })
+                        }
+                    }
+                }
+                FlatButton {
+                    text: "close"
+                    onClicked: captureDialog.visible = false
                 }
             }
         }

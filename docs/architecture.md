@@ -766,6 +766,24 @@ exists.
   normalized first-difference (high-pass) energy strip for visually locating
   high-frequency-rich transients.
 
+## Session capture
+
+A direct-to-disk session recorder writes a long performance as separate WAVs,
+one per selected source, without risking the audio callback.
+
+- The audio thread only copies the selected taps (strip post-fader or bus
+  output) into a preallocated lock-free ring (`rtrb`), exactly like the loop
+  recorder's `build_record_mix`. If the ring is full the whole block is dropped
+  and counted as an overrun; the callback never blocks and recording continues.
+- A dedicated writer thread drains the ring and streams one `hound` WAV per
+  source (16-bit, 24-bit or 32-bit float), finalizing each header on stop. Files
+  are named `capture-<timestamp>-<nn>-<source>.wav` in the loop folder.
+- The capture sources, bit depth and folder live in the recorder settings
+  (`capture_sources`, `capture_bit_depth`, `capture_dir`). The GUI's
+  "session capture" dialog selects sources with checkboxes and starts/stops the
+  run; status (`capture_state`, `capture_frames`, `capture_overruns`,
+  `capture_message`) rides on the existing recorder-status message.
+
 
 
 ## Milestones

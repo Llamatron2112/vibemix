@@ -37,6 +37,7 @@ use crate::params::{
 };
 use crate::recorder::MAX_LOOPS;
 
+mod capture;
 mod catalog;
 mod loops;
 mod plugins;
@@ -142,6 +143,13 @@ struct PendingWaveform {
     seq: u64,
     buckets: u32,
     base: bool,
+}
+
+/// A running (or finalizing) direct-to-disk session capture.
+struct CaptureRuntime {
+    join: std::thread::JoinHandle<Result<Vec<PathBuf>, String>>,
+    shared: Arc<crate::params::SharedCapture>,
+    stopping: bool,
 }
 
 const LOOP_PEAK_BUCKETS: usize = 512;
@@ -255,6 +263,12 @@ pub struct Controller {
     loops: Vec<Option<LoopRuntime>>,
     recorder_status: RecorderStatus,
     recorder_dirty: bool,
+    /// Session capture writer while a run is active or finalizing.
+    capture: Option<CaptureRuntime>,
+    capture_state: String,
+    capture_frames: u64,
+    capture_overruns: u64,
+    capture_message: String,
     loops_dirty: bool,
     pending_waveform: Option<PendingWaveform>,
     /// Last "PDC exceeded the delay capacity" state reported to the log.
@@ -524,6 +538,11 @@ impl Controller {
             loops: (0..MAX_LOOPS).map(|_| None).collect(),
             recorder_status: RecorderStatus::default(),
             recorder_dirty: false,
+            capture: None,
+            capture_state: "idle".to_string(),
+            capture_frames: 0,
+            capture_overruns: 0,
+            capture_message: String::new(),
             loops_dirty: true,
             pending_waveform: None,
             pdc_limited_reported: false,
@@ -656,6 +675,7 @@ impl Controller {
                 actions.snapshot = true;
             }
             self.engine.drain_garbage();
+            self.poll_capture();
             self.poll_recorder();
             self.poll_workers();
             if self.poll_trim_learn() {

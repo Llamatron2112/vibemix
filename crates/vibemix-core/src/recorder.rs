@@ -84,6 +84,15 @@ pub struct RecorderSettings {
     /// their own bus.
     #[serde(default)]
     pub default_output_bus: u32,
+    /// Sources captured separately by the session recorder (one WAV each).
+    #[serde(default)]
+    pub capture_sources: Vec<RecorderSource>,
+    /// WAV bit depth for captured files: 16, 24, or 32 (float).
+    #[serde(default = "default_bit_depth")]
+    pub capture_bit_depth: u8,
+    /// Folder for captured WAVs. Empty means the loop folder.
+    #[serde(default)]
+    pub capture_dir: String,
 }
 
 fn default_bit_depth() -> u8 {
@@ -124,6 +133,9 @@ impl Default for RecorderSettings {
             crossfade_ms: 0.0,
             auto_swap: false,
             default_output_bus: 0,
+            capture_sources: Vec::new(),
+            capture_bit_depth: 24,
+            capture_dir: String::new(),
         }
     }
 }
@@ -225,6 +237,17 @@ pub struct RecorderStatus {
     pub loops_dir: String,
     #[serde(default)]
     pub message: String,
+    /// Session capture state: "idle", "recording", "stopping" or "saved".
+    #[serde(default)]
+    pub capture_state: String,
+    /// Frames captured by the session recorder in this run.
+    #[serde(default)]
+    pub capture_frames: u64,
+    /// Blocks the capture ring had to drop because the disk fell behind.
+    #[serde(default)]
+    pub capture_overruns: u64,
+    #[serde(default)]
+    pub capture_message: String,
 }
 
 impl Default for RecorderStatus {
@@ -237,6 +260,10 @@ impl Default for RecorderStatus {
             loop_beats: 0.0,
             loops_dir: String::new(),
             message: String::new(),
+            capture_state: "idle".to_string(),
+            capture_frames: 0,
+            capture_overruns: 0,
+            capture_message: String::new(),
         }
     }
 }
@@ -254,6 +281,10 @@ pub enum RecorderAction {
     /// End an in-progress take at the next bar boundary, keeping it as a loop.
     /// This overrides the configured loop length.
     StopAtBar,
+    /// Start capturing the configured sources to separate WAV files.
+    CaptureStart,
+    /// Stop the session capture and finalize the files.
+    CaptureStop,
     /// Change the manual nudge of a slot, in samples.
     SetNudge {
         slot: u32,

@@ -24,8 +24,8 @@ use crate::midi::{
 };
 use crate::midi_map::SharedMidi;
 use crate::params::{
-    SharedClock, SharedLoops, SharedMeters, SharedParams, SharedRecorder, MAX_PARAMS, MAX_PLUGINS,
-    PLUGIN_CHAINS,
+    SharedCapture, SharedClock, SharedLoops, SharedMeters, SharedParams, SharedRecorder,
+    MAX_PARAMS, MAX_PLUGINS, PLUGIN_CHAINS,
 };
 use crate::pdc::PdcPlan;
 
@@ -41,6 +41,59 @@ const TAKE_RING_DEPTH: usize = 8;
 
 /// Fractional DSP-load peak decay per real second (independent of the period).
 const PEAK_DECAY_PER_SECOND: f32 = 0.08;
+
+/// Maximum number of sources the session recorder captures at once.
+pub const MAX_CAPTURE_SOURCES: usize = 32;
+
+/// Fixed-size, copyable capture source list handed to the audio thread. The
+/// packing matches `SharedRecorder::set_sources`.
+#[derive(Clone, Copy)]
+pub struct CaptureSources {
+    pub count: usize,
+    pub items: [u32; MAX_CAPTURE_SOURCES],
+}
+
+impl CaptureSources {
+    pub fn from_recorder(sources: &[vibemix_core::recorder::RecorderSource]) -> Self {
+        let mut items = [0u32; MAX_CAPTURE_SOURCES];
+        let count = sources.len().min(MAX_CAPTURE_SOURCES);
+        for (i, source) in sources.iter().take(count).enumerate() {
+            let kind = match source.kind {
+                RecorderSourceKind::Strip => 0u32,
+                RecorderSourceKind::Bus => 1u32,
+            };
+            let tap = match source.tap {
+                RecorderTap::Input => 0u32,
+                RecorderTap::PreFader => 1u32,
+                RecorderTap::PostFader => 2u32,
+                RecorderTap::Output => 3u32,
+            };
+            items[i] = (source.id & 0xffff) | (kind << 16) | (tap << 18);
+        }
+        Self { count, items }
+    }
+
+    /// Returns `(kind, tap, id)`: kind 0 = strip, 1 = bus.
+    pub fn get(&self, index: usize) -> Option<(u32, u32, usize)> {
+        if index >= self.count {
+            return None;
+        }
+        let packed = *self.items.get(index)?;
+        Some((
+            packed >> 16 & 0x1,
+            packed >> 18 & 0x3,
+            (packed & 0xffff) as usize,
+        ))
+    }
+}
+
+/// Audio-thread state for a running session capture.
+struct CaptureState {
+    producer: Producer<f32>,
+    sources: CaptureSources,
+    channels: usize,
+    shared: Arc<SharedCapture>,
+}
 
 /// Serialized plugin state, backed by either host's cross-thread state handle.
 #[derive(Clone)]
@@ -431,6 +484,16 @@ pub enum EngineCommand {
     RecorderCancel,
     /// End the running take at the next bar boundary, keeping it.
     RecorderStopAtBar,
+    /// Start streaming the configured sources into the capture ring.
+    CaptureStart {
+        producer: Producer<f32>,
+        sources: CaptureSources,
+        channels: usize,
+        shared: Arc<SharedCapture>,
+    },
+    /// Stop capturing; the audio thread drops the producer so the writer can
+    /// drain and finalize.
+    CaptureStop,
     SetLoop {
         slot: usize,
         buffer: Box<[f32]>,
@@ -743,6 +806,8 @@ struct MixerGraph {
     recorder: Recorder,
     takes: Producer<RecordedTake>,
     shared_recorder: Arc<SharedRecorder>,
+    /// Running session capture, if any.
+    capture: Option<CaptureState>,
     loop_slots: Vec<Option<LoopPlayback>>,
     loop_garbage: Producer<Box<[f32]>>,
     latency_test: Option<LatencyTest>,
@@ -1008,6 +1073,29 @@ impl MixerGraph {
                 }
                 EngineCommand::RecorderStopAtBar => {
                     self.recorder.request_bar_stop();
+                }
+                EngineCommand::CaptureStart {
+                    producer,
+                    sources,
+                    channels,
+                    shared,
+                } => {
+                    self.capture = Some(CaptureState {
+                        producer,
+                        sources,
+                        channels,
+                        shared,
+                    });
+                }
+                EngineCommand::CaptureStop => {
+                    if let Some(capture) = self.capture.take() {
+                        let shared = Arc::clone(&capture.shared);
+                        // Drop the producer while the writer still holds the
+                        // consumer, so the ring's buffer is never freed on the
+                        // audio thread. Signal `stopped` only afterwards.
+                        drop(capture);
+                        shared.set_stopped();
+                    }
                 }
                 EngineCommand::SetLoop {
                     slot,
@@ -2079,6 +2167,74 @@ impl MixerGraph {
     }
 
     /// Sum the selected recorder sources for this block.
+    /// Push the configured source taps into the session capture ring. The audio
+    /// thread only copies; if the ring is full (the writer fell behind) the whole
+    /// block is dropped and counted, so the callback never blocks.
+    fn capture_process(&mut self, frames: usize) {
+        let Self {
+            capture,
+            strip_input,
+            strip_pre_fader,
+            strip_post_fader,
+            bus_out,
+            ..
+        } = self;
+        let Some(capture) = capture.as_mut() else {
+            return;
+        };
+        let channels = capture.channels;
+        if channels == 0 || capture.sources.count == 0 {
+            return;
+        }
+        if capture.producer.slots() < frames * channels {
+            capture.shared.note_overrun();
+            return;
+        }
+        for index in 0..capture.sources.count {
+            let Some((kind, tap, id)) = capture.sources.get(index) else {
+                continue;
+            };
+            let source: Option<(&[f32], &[f32])> = match kind {
+                0 => match tap {
+                    0 => strip_input
+                        .get(id)
+                        .map(|t| (t[0].as_slice(), t[1].as_slice())),
+                    1 => strip_pre_fader
+                        .get(id)
+                        .map(|t| (t[0].as_slice(), t[1].as_slice())),
+                    2 => strip_post_fader
+                        .get(id)
+                        .map(|t| (t[0].as_slice(), t[1].as_slice())),
+                    _ => None,
+                },
+                _ => {
+                    if tap == 3 {
+                        bus_out.get(id).map(|t| (t[0].as_slice(), t[1].as_slice()))
+                    } else {
+                        None
+                    }
+                }
+            };
+            let (left, right) = match source {
+                Some(source) => source,
+                None => {
+                    // A missing source still needs its channel slots so the
+                    // interleaving stays in sync; feed silence.
+                    for _ in 0..frames {
+                        let _ = capture.producer.push(0.0);
+                        let _ = capture.producer.push(0.0);
+                    }
+                    continue;
+                }
+            };
+            for frame in 0..frames {
+                let _ = capture.producer.push(left[frame]);
+                let _ = capture.producer.push(right[frame]);
+            }
+        }
+        capture.shared.note_frames(frames as u64);
+    }
+
     fn build_record_mix(&mut self, frames: usize) {
         self.record_mix[0][..frames].fill(0.0);
         self.record_mix[1][..frames].fill(0.0);
@@ -2511,6 +2667,7 @@ impl ProcessHandler for MixerGraph {
         self.process_buses(scope, frames);
         self.run_latency_test(scope, frames);
         self.build_record_mix(frames);
+        self.capture_process(frames);
         // Keep the take's automatic trim current if a plugin changes its
         // latency while the recorder is armed or recording. Set it before the
         // block is captured so a take that ends here uses this block's value.
@@ -2868,6 +3025,7 @@ impl JackEngine {
             recorder: Recorder::new(),
             takes,
             shared_recorder: Arc::clone(&shared_recorder),
+            capture: None,
             loop_slots: (0..MAX_LOOPS).map(|_| None).collect(),
             loop_garbage,
             latency_test,
@@ -3006,6 +3164,29 @@ impl JackEngine {
     pub fn stop_recorder_at_bar(&mut self) -> Result<()> {
         self.commands
             .push(EngineCommand::RecorderStopAtBar)
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn start_capture(
+        &mut self,
+        producer: Producer<f32>,
+        sources: CaptureSources,
+        channels: usize,
+        shared: Arc<SharedCapture>,
+    ) -> Result<()> {
+        self.commands
+            .push(EngineCommand::CaptureStart {
+                producer,
+                sources,
+                channels,
+                shared,
+            })
+            .map_err(|_| anyhow!("engine command queue full"))
+    }
+
+    pub fn stop_capture(&mut self) -> Result<()> {
+        self.commands
+            .push(EngineCommand::CaptureStop)
             .map_err(|_| anyhow!("engine command queue full"))
     }
 
