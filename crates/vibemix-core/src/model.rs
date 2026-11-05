@@ -365,6 +365,9 @@ pub struct TransportUi {
     pub time: bool,
     #[serde(default)]
     pub loop_indicator: bool,
+    /// Session-capture widget in the transport bar (start/stop + elapsed time).
+    #[serde(default)]
+    pub capture: bool,
     /// Loop length unit: bars when true, beats when false.
     #[serde(default)]
     pub loop_bars: bool,
@@ -392,6 +395,7 @@ impl Default for TransportUi {
             dsp: true,
             time: false,
             loop_indicator: false,
+            capture: false,
             loop_bars: false,
             loop_length: 8,
             autosize: false,

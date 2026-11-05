@@ -866,7 +866,7 @@ ApplicationWindow {
 
     function transportUi() {
         var t = mix.transport_ui
-        return t ? t : ({ beats: true, bpm: true, stability: true, dsp: true, time: false, loop_indicator: false, loop_bars: false, loop_length: 8, autosize: false })
+        return t ? t : ({ beats: true, bpm: true, stability: true, dsp: true, time: false, loop_indicator: false, capture: false, loop_bars: false, loop_length: 8, autosize: false })
     }
     function clockSettings() {
         var c = mix.clock
@@ -878,6 +878,7 @@ ApplicationWindow {
         var next = {
             beats: t.beats, bpm: t.bpm, stability: t.stability, dsp: t.dsp !== false, time: t.time,
             loop_indicator: t.loop_indicator,
+            capture: t.capture === true,
             loop_bars: t.loop_bars, loop_length: t.loop_length,
             autosize: t.autosize
         }
@@ -1092,6 +1093,23 @@ ApplicationWindow {
     function captureBusy() {
         var state = root.recorderInfo().capture_state
         return state === "recording" || state === "stopping"
+    }
+    function toggleCapture() {
+        if (root.captureBusy()) {
+            root.sendRecorderAction({ action: "capture_stop" })
+        } else {
+            root.sendRecorderAction({ action: "capture_start" })
+        }
+    }
+    function formatCaptureTime() {
+        var total = Math.max(0, Math.floor(root.captureSeconds()))
+        var seconds = total % 60
+        var minutes = Math.floor(total / 60) % 60
+        var hours = Math.floor(total / 3600)
+        function pad(value) { return value < 10 ? "0" + value : "" + value }
+        return hours > 0
+            ? hours + ":" + pad(minutes) + ":" + pad(seconds)
+            : minutes + ":" + pad(seconds)
     }
     function busOptionIds() {
         var buses = mix.buses || []
@@ -1737,6 +1755,56 @@ ApplicationWindow {
                         font.pixelSize: 10
                     }
 
+                    Item {
+                        id: captureWidget
+                        visible: root.transportUi().capture
+                        Layout.alignment: Qt.AlignVCenter
+                        Layout.preferredWidth: captureRow.implicitWidth
+                        Layout.preferredHeight: 16
+
+                        Row {
+                            id: captureRow
+                            spacing: 4
+                            anchors.verticalCenter: parent.verticalCenter
+
+                            Rectangle {
+                                width: 12
+                                height: 12
+                                radius: 6
+                                anchors.verticalCenter: parent.verticalCenter
+                                color: root.captureBusy() ? "#e53935" : root.controlColor
+                                border.color: root.captureBusy() ? "#e53935" : root.borderColor
+                                border.width: 1
+                            }
+                            Label {
+                                anchors.verticalCenter: parent.verticalCenter
+                                text: root.captureBusy() ? root.formatCaptureTime() : "rec"
+                                color: root.captureBusy() ? "#e53935" : root.textColor
+                                font.pixelSize: 10
+                                font.family: "monospace"
+                            }
+                        }
+
+                        MouseArea {
+                            anchors.fill: parent
+                            cursorShape: Qt.PointingHandCursor
+                            onClicked: root.toggleCapture()
+                        }
+                        HoverHandler { id: captureHover }
+                        ToolTip.visible: captureHover.hovered
+                        ToolTip.delay: 300
+                        ToolTip.text: {
+                            var info = root.recorderInfo()
+                            var state = info.capture_state || "idle"
+                            var text = "session capture: " + state
+                            if (root.captureBusy()) text += " · " + root.formatCaptureTime()
+                            if ((info.capture_overruns || 0) > 0)
+                                text += " · " + info.capture_overruns + " overruns (disk behind)"
+                            if (info.capture_message) text += " · " + info.capture_message
+                            return text + " · click to start/stop"
+                        }
+                    }
+
                     Rectangle {
                         id: recordDot
                         Layout.alignment: Qt.AlignVCenter
@@ -2133,6 +2201,12 @@ ApplicationWindow {
                         checkable: true
                         checked: root.transportUi().loop_indicator
                         onTriggered: root.setTransportUi({ loop_indicator: !root.transportUi().loop_indicator })
+                    }
+                    MenuItem {
+                        text: "Session capture"
+                        checkable: true
+                        checked: root.transportUi().capture === true
+                        onTriggered: root.setTransportUi({ capture: root.transportUi().capture !== true })
                     }
                 }
             }
