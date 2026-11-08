@@ -6,6 +6,8 @@ adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
 ## [Unreleased]
 
+## [1.1.0] - 2026-11-08
+
 ### Added
 
 - **Recent sessions can be pruned.** Right-click an entry in
@@ -391,6 +393,7 @@ First release.
   (Fedora 43) and binary tarballs attached to each release with SHA-256
   checksums.
 
+[1.1.0]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.1.0
 [1.0.2]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.2
 [1.0.1]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.1
 [1.0.0]: https://github.com/Llamatron2112/vibemix/releases/tag/v1.0.0

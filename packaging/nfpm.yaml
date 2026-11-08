@@ -61,6 +61,7 @@ overrides:
       - libgl1
       - liblilv-0-0
       - libsuil-0-0
+      - libsoundtouch1
       - libjack-jackd2-0 | pipewire-jack
       - ${QT_CORE} (>= ${QT_MIN})
       - ${QT_CORE} (<< ${QT_MAX})

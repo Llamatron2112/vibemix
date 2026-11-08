@@ -55,6 +55,7 @@ overrides:
       - libglvnd
       - liblilv-0-0
       - libsuil-0-0
+      - libSoundTouch1
       - suil-plugin-x11
       - pipewire-libjack-0_3
       - pipewire-jack

@@ -1,7 +1,7 @@
 %global debug_package %{nil}
 
 Name:           vibemix
-Version:        1.0.2
+Version:        1.1.0
 Release:        1%{?dist}
 Summary:        Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire
 License:        MIT OR Apache-2.0
@@ -31,8 +31,11 @@ BuildRequires:  pipewire-jack-audio-connection-kit-devel
 BuildRequires:  libX11-devel
 BuildRequires:  mesa-libGL-devel
 BuildRequires:  libglvnd-devel
+BuildRequires:  soundtouch-devel
+BuildRequires:  clang-devel
 
 Requires:       qt6-qtdeclarative
+Requires:       soundtouch
 Requires:       hicolor-icon-theme
 Recommends:     gtk3
 Recommends:     pipewire-jack-audio-connection-kit
@@ -77,5 +80,13 @@ install -Dm644 packaging/vibemix.svg \
 %{_datadir}/icons/hicolor/scalable/apps/vibemix.svg
 
 %changelog
+* Sun Nov 08 2026 Llamatron2112 <llamatron23@proton.me> - 1.1.0-1
+- Release 1.1.0.
+- Add a pitch-preserving time-stretch for recorded loops (system
+  SoundTouch).
+- Recorded-loop latency and transport alignment fixes; manual input
+  latency.
+- Direct-to-disk session capture and loop editor improvements.
+
 * Sun Oct 25 2026 Llamatron2112 <llamatron23@proton.me> - 1.0.2-1
 - Initial COPR package.

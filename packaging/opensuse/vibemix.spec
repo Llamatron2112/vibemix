@@ -9,7 +9,7 @@
 %define debug_package %{nil}
 
 Name:           vibemix
-Version:        1.0.2
+Version:        1.1.0
 Release:        0
 Summary:        Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire
 License:        MIT OR Apache-2.0
@@ -45,6 +45,9 @@ BuildRequires:  pipewire-libjack-0_3-devel
 BuildRequires:  libX11-devel
 BuildRequires:  Mesa-libGL-devel
 BuildRequires:  libglvnd-devel
+BuildRequires:  soundtouch-devel
+BuildRequires:  clang
+BuildRequires:  libclang-devel
 
 # cxx-qt compiles the QML ahead-of-time, and its output uses Qt private API.
 # OBS rebuilds this package when Tumbleweed's Qt changes, so the binary always
@@ -58,6 +61,7 @@ Requires:       libQt6Quick6 >= 6.12
 Requires:       qt6-declarative-imports
 Requires:       liblilv-0-0
 Requires:       libsuil-0-0
+Requires:       libSoundTouch1
 Requires:       suil-plugin-x11
 Requires:       pipewire-libjack-0_3
 Requires:       pipewire-jack

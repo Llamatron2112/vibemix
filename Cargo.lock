@@ -1216,7 +1216,7 @@ checksum = "ba73ea9cf16a25df0c8caa16c51acb937d5712a8429db78a3ee29d5dcacd3a65"
 
 [[package]]
 name = "vibemix-clap"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "cc",
  "libc",
@@ -1226,7 +1226,7 @@ dependencies = [
 
 [[package]]
 name = "vibemix-core"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "realfft",
  "serde",
@@ -1236,7 +1236,7 @@ dependencies = [
 
 [[package]]
 name = "vibemix-engine"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "clap",
@@ -1260,7 +1260,7 @@ dependencies = [
 
 [[package]]
 name = "vibemix-gui"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "anyhow",
  "cxx",
@@ -1276,7 +1276,7 @@ dependencies = [
 
 [[package]]
 name = "vibemix-lv2"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "cc",
  "libc",
@@ -1291,7 +1291,7 @@ dependencies = [
 
 [[package]]
 name = "vibemix-proto"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "libc",
  "rosc",
@@ -1300,7 +1300,7 @@ dependencies = [
 
 [[package]]
 name = "vibemix-vst3"
-version = "1.0.2"
+version = "1.1.0"
 dependencies = [
  "cc",
  "libc",

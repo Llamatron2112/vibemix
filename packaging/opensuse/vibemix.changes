@@ -1,4 +1,14 @@
 -------------------------------------------------------------------
+Sun Nov 08 12:00:00 UTC 2026 - Llamatron2112 <llamatron23@proton.me>
+
+- Update to 1.1.0:
+  * Pitch-preserving time-stretch for recorded loops (SoundTouch).
+  * Recorded-loop latency and transport alignment fixes, plus a manual
+    input-latency setting.
+  * Direct-to-disk session capture (one WAV per selected source).
+  * Loop editor: staged nudge with Commit/Cancel, arbitrary grid
+    subdivisions, transient grabbing and one-shot marker snapping.
+-------------------------------------------------------------------
 Thu Oct 22 12:00:00 UTC 2026 - Llamatron2112 <llamatron23@proton.me>
 
 - Initial OBS package of vibemix 1.0.2.

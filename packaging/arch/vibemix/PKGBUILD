@@ -8,7 +8,7 @@
 # Deps: see vibemix-git (the same libraries and tools apply).
 
 pkgname=vibemix
-pkgver=1.0.2
+pkgver=1.1.0
 pkgrel=1
 pkgdesc="Modular LV2/VST3/CLAP audio mixer for JACK/PipeWire (real-time engine + Qt Quick GUI)"
 arch=('x86_64')
@@ -24,6 +24,7 @@ depends=(
   'jack'
   'qt6-base'
   'qt6-declarative'
+  'soundtouch'
 )
 # GTK is dlopen()ed at runtime to host GTK2/GTK3 LV2 plugin UIs (e.g. Calf);
 # optional so the package installs without either toolkit.
@@ -49,6 +50,8 @@ makedepends=(
   'jack'
   'qt6-base'
   'qt6-declarative'
+  'soundtouch'
+  'clang'
 )
 provides=(
   'vibemix'
@@ -58,7 +61,9 @@ provides=(
 )
 conflicts=('vibemix-git')
 source=("vibemix-$pkgver.tar.gz::https://github.com/Llamatron2112/vibemix/releases/download/v$pkgver/vibemix-$pkgver.tar.gz")
-sha256sums=('49d4a2597266de4cf37306c0981945f227d7a91d5e7d5f63db7da25128d40079')
+# The release tarball is produced by the tag workflow; replace SKIP with its
+# sha256 once v$pkgver is published (`updpkgsums` after the release).
+sha256sums=('SKIP')
 
 prepare() {
   cd "$pkgname-$pkgver"
