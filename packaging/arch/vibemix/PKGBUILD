@@ -61,9 +61,7 @@ provides=(
 )
 conflicts=('vibemix-git')
 source=("vibemix-$pkgver.tar.gz::https://github.com/Llamatron2112/vibemix/releases/download/v$pkgver/vibemix-$pkgver.tar.gz")
-# The release tarball is produced by the tag workflow; replace SKIP with its
-# sha256 once v$pkgver is published (`updpkgsums` after the release).
-sha256sums=('SKIP')
+sha256sums=('b877b1f20c7d5048667b2e975c1abc140ee28d5eae388ecd7f5532bc653d23ae')
 
 prepare() {
   cd "$pkgname-$pkgver"

@@ -43,6 +43,6 @@ pkgbase = vibemix
 	provides = lv2-host
 	conflicts = vibemix-git
 	source = vibemix-1.1.0.tar.gz::https://github.com/Llamatron2112/vibemix/releases/download/v1.1.0/vibemix-1.1.0.tar.gz
-	sha256sums = SKIP
+	sha256sums = b877b1f20c7d5048667b2e975c1abc140ee28d5eae388ecd7f5532bc653d23ae
 
 pkgname = vibemix

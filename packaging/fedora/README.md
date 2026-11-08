@@ -15,8 +15,8 @@ COPR rebuilds when Fedora's Qt changes (enable *Auto-rebuild* on the package).
 
 ## COPR setup
 
-Create a project with the `fedora-43-x86_64` and `fedora-44-x86_64` chroots,
-then add an SCM package:
+Create a project with the `fedora-43-x86_64`, `fedora-44-x86_64` and
+`fedora-45-x86_64` chroots, then add an SCM package:
 
 - Clone URL: `https://github.com/Llamatron2112/vibemix.git`
 - Spec File: `packaging/fedora/vibemix.spec`
